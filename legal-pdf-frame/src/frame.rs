@@ -1,6 +1,7 @@
 //! The grader's frame: a document as literal source-span blocks and annotations over its lines (the
 //! gold's projection and a parse's alike), the documents that own them and the logical blocks their
 //! continuations make. No classification runs here.
+use crate::state::State;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -13,13 +14,12 @@ pub struct SourceSpan {
     pub end: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// A parser structure's source line: its text, page and range (UTF-16) in the structure's text.
 pub struct FrameLine {
     pub id: String,
     pub text: String,
     pub page: usize,
-    #[serde(flatten)]
-    pub evidence: BTreeMap<String, Value>,
+    pub range: legal_structure_model::ScalarRange,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -61,25 +61,18 @@ pub struct FrameLink {
 
 pub type FrameLinks = BTreeMap<String, BTreeMap<String, FrameLink>>;
 
-#[derive(Debug, Deserialize)]
-pub struct FrameRequest {
-    pub lines: Vec<FrameLine>,
-    pub groups: Vec<FrameBlock>,
-    pub annotations: Vec<FrameAnnotation>,
-    pub reading_order: Vec<String>,
-    #[serde(default)]
-    pub continuations: FrameLinks,
-}
-
 #[derive(Debug, Serialize)]
 pub struct AssembledFrame {
+    /// The state's blocks, each with its document.
     pub groups: Vec<FrameBlock>,
+    /// Each annotation with the fragments its note or table continuations join to it.
     pub annotations: Vec<FrameAnnotation>,
     /// Each logical block's fragments, keyed by its first.
     pub logical_blocks: BTreeMap<String, Vec<String>>,
 }
 
-pub(crate) fn anchor(span: &SourceSpan) -> String {
+/// A source span's anchor: its line and where in it the span opens.
+pub fn anchor(span: &SourceSpan) -> String {
     format!("{}@{}", span.line_id, span.start)
 }
 
@@ -87,19 +80,20 @@ pub(crate) fn spans(value: Option<&Value>) -> Result<Vec<SourceSpan>, String> {
     serde_json::from_value(value.cloned().unwrap_or_else(|| Value::Array(Vec::new()))).map_err(|e| e.to_string())
 }
 
+/// A state's lines as the frame reads them: each line's length in characters and its place in reading order.
 pub(crate) struct Source<'a> {
-    pub(crate) lines: HashMap<&'a str, &'a FrameLine>,
+    pub(crate) lengths: HashMap<&'a str, usize>,
     pub(crate) positions: HashMap<&'a str, usize>,
 }
 
 impl<'a> Source<'a> {
-    pub(crate) fn new(lines: &'a [FrameLine], order: &'a [String]) -> Result<Self, String> {
+    pub(crate) fn new(state: &'a State) -> Result<Self, String> {
         let source = Source {
-            lines: lines.iter().map(|line| (line.id.as_str(), line)).collect(),
-            positions: order.iter().enumerate().map(|(n, id)| (id.as_str(), n)).collect(),
+            lengths: state.lines.iter().map(|line| (line.id.as_str(), line.text.len())).collect(),
+            positions: state.reading_order.iter().enumerate().map(|(n, &line)| (state.lines[line].id.as_str(), n)).collect(),
         };
-        if source.lines.len() != lines.len() || source.positions.len() != order.len()
-            || source.lines.keys().any(|id| !source.positions.contains_key(id)) {
+        if source.lengths.len() != state.lines.len() || source.positions.len() != state.reading_order.len()
+            || source.lengths.keys().any(|id| !source.positions.contains_key(id)) {
             return Err("Source identities and reading order must match exactly".into());
         }
         Ok(source)
@@ -108,8 +102,8 @@ impl<'a> Source<'a> {
     /// An object's spans in reading order, whole lines where it names only lines.
     pub(crate) fn membership(&self, ids: &mut Vec<String>, spans: &mut Vec<SourceSpan>) -> Result<(), String> {
         if spans.is_empty() {
-            *spans = ids.iter().map(|id| self.lines.get(id.as_str())
-                .map(|line| SourceSpan { line_id: id.clone(), start: 0, end: line.text.chars().count() })
+            *spans = ids.iter().map(|id| self.lengths.get(id.as_str())
+                .map(|&end| SourceSpan { line_id: id.clone(), start: 0, end })
                 .ok_or_else(|| "Membership names absent source".to_owned())).collect::<Result<_, _>>()?;
         }
         if spans.is_empty() || spans.iter().any(|span| !self.positions.contains_key(span.line_id.as_str())) {
@@ -122,7 +116,7 @@ impl<'a> Source<'a> {
     }
 
     pub(crate) fn canonical(&self, id: &str) -> String {
-        if self.lines.contains_key(id) { format!("{id}@0") } else { id.to_owned() }
+        if self.lengths.contains_key(id) { format!("{id}@0") } else { id.to_owned() }
     }
 
     pub(crate) fn location(&self, id: &str) -> Result<(usize, usize), String> {
@@ -143,22 +137,27 @@ impl<'a> Source<'a> {
     }
 }
 
-pub fn assemble_frame(mut request: FrameRequest) -> Result<AssembledFrame, String> {
-    let source = Source::new(&request.lines, &request.reading_order)?;
-    for group in &mut request.groups {
+/// A state's frame with `annotations` over it: its blocks and annotations on their source spans, each block's
+/// document, its logical blocks, and its notes and tables each one object across their fragments.
+pub fn assemble_frame(state: &State, annotations: &[FrameAnnotation]) -> Result<AssembledFrame, String> {
+    let source = Source::new(state)?;
+    let mut groups = state.groups.clone();
+    for group in &mut groups {
         source.membership(&mut group.line_ids, &mut group.spans)?;
         group.id = anchor(&group.spans[0]);
     }
-    request.groups.sort_by_key(|group| (source.positions[group.spans[0].line_id.as_str()], group.spans[0].start));
-    for annotation in &mut request.annotations {
+    groups.sort_by_key(|group| (source.positions[group.spans[0].line_id.as_str()], group.spans[0].start));
+    let mut annotations = annotations.to_vec();
+    for annotation in &mut annotations {
         source.membership(&mut annotation.line_ids, &mut annotation.spans)?;
     }
-    let owners = documents(&request.groups, &request.annotations, &source, &request.continuations)?;
-    for (group, owner) in request.groups.iter_mut().zip(owners) {
+    let owners = documents(&groups, &annotations, &source, &state.continuations)?;
+    for (group, owner) in groups.iter_mut().zip(owners) {
         group.document = Some(owner);
     }
-    let logical_blocks = logical_blocks(&request.groups, &request.annotations, &source, &request.continuations)?;
-    Ok(AssembledFrame { groups: request.groups, annotations: request.annotations, logical_blocks })
+    let logical_blocks = logical_blocks(&groups, &annotations, &source, &state.continuations)?;
+    let annotations = crate::frame_annotations::logical_annotations(&source, &annotations, &state.continuations)?;
+    Ok(AssembledFrame { groups, annotations, logical_blocks })
 }
 
 /// Who owns each block: the document holding its note's references, else the innermost document

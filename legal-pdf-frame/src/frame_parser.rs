@@ -1,15 +1,9 @@
 //! A parser structure as the grader's frame: blocks and annotations over its source lines.
 use crate::{FrameAnnotation, FrameBlock, FrameLine, FrameLink, FrameLinks, SourceSpan};
 use legal_structure_model::{DocumentStructure, NodeKind, PrimaryRole, ScalarRange, ScalarText};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-
-#[derive(Deserialize)]
-pub struct ParserFrameRequest {
-    pub structure: DocumentStructure,
-    pub lines: Vec<FrameLine>,
-}
 
 #[derive(Serialize)]
 pub struct ParserFrame {
@@ -38,20 +32,12 @@ fn line_spans(text: &ScalarText<'_>, lines: &[Line<'_>], ranges: &[ScalarRange])
     Ok(result)
 }
 
-pub fn parser_frame(request: ParserFrameRequest) -> Result<ParserFrame, String> {
-    let structure = &request.structure;
-    if structure.offset_unit != "utf16" {
-        return Err("Native source coordinates must be UTF-16".into());
-    }
+/// A parser structure as the grader's frame over its source `lines` (each its text's slice at its range).
+pub fn parser_frame(structure: &DocumentStructure, source_lines: &[FrameLine]) -> Result<ParserFrame, String> {
     let text = ScalarText::new(&structure.text);
     let mut lines = Vec::new();
-    for line in &request.lines {
-        let range: ScalarRange = serde_json::from_value(line.evidence.get("range").cloned().ok_or("Source range missing")?)
-            .map_err(|error| error.to_string())?;
-        if text.slice_utf16(range.start..range.end) != Some(line.text.as_str()) {
-            return Err("Source line text differs from its declared range".into());
-        }
-        lines.push((line, range, text.scalar_at_utf16(range.start).ok_or("Invalid source boundary")?));
+    for line in source_lines {
+        lines.push((line, line.range, text.scalar_at_utf16(line.range.start).ok_or("Invalid source boundary")?));
     }
     lines.sort_by_key(|(_, range, _)| (range.start, range.end));
     let nodes: HashMap<_, _> = structure.nodes.iter().map(|node| (node.id.as_str(), node)).collect();

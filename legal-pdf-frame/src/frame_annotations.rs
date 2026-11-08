@@ -1,33 +1,13 @@
 //! Annotations as logical objects: a note or table continued across fragments read as one.
 use crate::frame::{anchor, spans, Source};
-use crate::{FrameAnnotation, FrameLine, FrameLinks};
-use serde::{Deserialize, Serialize};
+use crate::{FrameAnnotation, FrameLinks};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 type Result<T> = std::result::Result<T, String>;
 
-#[derive(Debug, Deserialize)]
-pub struct FrameAnnotationsRequest {
-    pub lines: Vec<FrameLine>,
-    pub reading_order: Vec<String>,
-    pub annotations: Vec<FrameAnnotation>,
-    #[serde(default)]
-    pub continuations: FrameLinks,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ResolvedFrameAnnotations {
-    pub annotations: Vec<FrameAnnotation>,
-}
-
-/// Each annotation with the fragments its note or table continuations join to it.
-pub fn resolve_frame_annotations(mut request: FrameAnnotationsRequest) -> Result<ResolvedFrameAnnotations> {
-    let source = Source::new(&request.lines, &request.reading_order)?;
-    for annotation in &mut request.annotations {
-        source.membership(&mut annotation.line_ids, &mut annotation.spans)?;
-    }
-    let annotations = &request.annotations;
+/// Each annotation (on its source spans) with the fragments its note or table continuations join to it.
+pub(crate) fn logical_annotations(source: &Source<'_>, annotations: &[FrameAnnotation], continuations: &FrameLinks) -> Result<Vec<FrameAnnotation>> {
     // The annotation of a kind that opens at an anchor, or else holds it.
     let object = |kind: &str, id: &str| -> Result<Option<&FrameAnnotation>> {
         if let Some(found) = annotations.iter().find(|a| a.kind == kind && anchor(&a.spans[0]) == id) {
@@ -39,7 +19,7 @@ pub fn resolve_frame_annotations(mut request: FrameAnnotationsRequest) -> Result
     };
     let mut next_of = HashMap::<String, String>::new();
     for kind in ["note", "table"] {
-        for (first, link) in request.continuations.get(kind).into_iter().flatten() {
+        for (first, link) in continuations.get(kind).into_iter().flatten() {
             let left = object(kind, &source.canonical(first))?.ok_or("Continuation names absent annotation fragment")?;
             let right = object(kind, &source.canonical(&link.next))?.ok_or("Continuation names absent annotation fragment")?;
             if left.id != right.id {
@@ -88,5 +68,5 @@ pub fn resolve_frame_annotations(mut request: FrameAnnotationsRequest) -> Result
         }
         result.push(merged);
     }
-    Ok(ResolvedFrameAnnotations { annotations: result })
+    Ok(result)
 }

@@ -2,7 +2,7 @@
 //! (notes, tables, documents) and continuations. The gold is projected into it from its typed
 //! lines and units; a parser structure through the composition the apps read.
 use crate::{FrameAnnotation, FrameBlock, FrameLine, FrameLink, FrameLinks, SourceSpan};
-use legal_structure_model::DocumentStructure;
+use legal_structure_model::{DocumentStructure, ScalarRange};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -33,20 +33,9 @@ impl State {
     pub fn line(&self, id: &str) -> &Line {
         &self.lines[self.index[id]]
     }
-
-    pub fn composition_lines(&self) -> Vec<FrameLine> {
-        let line = |line: &Line| FrameLine { id: line.id.clone(), text: line.text.iter().collect(), page: line.page, evidence: BTreeMap::new() };
-        self.lines.iter().map(line).collect()
-    }
-
-    pub fn order_ids(&self) -> Vec<String> {
-        self.reading_order.iter().map(|&n| self.lines[n].id.clone()).collect()
-    }
 }
 
-pub fn anchor(span: &SourceSpan) -> String {
-    format!("{}@{}", span.line_id, span.start)
-}
+pub use crate::frame::anchor;
 
 /// A block's identity: its declared id, or its first span.
 pub fn block_id(block: &FrameBlock) -> String {
@@ -505,11 +494,11 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
     let slice = |start: usize, end: usize| -> Result<String, String> {
         String::from_utf16(units.get(start..end).ok_or("Invalid native source fragment")?).map_err(|e| e.to_string())
     };
-    let mut sources: Vec<(String, String, usize, usize, usize)> = Vec::new();
+    let mut sources: Vec<FrameLine> = Vec::new();
     if !structure.source_fragments.is_empty() {
         for fragment in &structure.source_fragments {
-            let (start, end) = (fragment.range.start, fragment.range.end);
-            sources.push((fragment.id.clone(), slice(start, end)?, fragment.page_index + 1, start, end));
+            let range = fragment.range;
+            sources.push(FrameLine { id: fragment.id.clone(), text: slice(range.start, range.end)?, page: fragment.page_index + 1, range });
         }
     } else {
         for page in structure.nodes.iter().filter(|n| n.kind == legal_structure_model::NodeKind::Page) {
@@ -524,24 +513,20 @@ pub fn parsed(structure: &DocumentStructure) -> Result<State, String> {
             }
             for (id, text) in page.line_ids.iter().zip(pieces) {
                 let stop = start + text.encode_utf16().count();
-                sources.push((id.clone(), text.to_owned(), page.page_indexes[0] + 1, start, stop));
+                sources.push(FrameLine { id: id.clone(), text: text.to_owned(), page: page.page_indexes[0] + 1, range: ScalarRange { start, end: stop } });
                 start = stop + 1;
             }
         }
     }
-    if sources.iter().map(|s| s.0.as_str()).collect::<HashSet<_>>().len() != sources.len() {
+    if sources.iter().map(|s| s.id.as_str()).collect::<HashSet<_>>().len() != sources.len() {
         return Err("Duplicate native line ID".into());
     }
-    let (mut lines, mut composition) = (Vec::new(), Vec::new());
-    for (k, (id, text, page, start, end)) in sources.iter().enumerate() {
-        // The parser's reading order is its text order, so the alignment's page-local diff follows it,
-        // as it follows the gold's typed order on the other side; box geometry would interleave the
-        // columns of a two-column page.
-        lines.push(Line { id: id.clone(), page: *page, text: text.chars().collect(), spatial: (*page, k as f64, 0.0) });
-        let evidence = BTreeMap::from([("range".to_owned(), json!({"start": start, "end": end}))]);
-        composition.push(FrameLine { id: id.clone(), text: text.clone(), page: *page, evidence });
-    }
-    let prepared = crate::parser_frame(crate::ParserFrameRequest { structure: structure.clone(), lines: composition })?;
+    // The parser's reading order is its text order, so the alignment's page-local diff follows it, as it follows
+    // the gold's typed order on the other side; box geometry would interleave the columns of a two-column page.
+    let lines: Vec<Line> = sources.iter().enumerate()
+        .map(|(k, line)| Line { id: line.id.clone(), page: line.page, text: line.text.chars().collect(), spatial: (line.page, k as f64, 0.0) })
+        .collect();
+    let prepared = crate::parser_frame(structure, &sources)?;
     let index: HashMap<String, usize> = lines.iter().enumerate().map(|(n, l)| (l.id.clone(), n)).collect();
     let mut groups = prepared.groups;
     // A node that states its region (a tagger's, the transition parser's: its grammar `region:<name>`)
