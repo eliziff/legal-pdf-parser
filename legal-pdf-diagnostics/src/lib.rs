@@ -137,9 +137,8 @@ pub fn validate_pdf_components(
     if structure_graph.document_id != document_id || structure_graph.source_sha256.as_deref() != Some(source_sha256) {
         return invalid("structure graph identity disagrees with the document");
     }
-    let (text_length, line_count) =
-        pages.iter().flat_map(|page| &page.lines).fold((0, 0_usize), |(units, count), line| (units + utf16_len(&line.text), count + 1));
-    let text_length = text_length + line_count.saturating_sub(1);
+    // The structure's ranges stand in its text.
+    let text_length = utf16_len(&structure_graph.text);
     let mut node_ids = HashSet::new();
     for node in &structure_graph.nodes {
         let grammar = node.grammar.as_deref();

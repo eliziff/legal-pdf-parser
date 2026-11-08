@@ -77,7 +77,7 @@ impl Encoder {
 
     /// Each line's class probabilities (`CLASSES` a line) and heading-level probabilities
     /// (`LEVEL_CLASSES` a line), lines in reading order.
-    pub fn probabilities(&self, table: &LineTable, texts: &[&str]) -> std::result::Result<(Vec<f32>, Vec<f32>), String> {
+    pub fn probabilities(&self, table: &LineTable, texts: &[&str], template: &[u32]) -> std::result::Result<(Vec<f32>, Vec<f32>), String> {
         let (n, m) = (table.order.len(), &self.meta);
         let features: Vec<f32> = table.features.iter().enumerate()
             .map(|(at, &value)| ((value - m.mean[at % ALL]) / m.std[at % ALL]).clamp(-8.0, 8.0)).collect();
@@ -94,7 +94,7 @@ impl Encoder {
         distinct.sort_unstable();
         distinct.dedup();
         let looks: Vec<i64> = table.looks.iter().map(|look| distinct.binary_search(look).unwrap_or(0) as i64).collect();
-        let templates: Vec<i64> = template_ids(table).into_iter().map(i64::from).collect();
+        let templates: Vec<i64> = template.iter().map(|&t| i64::from(t)).collect();
         // The openers' places (the first line where none is one), and each line's last opener at or
         // before it, counted from 1 (0 for none).
         let mut openers: Vec<i64> = (0..n).filter(|&k| opener(table, k)).map(|k| k as i64).collect();

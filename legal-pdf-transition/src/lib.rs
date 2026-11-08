@@ -355,15 +355,17 @@ pub fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &F
     if !doc && !enabled() { return None; }
     let mut table = table.clone();
     table.measure(pages, slots, evidence, fences, geometry, notes, decision);
-    let locals = locals_of(s, pages, slots, &table, sha256);
-    let mut sheet = Stylesheet::read(pages, slots, evidence, fences, geometry, outline, &table, &locals);
+    // Each line's template, which the local scores and the stylesheet both read.
+    let template = template_ids(&table);
+    let locals = locals_of(s, pages, slots, &table, &template, sha256);
+    let mut sheet = Stylesheet::read(pages, slots, evidence, fences, geometry, outline, &table, template, &locals);
     let moves = parse(s, pages, slots, fences, sha256, &table, tier0_views, &locals, &mut sheet);
     doc.then_some(moves)
 }
 
 /// Each line's local scores, read once.
 #[cfg_attr(not(feature = "encoder"), allow(unused_variables))]
-fn locals_of(s: &Settings, pages: &[Page], slots: &Slots, table: &LineTable, sha256: &str) -> Vec<Local> {
+fn locals_of(s: &Settings, pages: &[Page], slots: &Slots, table: &LineTable, template: &[u32], sha256: &str) -> Vec<Local> {
     let n = table.order.len();
     // Another tier's probabilities, where they cover the document's lines.
     let read = |path: PathBuf, width: usize| -> Option<Vec<f32>> {
@@ -375,7 +377,7 @@ fn locals_of(s: &Settings, pages: &[Page], slots: &Slots, table: &LineTable, sha
         #[cfg(feature = "encoder")]
         Some(LocalScores::Encoder(model)) => {
             let texts: Vec<&str> = table.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
-            model.probabilities(table, &texts).map_or_else(|e| {
+            model.probabilities(table, &texts, template).map_or_else(|e| {
                 eprintln!("transition parser {sha256}: {e}");
                 (None, None)
             }, |(classes, levels)| (Some(classes), Some(levels)))

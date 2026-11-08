@@ -92,10 +92,10 @@ pub fn opener(table: &LineTable, k: usize) -> bool {
 }
 
 impl Stylesheet {
-    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &legal_pdf_decide::Geometry, outline: &[PdfOutlineEntry], table: &LineTable, locals: &[Local]) -> Self {
+    /// The stylesheet of the lines `table` reads, each line's template `template` (`template_ids`).
+    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &legal_pdf_decide::Geometry, outline: &[PdfOutlineEntry], table: &LineTable, template: Vec<u32>, locals: &[Local]) -> Self {
         let n = table.order.len();
         let (size, bold, upper, edge, beside) = (feature("size"), feature("bold"), feature("upper"), feature("edge_repeated"), feature("beside"));
-        let template = template_ids(table);
         let count = template.iter().map(|&t| t as usize + 1).max().unwrap_or(0);
         // The outline's anchors: the bookmarks and the confirmed contents entries, as lines.
         // The document's bookmarks alone: its printed contents the parser links itself (`State::answering`).

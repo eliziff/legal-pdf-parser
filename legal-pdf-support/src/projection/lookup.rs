@@ -216,7 +216,7 @@ pub(crate) fn printed_unit(
         locator: format!("paragraph {}", paragraph.number),
         text: range_text(text, &paragraph.ranges),
         page_numbers: paragraph.page_numbers.clone(),
-        confidence: page.map(|item| item.text_quality.clamp(0.0, 1.0)),
+        confidence: page.map(ProjectionPage::confidence),
         confidence_basis: if page.is_some() {
             "page_text_quality"
         } else {
@@ -249,13 +249,9 @@ pub(crate) fn page_unit(
         locator: format!("[page {}]", page.number),
         text,
         page_numbers: vec![page.number],
-        confidence: Some(page.text_quality.clamp(0.0, 1.0)),
+        confidence: Some(page.confidence()),
         confidence_basis: "page_text_quality",
-        provenance: if page.source.is_empty() {
-            "unknown".to_owned()
-        } else {
-            page.source.clone()
-        },
+        provenance: page.provenance(),
         proposition: None,
         note: None,
     }
@@ -319,20 +315,19 @@ fn page_at(document: &PdfDocument, offset: usize) -> Option<u32> {
 
 /// A note as a lookup returns it: its body, the page its first call stands on and those its body does, the times its label
 /// was printed before it and once more, its numbering's restart, and its proposition.
-pub(crate) fn footnote_unit(document: &PdfDocument, notes: &[&StructureNode], at: usize) -> PdfLookupUnit {
+pub(crate) fn footnote_unit(text: &ScalarText<'_>, document: &PdfDocument, notes: &[&StructureNode], at: usize) -> PdfLookupUnit {
     let note = notes[at];
     let label = note.printed_label();
     let reference_page = note.calls.first().and_then(|call| page_at(document, call.start));
     let body_pages: Vec<u32> = note.page_indexes.iter().map(|page| *page as u32 + 1).collect();
     let mut page_numbers: Vec<u32> = reference_page.into_iter().collect();
     page_numbers.extend(body_pages.iter().filter(|page| Some(**page) != reference_page));
-    let text = ScalarText::new(document.structure.query_text());
     let property = |name: &str| note.properties.get(name).map_or("", String::as_str).to_owned();
     PdfLookupUnit {
         id: note.id.clone(),
         kind: "footnote",
         locator: format!("footnote {label}"),
-        text: rendered_slice(&text, &document.structure, note).trim().to_owned(),
+        text: rendered_slice(text, &document.structure, note).trim().to_owned(),
         page_numbers,
         confidence: None,
         confidence_basis: "footnote_pairing",
@@ -363,7 +358,7 @@ pub(crate) fn section_unit(
             if !page_numbers.contains(&page.number) {
                 page_numbers.push(page.number);
             }
-            let quality = page.text_quality.clamp(0.0, 1.0);
+            let quality = page.confidence();
             confidence = Some(confidence.map_or(quality, |value| value.min(quality)));
         }
     }
@@ -487,6 +482,7 @@ fn ordered(start: Option<usize>, end: Option<usize>) -> Option<(usize, usize)> {
 
 pub(crate) fn finish<F>(
     document: &PdfDocument,
+    text: &ScalarText<'_>,
     input: &PdfLookupRequest,
     ordered_len: usize,
     selected_start: usize,
@@ -540,13 +536,16 @@ where
         .chain(after.iter())
         .flat_map(|unit| unit.page_numbers.iter().copied())
         .collect();
-    let texts = document.page_texts();
+    // The text of each page a unit is on, as a page lookup returns it (`PdfDocument::page_texts`).
+    let nodes = nodes_by_id(document);
     let pages = document
         .pages
         .iter()
-        .zip(texts)
-        .filter(|(page, text)| page_numbers.contains(&page.number) && !text.is_empty())
-        .map(|(page, text)| PdfLookupPage { page_number: page.number, text })
+        .filter(|page| page_numbers.contains(&page.number))
+        .filter_map(|page| {
+            let text = nodes.get(page.id.as_str()).map(|node| rendered_slice(text, &document.structure, node)).unwrap_or_default();
+            (!text.is_empty()).then_some(PdfLookupPage { page_number: page.number, text })
+        })
         .collect();
     let matches = selected.iter().map(|unit| unit.id.clone()).collect();
     let mut lookup = result(input, PdfLookupStatus::Found, None);
@@ -576,6 +575,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         "page" | "line" | "paragraph" | "footnote" => input.locator_kind.as_str(),
         _ => "section",
     };
+    let text = ScalarText::new(document.structure.query_text());
     let end_locator = input
         .end_locator
         .as_deref()
@@ -657,21 +657,17 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         let Some((start, end)) = ordered(at(start_number), at(end_number)) else {
             return result(input, PdfLookupStatus::NotFound, None);
         };
-        return finish(document, input, lines.len(), start, end, |index| {
-            let (number, id, text) = &lines[index];
+        return finish(document, &text, input, lines.len(), start, end, |index| {
+            let (number, id, words) = &lines[index];
             PdfLookupUnit {
                 id: id.clone(),
                 kind: "line",
                 locator: format!("page {}, line {number}", page.number),
-                text: text.clone(),
+                text: words.clone(),
                 page_numbers: vec![page.number],
-                confidence: Some(page.text_quality.clamp(0.0, 1.0)),
+                confidence: Some(page.confidence()),
                 confidence_basis: "page_text_quality",
-                provenance: if page.source.is_empty() {
-                    "unknown".to_owned()
-                } else {
-                    page.source.clone()
-                },
+                provenance: page.provenance(),
                 proposition: None,
                 note: None,
             }
@@ -691,9 +687,8 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
             let Some((start, end)) = ordered(position(start_number), position(end_number)) else {
                 return result(input, PdfLookupStatus::NotFound, None);
             };
-            let text = ScalarText::new(document.structure.query_text());
             let nodes = nodes_by_id(document);
-            return finish(document, input, document.pages.len(), start, end, |index| {
+            return finish(document, &text, input, document.pages.len(), start, end, |index| {
                 page_unit(&document.structure, &text, &nodes, &document.pages[index])
             });
         }
@@ -714,8 +709,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
             .position(|p| std::ptr::eq(p, &selected[0]))
             .unwrap();
         let end = start + selected.len() - 1;
-        let text = ScalarText::new(document.structure.query_text());
-        return finish(document, input, printed.len(), start, end, |index| {
+        return finish(document, &text, input, printed.len(), start, end, |index| {
             printed_unit(&text, document, &printed[index])
         });
     }
@@ -741,14 +735,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         else {
             return result(input, PdfLookupStatus::NotFound, None);
         };
-        return finish(
-            document,
-            input,
-            notes.len(),
-            start,
-            end,
-            |index| footnote_unit(document, &notes, index),
-        );
+        return finish(document, &text, input, notes.len(), start, end, |index| footnote_unit(&text, document, &notes, index));
     }
     if end_locator.is_some() {
         return result(
@@ -790,13 +777,12 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
     let Some(index) = candidates.first().copied() else {
         return result(input, PdfLookupStatus::NotFound, None);
     };
-    let text = ScalarText::new(document.structure.query_text());
     let pages: HashMap<_, _> = document
         .pages
         .iter()
         .map(|page| (page.index, page))
         .collect();
-    finish(document, input, sections.len(), index, index, |index| {
+    finish(document, &text, input, sections.len(), index, index, |index| {
         section_unit(&document.structure, &text, &pages, sections[index], index)
     })
 }
