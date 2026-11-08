@@ -157,23 +157,6 @@ pub(crate) fn nfkc_text(value: &str) -> Cow<'_, str> {
     }
 }
 
-pub(crate) fn join_page_lines(lines: Vec<Line>) -> String {
-    let mut output = String::with_capacity(lines.iter().map(|line| line.text.len() + 1).sum());
-    for line in lines {
-        let text = line.text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        if output.ends_with('-') && text.chars().next().is_some_and(char::is_lowercase) {
-            output.pop();
-        } else if !output.is_empty() {
-            output.push(' ');
-        }
-        output.push_str(text);
-    }
-    output
-}
-
 pub(crate) fn range_text(text: &ScalarText<'_>, ranges: &[ScalarRange]) -> String {
     ranges
         .iter()
@@ -557,14 +540,13 @@ where
         .chain(after.iter())
         .flat_map(|unit| unit.page_numbers.iter().copied())
         .collect();
+    let texts = document.page_texts();
     let pages = document
         .pages
         .iter()
-        .filter(|page| page_numbers.contains(&page.number) && !page.evidence_text.is_empty())
-        .map(|page| PdfLookupPage {
-            page_number: page.number,
-            text: page.evidence_text.clone(),
-        })
+        .zip(texts)
+        .filter(|(page, text)| page_numbers.contains(&page.number) && !text.is_empty())
+        .map(|(page, text)| PdfLookupPage { page_number: page.number, text })
         .collect();
     let matches = selected.iter().map(|unit| unit.id.clone()).collect();
     let mut lookup = result(input, PdfLookupStatus::Found, None);
@@ -654,9 +636,9 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
                     .iter()
                     .find(|page| page.number == page_number)
             });
+        let passage = document.passage_pages();
         let Some((page, geometry)) = page.and_then(|page| {
-            document
-                .passage_pages
+            passage
                 .iter()
                 .find(|geometry| geometry.page_number == page.number)
                 .map(|geometry| (page, geometry))

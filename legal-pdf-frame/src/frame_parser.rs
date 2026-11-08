@@ -211,14 +211,16 @@ pub fn parser_frame(structure: &DocumentStructure, source_lines: &[FrameLine]) -
         let contents = node.is_some_and(|node| node.grammar.as_deref() == Some("contents") && role == PrimaryRole::Text);
         let role_name = serde_json::to_value(role).unwrap().as_str().unwrap().to_owned();
         let kind = if quoted { "quote".to_owned() } else if contents { "contents".to_owned() } else { role_name.clone() };
-        // The region a node's block is scored as, as the gold names regions: a note, a list's item, a quotation, a
-        // provision (a section the parser reads as text), a contents list, else its role.
+        // The region a node's block is scored as, as the gold names regions: a note, a list's item, a quotation (a
+        // quotation node, or a block one mostly covers), a provision (a section the parser reads as text), a contents
+        // list, else its role.
         if let Some(node) = node {
             let region = match node.kind {
                 NodeKind::Footnote | NodeKind::Endnote => "note".to_owned(),
                 NodeKind::ListItem => "list_item".to_owned(),
                 NodeKind::Quote => "quote".to_owned(),
                 NodeKind::Section if node.role == Some(PrimaryRole::Text) => "provision".to_owned(),
+                _ if quoted => "quote".to_owned(),
                 _ if contents => "contents".to_owned(),
                 _ => role_name,
             };

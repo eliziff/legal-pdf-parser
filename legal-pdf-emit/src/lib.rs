@@ -13,12 +13,12 @@
 use legal_pdf_constituents as constituents;
 use legal_pdf_core::model::Page;
 use legal_pdf_core::{Error, Result};
-use legal_pdf_fences::{decided, Fences};
+use legal_pdf_fences::Fences;
 use legal_pdf_machine::lines::LineTable;
 use legal_pdf_machine::machine::{stream_of, LineView, Move, Stands, State, Streams, MARGIN, OPENING, RANKED_BODY};
 use legal_pdf_text::joining::{seam, split_words, Join};
 use legal_pdf_structure_model::regions::{HEADING, LINE_LABEL, NOTE, NOTE_QUOTE, PAGE_LABEL, REGIONS, TABLE};
-use legal_pdf_structure_model::{Evidence, Place, Runs, Slots, StructureIdentity, TRANSITION_ORIGIN as ORIGIN};
+use legal_pdf_structure_model::{Decided, Evidence, Place, Runs, Slots, StructureIdentity, TRANSITION_ORIGIN as ORIGIN};
 use legal_pdf_text::text_index::PdfTextIndex;
 use legal_structure_model::{ContinuationKind, NodeKind, ScalarRange, SourceContinuation, SourceJoin};
 use serde_json::Value;
@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 
 mod rendered;
 
-use legal_structure_model::{Derivation, DocumentStructure, Origin, PrimaryRole, Scope, StructureDiagnostic, StructureNode};
+use legal_structure_model::{Derivation, DocumentStructure, Origin, PrimaryRole, StructureNode};
 
 /// What tier 0 settled before its moves (`tier0`): its lines are written and their regions built, the text indexed, and
 /// its notes the pairer's: their nodes, the projection's notes, the claims left aside; and the run member each unit opens
@@ -34,7 +34,6 @@ use legal_structure_model::{Derivation, DocumentStructure, Origin, PrimaryRole, 
 pub struct Settled<'a> {
     pub index: &'a PdfTextIndex,
     pub notes: Vec<StructureNode>,
-    pub diagnostics: Vec<StructureDiagnostic>,
     pub runs: &'a Runs,
     pub opened: HashMap<usize, (u32, u32)>,
     /// The further markers a unit's first line opens on, a unit each under it.
@@ -88,6 +87,7 @@ pub fn structure_graph(pages: &mut [Page],
     slots: &Slots,
     evidence: &Evidence,
     fences: &Fences,
+    decided: &Decided,
     table: &LineTable,
     views: &[LineView],
     tier0: &[Move],
@@ -232,7 +232,6 @@ pub fn structure_graph(pages: &mut [Page],
         }
     }).collect();
     let node_id = |u: usize| unit_ids[u].clone();
-    let decided = decided(pages, slots, fences);
     for page in pages.iter() {
         let Some(range) = index.page_range(page.index) else { continue };
         let mut node = StructureNode::new(page.id.clone(), NodeKind::Page, range, ORIGIN, Derivation::Native, None);
@@ -319,17 +318,15 @@ pub fn structure_graph(pages: &mut [Page],
                 _ => {}
             }
         }
-        // Its region as the tagger states one (`region:<name>`), which readers take for the unit's kind; a
-        // contents list's lines under the `contents` grammar.
-        // A numbered paragraph wholly in the translation prints that paragraph in the other language
-        // (`paragraph_printings`), as the stage's nodes say.
-        node.grammar = Some(if region == "contents" {
-            "contents".to_owned()
+        // A contents list's lines are under the `contents` grammar. A numbered paragraph wholly in the translation prints
+        // that paragraph in the other language (`paragraph_printings`), as the stage's nodes say.
+        node.grammar = if region == "contents" {
+            Some("contents".to_owned())
         } else if (kind == NodeKind::Paragraph || kind == NodeKind::Prose) && unit.lines.iter().all(|&k| views[k].translation) {
-            "translation".to_owned()
+            Some("translation".to_owned())
         } else {
-            format!("region:{region}")
-        });
+            None
+        };
         nodes.push(node);
         // A further marker on the unit's first line opens a unit under it, to the unit's end, the unit before it left with what
         // stands before that marker: "2(1) The Court has ...", the section "2" and its subsection.
@@ -355,7 +352,6 @@ pub fn structure_graph(pages: &mut [Page],
             own.marker_range = Some(ScalarRange { start, end: end.max(start) });
             own.content_start = scalar(member.content);
             own.label = Some(if kind == NodeKind::Section { member.grammar_value.clone() } else { member.label.clone() });
-            own.grammar = Some(format!("region:{}", match role { legal_structure_model::UnitRole::Section => "provision", legal_structure_model::UnitRole::Item => "list_item", legal_structure_model::UnitRole::Paragraph => "text" }));
             if kind == NodeKind::Section {
                 own.locator_kind = Some(legal_structure_model::provision_locator(&member.grammar_value, usize::from(member.level)).to_owned());
             }
@@ -390,7 +386,7 @@ pub fn structure_graph(pages: &mut [Page],
     }
     nodes.append(&mut settled.notes);
     nodes.extend(legal_pdf_graph::graph::table_nodes(index, fences.tables.iter().enumerate(), ORIGIN)?);
-    nodes.extend(legal_pdf_graph::graph::quotation_nodes(index, &decided, ORIGIN)?);
+    nodes.extend(legal_pdf_graph::graph::quotation_nodes(index, decided, ORIGIN)?);
     // Text the parser read as no region's lies outside the body, as the gold leaves it: furniture.
     for (k, chosen) in moves.iter().enumerate() {
         if chosen.region != 0 || texts[k].trim().is_empty() {
@@ -399,7 +395,6 @@ pub fn structure_graph(pages: &mut [Page],
         let Some(range) = line_range(k) else { continue };
         let mut node = StructureNode::new(format!("transition-none-{:06}", k + 1), NodeKind::Prose, range, ORIGIN, Derivation::Heuristic, None);
         node.role = Some(PrimaryRole::Furniture);
-        node.grammar = Some("region:furniture".to_owned());
         node.ranges = vec![range];
         node.line_ids = vec![id_of(k)];
         nodes.push(node);
@@ -412,25 +407,14 @@ pub fn structure_graph(pages: &mut [Page],
         constituents::Start::new(id, &kind)
     }).collect();
     nodes.extend(constituents::constituents(index, pages, &starts));
-    let text = index.text().to_owned();
-    let digest = {
-        use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(text.as_bytes()))
-    };
-    let mut structure = DocumentStructure::from_scalar_parts(
-        identity.document_id.clone(),
-        "local-pdf".to_owned(),
-        text,
-        digest,
-        Some(identity.source_sha256.clone()),
-        Scope::complete(),
-        vec![Origin { id: ORIGIN.to_owned() }, Origin { id: legal_structure_model::NOTE_PAIRING_ORIGIN.to_owned() }],
-        nodes,
-        std::mem::take(&mut settled.diagnostics),
-    );
+    let mut structure = DocumentStructure::new(identity.document_id.clone(), "local-pdf", index.text().to_owned(), ORIGIN);
+    structure.origins.push(Origin { id: legal_structure_model::NOTE_PAIRING_ORIGIN.to_owned() });
+    structure.source_sha256 = Some(identity.source_sha256.clone());
+    DocumentStructure::project_scalar_parts(&legal_structure_model::ScalarText::new(&structure.text), &mut nodes, &mut Vec::new());
+    structure.nodes = nodes;
     // The outline is tier 0's: each constituent document's and language's own stacks, a quotation within what quotes it.
     let levels: HashMap<&str, usize> = units.iter().filter(|unit| unit.level > 0).flat_map(|unit| unit.lines.iter().map(|&k| (ids[k].as_str(), unit.level))).collect();
-    let contexts = legal_pdf_graph::graph::outline_contexts(&mut structure.nodes, &identity.document_id, index, &decided);
+    let contexts = legal_pdf_graph::graph::outline_contexts(&mut structure.nodes, &identity.document_id, index, decided);
     legal_pdf_graph::graph::assemble_outline(&mut structure.nodes, &contexts, index.text(), &|id| levels.get(id).copied());
     // A provision's path from the outermost provision it stands in ("12(1)(a)"), by the parents the outline kept, after
     // its printing's alias where it has one: each unit's printed label along the chain.
@@ -466,11 +450,11 @@ pub fn structure_graph(pages: &mut [Page],
     }
     structure.joins.extend(joins);
     structure.continuations = Some(continuations);
-    legal_pdf_graph::graph::read_judgment_paragraphs(&mut structure, pages, &decided, &HashSet::new());
+    legal_pdf_graph::graph::read_judgment_paragraphs(&mut structure, pages, decided, &HashSet::new());
     structure.profile = identity.profile;
     let runs = rendered::render(pages, &mut structure)?;
     let units = rendered::authority_units(&structure, &runs);
-    legal_pdf_notes::note_context::attach_propositions(&mut structure, &units, &decided);
+    legal_pdf_notes::note_context::attach_propositions(&mut structure, &units, decided);
     structure.refresh_revision().map_err(|e| Error::Message(e.to_string()))?;
     Ok((structure, units))
 }

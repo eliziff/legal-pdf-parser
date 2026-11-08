@@ -190,8 +190,8 @@ fn output(pages: &mut [Page],
     // notes, the pairer's (a line either reads as a note keeps this reading's move). DOC reads the same table, so its
     // reading of a marker names one of this reading's.
     tier0::in_slot_order(pages, slots);
-    let settled = Settled { index: &index, notes, diagnostics: Vec::new(), runs, opened, within };
-    let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &table, &views, &moves, doc, identity, settled)?;
+    let settled = Settled { index: &index, notes, runs, opened, within };
+    let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &decided, &table, &views, &moves, doc, identity, settled)?;
     diagnostics.extend(note_crossrefs(&structure_graph, &decided));
     in_reading_order(pages, slots, &fences);
     Ok(StructureOutput { authority_text_units, diagnostics, structure_graph, heading_sources })

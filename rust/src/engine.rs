@@ -484,12 +484,10 @@ fn derive_document(
             }
         }
     }
-    let mut parsed = profile::measure("project_document", || {
+    Ok(profile::measure("project_document", || {
         let (metadata, pages) = (extracted.metadata, extracted.pages);
-        PdfDocument::from_parts(source_hash, key, document_status, metadata, pages, derived.authority_text_units, derived.structure_graph)
-    });
-    parsed.set_passage_evidence(passage_pages);
-    Ok(parsed)
+        PdfDocument::from_parts(source_hash, key, document_status, metadata, pages, passage_pages, derived.authority_text_units, derived.structure_graph)
+    }))
 }
 
 /// The structure gold's inputs: `pdf`'s pages exactly as a parse of this build feeds its structure

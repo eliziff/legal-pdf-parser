@@ -8,9 +8,8 @@ pub struct PdfDocument {
     pub(crate) pages: Vec<ProjectionPage>,
     pub(crate) authority_text_units: Vec<Value>,
     pub(crate) summary: PdfSummary,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) recognized_pages: Option<Vec<PdfTextPage>>,
-    pub(crate) passage_pages: Arc<Vec<PdfTextPage>>,
+    /// The extraction's pages as witnesses, as read before the structure stage rewrote their lines.
+    pub(crate) evidence: Arc<Vec<PdfTextPage>>,
     #[serde(skip)]
     pub(crate) printed: OnceLock<Vec<PrintedParagraph>>,
 }
@@ -85,7 +84,6 @@ pub(crate) struct ProjectionPage {
     pub(crate) id: String,
     pub(crate) index: usize,
     pub(crate) number: u32,
-    pub(crate) evidence_text: String,
     pub(crate) source: String,
     pub(crate) text_quality: f64,
 }
@@ -131,19 +129,14 @@ impl PdfDocument {
         status: String,
         metadata: PdfExtractionMetadata,
         pages: Vec<Page>,
+        evidence: Arc<Vec<PdfTextPage>>,
         authority_text_units: Vec<Value>,
         structure: DocumentStructure,
     ) -> Self {
         let summary = summary(source_sha256, cache_key, pages.len(), status, metadata);
-        let recognized_pages = pages
-            .iter()
-            .filter(|page| page.source != "native")
-            .map(text_page)
-            .collect();
         Self {
-            passage_pages: Arc::new(Vec::new()),
+            evidence,
             printed: OnceLock::new(),
-            recognized_pages: Some(recognized_pages),
             structure,
             pages: pages
                 .into_iter()
@@ -152,7 +145,6 @@ impl PdfDocument {
                          id,
                          index,
                          number,
-                         lines,
                          source,
                          text_quality,
                          ..
@@ -160,7 +152,6 @@ impl PdfDocument {
                         id,
                         index,
                         number,
-                        evidence_text: join_page_lines(lines),
                         source,
                         text_quality,
                     },
@@ -171,58 +162,25 @@ impl PdfDocument {
         }
     }
 
-    pub fn has_recognized_geometry(&self) -> bool {
-        self.recognized_pages.is_some()
-    }
-
     /// Capture extraction witnesses before structural derivation rewrites lines.
     pub fn passage_evidence(pages: &[Page]) -> Arc<Vec<PdfTextPage>> {
         Arc::new(pages.iter().map(text_page).collect())
     }
 
-    pub fn set_passage_evidence(&mut self, pages: Arc<Vec<PdfTextPage>>) {
-        self.printed.take();
-        self.recognized_pages = Some(pages.iter().filter(|page|page.source!="native").cloned().collect());
-        self.passage_pages = Arc::new(pages.iter().map(|page| {
-            let mut evidence=page.clone();
-            if evidence.source!="native" {evidence.lines.clear();evidence.regions.clear();}
-            evidence
-        }).collect());
-    }
-
-    /// The pages passages are read from: the extraction witnesses, with a recognized scan's
-    /// lines in place of its empty native page.
+    /// The pages passages are read from: the extraction witnesses, a recognized scan's lines each read in full with its
+    /// words in order (`recognized_witness_line`).
     pub fn passage_pages(&self) -> Arc<Vec<PdfTextPage>> {
-        let recognized = self.recognized_pages();
-        if recognized.iter().all(|page| page.lines.is_empty()) {
-            return Arc::clone(&self.passage_pages);
+        if self.evidence.iter().all(|page| page.source == "native") {
+            return Arc::clone(&self.evidence);
         }
-        Arc::new(
-            self.passage_pages
-                .iter()
-                .map(|page| {
-                    match recognized.iter().find(|read| {
-                        read.page_number == page.page_number
-                            && page.lines.is_empty()
-                            && !read.lines.is_empty()
-                    }) {
-                        Some(read) => PdfTextPage {
-                            page_number: page.page_number,
-                            source: read.source.clone(),
-                            regions: read.regions.clone(),
-                            width: page.width,
-                            height: page.height,
-                            lines: read.lines.iter().map(recognized_witness_line).collect(),
-                        },
-                        None => page.clone(),
-                    }
-                })
-                .collect(),
-        )
+        Arc::new(self.evidence.iter().map(|page| if page.source == "native" { page.clone() } else {
+            PdfTextPage { lines: page.lines.iter().map(recognized_witness_line).collect(), ..page.clone() }
+        }).collect())
     }
 
-    pub fn recognized_pages(&self) -> &[PdfTextPage] {
-        self.recognized_pages.as_deref().unwrap_or(&[])
+    /// The pages recognition read, as it read them.
+    pub fn recognized_pages(&self) -> impl Iterator<Item = &PdfTextPage> {
+        self.evidence.iter().filter(|page| page.source != "native")
     }
 
     pub fn structure(&self) -> &legal_structure_model::DocumentStructure {
@@ -267,8 +225,7 @@ impl PdfDocument {
         let product = serialization_sha256(&(
             &self.pages,
             &self.summary,
-            &self.passage_pages,
-            &self.recognized_pages,
+            &self.evidence,
         ));
         fingerprint.components.insert("pdf", product.clone());
         fingerprint.result_sha256 =
@@ -350,23 +307,13 @@ impl PdfDocument {
         paragraphs
     }
 
-    /// Every page's text, in page order, as a page lookup returns it: empty where
-    /// the page has no exact text. One read instead of one lookup per page.
-    pub fn page_texts(&self) -> Vec<&str> {
+    /// Every page's text, in page order, as a page lookup returns it: its page node's rendered text, empty where the page
+    /// has none. One read instead of one lookup per page.
+    pub fn page_texts(&self) -> Vec<String> {
         let text = ScalarText::new(self.structure.query_text());
         let nodes = nodes_by_id(self);
-        self.pages
-            .iter()
-            .map(|page| {
-                let exact = nodes
-                    .get(page.id.as_str())
-                    .is_some_and(|node| !rendered_slice(&text, &self.structure, node).is_empty());
-                if exact {
-                    page.evidence_text.as_str()
-                } else {
-                    ""
-                }
-            })
+        self.pages.iter()
+            .map(|page| nodes.get(page.id.as_str()).map(|node| rendered_slice(&text, &self.structure, node)).unwrap_or_default())
             .collect()
     }
 }
