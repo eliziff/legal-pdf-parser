@@ -158,7 +158,6 @@ fn output(pages: &mut [Page],
     let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, outline, &identity.source_sha256, &notes, &decision, &table, &views);
     let mut diagnostics = std::mem::take(&mut fences.diagnostics);
     diagnostics.append(&mut notes.diagnostics);
-    diagnostics.append(&mut decision.diagnostics);
     if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision);
     }

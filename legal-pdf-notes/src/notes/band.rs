@@ -25,7 +25,7 @@ use super::*;
 use legal_pdf_core::model::{Diagnostic, Line, Page};
 use legal_pdf_core::median;
 use legal_pdf_headings::headings::recognized_page;
-use legal_pdf_layout::{
+use legal_pdf_layout::{ColumnKind, 
     aligned_note_body_among, band_geometry_top, columns_of, kept_items, line_center_x, line_width, margin_note_model,
     standalone_note_label, ColumnModel,
 };
@@ -338,7 +338,7 @@ fn page_facts(band: &BandPage, sheet: &Sheet, reading: &PageReading, candidates:
     let numeric: Vec<u32> = candidates.iter().filter_map(|(_, prefix, _)| prefix.label.parse().ok()).collect();
     let columns = {
         let page_model = if sheet.members.len() == page.lines.len() { band.columns } else { columns_among(band, sheet, &sheet.member) };
-        if page_model.kind == "two_column" {
+        if page_model.kind == ColumnKind::Two {
             page_model
         } else {
             let mut labelled = vec![false; page.lines.len()];
@@ -346,7 +346,7 @@ fn page_facts(band: &BandPage, sheet: &Sheet, reading: &PageReading, candidates:
                 labelled[*place] = true;
             }
             let label_model = columns_among(band, sheet, &labelled);
-            if label_model.kind == "single" { page_model } else { label_model }
+            if label_model.kind == ColumnKind::Single { page_model } else { label_model }
         }
     };
     let first_candidate_y = candidates.first().map(|(place, _, _)| sheet.line(*place).bbox[1]);
@@ -520,7 +520,7 @@ fn labels(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate], facts:
                 || counts_on
                 || (lower
                     && (separator.is_some_and(|cut| line.bbox[1] >= cut - reading.tolerance)
-                        || (facts.columns.kind == "two_column" && *typographic)
+                        || (facts.columns.kind == ColumnKind::Two && *typographic)
                         || (separator.is_none()
                             && (*typographic
                                 || reference_backed
@@ -614,7 +614,7 @@ fn note_cut(sheet: &Sheet, reading: &PageReading, labels: &[usize], contents_pag
 /// column's first label (or the note body it aligns with), and under a notes heading at the
 /// column's first line. `furniture` holds the page's running heads and feet.
 fn column_cuts(sheet: &Sheet, labels: &[usize], columns: ColumnModel, has_margin: bool, endnote_page: bool, facts: &PageFacts, furniture: &dyn Fn(usize) -> bool) -> Option<[Option<f64>; 2]> {
-    if !((columns.kind == "two_column" || has_margin) && (!endnote_page || facts.endnote_heading_y.is_some())) {
+    if !((columns.kind == ColumnKind::Two || has_margin) && (!endnote_page || facts.endnote_heading_y.is_some())) {
         return None;
     }
     let lines = &sheet.page.lines;
@@ -628,7 +628,7 @@ fn column_cuts(sheet: &Sheet, labels: &[usize], columns: ColumnModel, has_margin
             .min(band_geometry_top(label));
         cuts[column] = Some(cuts[column].map_or(label_top, |cut| cut.min(label_top)));
     }
-    if !(cuts.iter().all(Option::is_some) || (columns.kind == "margin_column" && cuts.iter().any(Option::is_some))) {
+    if !(cuts.iter().all(Option::is_some) || (columns.kind == ColumnKind::Margin && cuts.iter().any(Option::is_some))) {
         return None;
     }
     if let Some(heading_y) = facts.endnote_heading_y {

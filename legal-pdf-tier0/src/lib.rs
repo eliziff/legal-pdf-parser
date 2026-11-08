@@ -91,7 +91,6 @@ pub fn line_views<'a>(pages: &[Page], slots: &Slots, evidence: &Evidence, fences
                 look_heading_lines: 0.0,
                 template: TemplateView::default(),
                 anchor: 0,
-                listed: false,
                 regime: [0.0; 4],
                 title_key: String::new(),
                 contents_title: None,

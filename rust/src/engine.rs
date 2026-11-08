@@ -254,7 +254,6 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
 struct CachedExtraction<T = ExtractedPdf> {
     schema_version: String,
     source_sha256: String,
-    cache_key: String,
     extraction: T,
 }
 
@@ -776,7 +775,7 @@ fn recognized_extraction(
     } else {
         let extracted = profile::measure("extract_pdf", || extract_pdf(bytes, None, None))?;
         if let Some(path) = &extraction_path {
-            let entry = CachedExtraction { schema_version: EXTRACTION_CACHE_SCHEMA.to_owned(), source_sha256: source_hash.to_owned(), cache_key: extraction_key, extraction: &extracted };
+            let entry = CachedExtraction { schema_version: EXTRACTION_CACHE_SCHEMA.to_owned(), source_sha256: source_hash.to_owned(), extraction: &extracted };
             let result = profile::measure("extraction_cache_write", || write_gzip_json(path, &entry));
             if options.require_cache_write {
                 result?;
@@ -839,7 +838,7 @@ pub fn corpus_check_cached_extraction(input: impl AsRef<Path>) -> Result<Value> 
     }
     let page_count = cached.extraction.pages.len();
     let line_count = cached.extraction.pages.iter().map(|page| page.lines.len()).sum::<usize>();
-    let (source_sha256, cache_key) = (cached.source_sha256.clone(), cached.cache_key.clone());
+    let source_sha256 = cached.source_sha256.clone();
     let (extracted, graph) = corpus_structure(&source_sha256, cached.extraction)?;
     let graph = &graph;
     // Each document's nodes, a line each, for reading two engines' graphs side by side.
@@ -860,25 +859,19 @@ pub fn corpus_check_cached_extraction(input: impl AsRef<Path>) -> Result<Value> 
     let proofs = graph.nodes.iter().filter_map(|node| node.proof.as_ref().map(|proof| (node.id.as_str(), proof))).collect::<Vec<_>>();
     let name = |value: serde_json::Result<Value>| value.ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_else(|| "unknown".to_owned());
     let by_rule = count(&mut proofs.iter().map(|(_, proof)| name(serde_json::to_value(proof.rule))));
-    let coded = |code: &str| graph.diagnostics.iter().filter(|diagnostic| diagnostic.code == code).count();
     let heading_derived_sections = graph
         .nodes
         .iter()
         .filter(|node| node.kind == legal_structure_model::NodeKind::Section && node.grammar.as_deref() == Some("accepted_heading"))
         .count();
-    let diagnostics_by_code = count(&mut graph.diagnostics.iter().map(|diagnostic| diagnostic.code.clone()));
     let structure = json!({
         "schema_version": graph.schema_version,
         "node_count": graph.nodes.len(),
         "note_count": graph.nodes.iter().filter(|node| matches!(node.kind, legal_structure_model::NodeKind::Footnote | legal_structure_model::NodeKind::Endnote)).count(),
-        "diagnostic_count": graph.diagnostics.len(),
         "by_kind": by_kind,
         "by_rule": by_rule,
         "sections_by_locator_kind": sections_by_locator_kind,
-        "diagnostics_by_code": diagnostics_by_code,
         "heading_derived_section_count": heading_derived_sections,
-        "abstention_count": coded("structure_run_abstained"),
-        "partial_resolution_count": coded("structure_run_partially_resolved"),
         "graph_sha256": serialization_sha256(graph)?,
         "proofs_sha256": serialization_sha256(&proofs)?,
         "examples": structure_examples(graph),

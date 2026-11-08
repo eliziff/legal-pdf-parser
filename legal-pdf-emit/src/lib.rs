@@ -415,7 +415,7 @@ pub fn structure_graph(pages: &mut [Page],
     let mut structure = DocumentStructure::new(identity.document_id.clone(), "local-pdf", index.text().to_owned(), ORIGIN);
     structure.origins.push(Origin { id: legal_structure_model::NOTE_PAIRING_ORIGIN.to_owned() });
     structure.source_sha256 = Some(identity.source_sha256.clone());
-    DocumentStructure::project_scalar_parts(&legal_structure_model::ScalarText::new(&structure.text), &mut nodes, &mut Vec::new());
+    DocumentStructure::project_scalar_parts(&legal_structure_model::ScalarText::new(&structure.text), &mut nodes);
     structure.nodes = nodes;
     // The outline is tier 0's: each constituent document's and language's own stacks, a quotation within what quotes it.
     let levels: HashMap<&str, usize> = units.iter().filter(|unit| unit.level > 0).flat_map(|unit| unit.lines.iter().map(|&k| (ids[k].as_str(), unit.level))).collect();
