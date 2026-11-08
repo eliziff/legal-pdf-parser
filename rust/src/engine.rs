@@ -398,7 +398,6 @@ fn derive_extracted(
         Some(parse_cache_root(root).join("reader").join(format!("{key}.json.gz")))
     });
     let mut derived = legal_pdf_structure::derive_cached(
-        legal_structure_model::structure_analysis(),
         &mut extracted.pages,
         &extracted.separators,
         &extracted.outline,

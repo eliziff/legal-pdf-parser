@@ -307,7 +307,6 @@ pub struct Lists {
 /// page's furniture (running heads and feet, folios), which are headings already and which a table
 /// holds, and each view's page number (the label the PDF declares for it, else its folio's).
 pub struct ListInput<'a> {
-    pub analysis: &'a dyn StructureAnalysis,
     pub line_label: &'a dyn Fn(Slot) -> bool,
     pub furniture: &'a dyn Fn(Slot) -> bool,
     pub heading: &'a dyn Fn(Slot) -> bool,
