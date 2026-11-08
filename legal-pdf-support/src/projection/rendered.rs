@@ -14,6 +14,31 @@ pub(crate) fn extend_range(range: Option<ScalarRange>, next: ScalarRange) -> Opt
     }))
 }
 
+/// A node's own ranges: its parts, else its range.
+fn own_ranges(node: &StructureNode) -> &[ScalarRange] {
+    if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges }
+}
+
+/// A heading's node, by its kind or its role.
+fn heading_node(node: &StructureNode) -> bool {
+    node.kind == NodeKind::Heading || node.role == Some(legal_structure_model::PrimaryRole::Heading)
+}
+
+/// A node's own text: a heading's heading range where it has one, else its own ranges.
+fn heading_or_own(node: &StructureNode) -> &[ScalarRange] {
+    heading_node(node).then_some(node.heading_range.as_ref()).flatten()
+        .map(std::slice::from_ref).unwrap_or_else(|| own_ranges(node))
+}
+
+/// A continuation of a heading's kind or a paragraph's, as the node is.
+fn continuation_kind(node: &StructureNode) -> legal_structure_model::ContinuationKind {
+    if heading_node(node) {
+        legal_structure_model::ContinuationKind::Heading
+    } else {
+        legal_structure_model::ContinuationKind::Paragraph
+    }
+}
+
 /// Preserve a native producer's witnessed dehyphenation as a manuscript-only edit.
 pub(crate) fn attach_manuscript_edits(paragraphs: &[Paragraph], structure: &mut DocumentStructure)
     -> Vec<(legal_structure_model::SourceJoin, Option<legal_structure_model::SourceContinuation>)> {
@@ -49,8 +74,7 @@ pub(crate) fn attach_manuscript_edits(paragraphs: &[Paragraph], structure: &mut 
             | NodeKind::Heading | NodeKind::Footnote | NodeKind::Endnote))
         .flat_map(|other| {
             let owner = node_at[other.id.as_str()];
-            (if other.ranges.is_empty() { std::slice::from_ref(&other.range) } else { &other.ranges })
-                .iter().map(move |range| (range.start, range.end, owner))
+            own_ranges(other).iter().map(move |range| (range.start, range.end, owner))
         })
         .collect();
     owned.sort_by_key(|&(start, _, _)| start);
@@ -74,12 +98,7 @@ pub(crate) fn attach_manuscript_edits(paragraphs: &[Paragraph], structure: &mut 
     for paragraph in paragraphs {
         let Some(&index) = node_at.get(paragraph.id.as_str()) else { continue; };
         let node = &structure.nodes[index];
-        let own = if matches!(node.kind, NodeKind::Heading)
-            || node.role == Some(legal_structure_model::PrimaryRole::Heading) {
-            node.heading_range.as_ref().map(std::slice::from_ref)
-        } else { None }.unwrap_or_else(|| {
-            if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges }
-        });
+        let own = heading_or_own(node);
         let output = ScalarText::new(&paragraph.text);
         for pair in paragraph.source_spans.windows(2) {
             let left = &pair[0];
@@ -136,9 +155,7 @@ pub(crate) fn attach_manuscript_edits(paragraphs: &[Paragraph], structure: &mut 
                             (start < range.end.min(fragment.end)).then_some(start)
                         })).min();
                     Some(legal_structure_model::SourceContinuation {
-                        kind: if node.kind == NodeKind::Heading || node.role == Some(legal_structure_model::PrimaryRole::Heading) {
-                            legal_structure_model::ContinuationKind::Heading
-                        } else { legal_structure_model::ContinuationKind::Paragraph },
+                        kind: continuation_kind(node),
                         from: first(a.page_index)?, to: first(b.page_index)?, separator: Some(String::new()),
                     })
                 } else { None };
@@ -193,12 +210,7 @@ pub(crate) fn attach_source_continuations(
     }).collect::<Vec<_>>();
     let links = |node: &StructureNode, produced: &str,
                  spans: &[legal_pdf_core::model::SourceTextSpan], kind| {
-        let heading = node.kind == NodeKind::Heading
-            || node.role == Some(legal_structure_model::PrimaryRole::Heading);
-        let own = heading.then_some(node.heading_range.as_ref()).flatten()
-            .map(std::slice::from_ref).unwrap_or_else(|| {
-                if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges }
-            });
+        let own = heading_or_own(node);
         let output = ScalarText::new(produced);
         let mut starts = HashMap::<usize, usize>::new();
         let mut ends = HashMap::<usize, usize>::new();
@@ -274,13 +286,7 @@ pub(crate) fn attach_source_continuations(
     let mut continuations = Vec::new();
     for paragraph in paragraphs {
         if let Some(node) = nodes.get(paragraph.id.as_str()) {
-            let kind = if node.kind == NodeKind::Heading
-                || node.role == Some(legal_structure_model::PrimaryRole::Heading) {
-                legal_structure_model::ContinuationKind::Heading
-            } else { legal_structure_model::ContinuationKind::Paragraph };
-            if let Some(found) = links(node, &paragraph.text, &paragraph.source_spans, kind) {
-                continuations.extend(found);
-            }
+            continuations.extend(links(node, &paragraph.text, &paragraph.source_spans, continuation_kind(node)).into_iter().flatten());
         }
     }
     let mut notes = HashMap::<&str, &legal_structure_model::Note>::new();
