@@ -3,23 +3,10 @@
 
 use super::*;
 
-/// A paragraph a PDF numbers in print ("[12]", or 12 in the margin): its number, its span of the
-/// query text in UTF-16 code units, the pages it is on and its native lines, over every printing of
-/// it (a parallel report's columns). `ranges` is exact membership; `start` and `end` only position
-/// its envelope.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PrintedParagraph {
-    /// Its printings' nodes, the first printing's first.
-    #[serde(skip)]
-    pub(crate) ids: Vec<String>,
-    pub number: usize,
-    pub start: usize,
-    pub end: usize,
-    pub ranges: Vec<ScalarRange>,
-    pub page_numbers: Vec<u32>,
-    pub line_ids: Vec<String>,
-}
+/// A paragraph a PDF numbers in print ("[12]", or 12 in the margin): its number and its printings, the structure's
+/// paragraph nodes that print it (a parallel report's columns), the first printing's first, as the structure engine
+/// reads them (`paragraph_printings`).
+pub type PrintedParagraph = (usize, Vec<usize>);
 
 #[derive(Clone, Serialize)]
 pub struct PdfLookupRequest {
@@ -191,32 +178,28 @@ pub(crate) fn section_nodes(document: &PdfDocument) -> Vec<&StructureNode> {
         .collect()
 }
 
-pub(crate) fn nodes_by_id(document: &PdfDocument) -> HashMap<&str, &StructureNode> {
-    document
-        .structure
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node))
-        .collect()
-}
-
-/// A declared paragraph as a lookup unit, retaining its graph identity.
+/// A declared paragraph as a lookup unit, retaining its graph identity: its printings' text and pages.
 pub(crate) fn printed_unit(
     text: &ScalarText<'_>,
     document: &PdfDocument,
-    paragraph: &PrintedParagraph,
+    (number, printings): &PrintedParagraph,
 ) -> PdfLookupUnit {
-    let page = paragraph
-        .page_numbers
+    let nodes: Vec<&StructureNode> = printings.iter().map(|&index| &document.structure.nodes[index]).collect();
+    let mut ranges: Vec<ScalarRange> = nodes.iter().flat_map(|node| document.structure.query_ranges(node).into_owned()).collect();
+    ScalarRange::normalize_union(&mut ranges);
+    let mut page_numbers: Vec<u32> = nodes.iter().flat_map(|node| node.page_indexes.iter().map(|page| (*page + 1) as u32)).collect();
+    page_numbers.sort_unstable();
+    page_numbers.dedup();
+    let page = page_numbers
         .first()
-        .and_then(|number| document.pages.iter().find(|page| page.number == *number));
+        .and_then(|number| document.page_nodes().find(|page| page_number(page) == *number));
     PdfLookupUnit {
-        id: paragraph.ids[0].clone(),
+        id: nodes[0].id.clone(),
         kind: "paragraph",
-        locator: format!("paragraph {}", paragraph.number),
-        text: range_text(text, &paragraph.ranges),
-        page_numbers: paragraph.page_numbers.clone(),
-        confidence: page.map(ProjectionPage::confidence),
+        locator: format!("paragraph {number}"),
+        text: range_text(text, &ranges),
+        page_numbers,
+        confidence: page.map(page_confidence),
         confidence_basis: if page.is_some() {
             "page_text_quality"
         } else {
@@ -228,30 +211,16 @@ pub(crate) fn printed_unit(
     }
 }
 
-pub(crate) fn page_unit(
-    document: &DocumentStructure,
-    text: &ScalarText<'_>,
-    nodes: &HashMap<&str, &StructureNode>,
-    page: &ProjectionPage,
-) -> PdfLookupUnit {
-    let text = nodes
-        .get(page.id.as_str())
-        .copied()
-        .map(|node| rendered_slice(text, document, node))
-        .unwrap_or_default();
+pub(crate) fn page_unit(document: &DocumentStructure, text: &ScalarText<'_>, page: &StructureNode) -> PdfLookupUnit {
     PdfLookupUnit {
-        id: if page.id.is_empty() {
-            format!("page-{}", page.number)
-        } else {
-            page.id.clone()
-        },
+        id: page.id.clone(),
         kind: "page",
-        locator: format!("[page {}]", page.number),
-        text,
-        page_numbers: vec![page.number],
-        confidence: Some(page.confidence()),
+        locator: format!("[page {}]", page_number(page)),
+        text: rendered_slice(text, document, page),
+        page_numbers: vec![page_number(page)],
+        confidence: Some(page_confidence(page)),
         confidence_basis: "page_text_quality",
-        provenance: page.provenance(),
+        provenance: page_provenance(page),
         proposition: None,
         note: None,
     }
@@ -262,7 +231,7 @@ pub(crate) fn page_unit(
 /// blank line is left out.
 pub(crate) fn transcript_lines(
     document: &PdfDocument,
-    page: &ProjectionPage,
+    page: &StructureNode,
     geometry: &PdfTextPage,
 ) -> Vec<(usize, String, String)> {
     let height = |rect: &[f64; 4]| (rect[3] - rect[1]).max(0.1);
@@ -272,7 +241,7 @@ pub(crate) fn transcript_lines(
         .iter()
         .filter(|node| {
             node.role == Some(legal_structure_model::PrimaryRole::LineLabel)
-                && node.page_indexes.contains(&page.index)
+                && node.page_indexes.contains(&page_index(page))
         })
         .filter_map(|node| {
             let number = node.label.as_deref()?.trim().parse().ok()?;
@@ -347,7 +316,7 @@ pub(crate) fn footnote_unit(text: &ScalarText<'_>, document: &PdfDocument, notes
 pub(crate) fn section_unit(
     document: &DocumentStructure,
     text: &ScalarText<'_>,
-    pages: &HashMap<usize, &ProjectionPage>,
+    pages: &HashMap<usize, &StructureNode>,
     section: &StructureNode,
     index: usize,
 ) -> PdfLookupUnit {
@@ -355,10 +324,10 @@ pub(crate) fn section_unit(
     let mut confidence: Option<f64> = None;
     for page_index in &section.page_indexes {
         if let Some(page) = pages.get(page_index) {
-            if !page_numbers.contains(&page.number) {
-                page_numbers.push(page.number);
+            if !page_numbers.contains(&page_number(page)) {
+                page_numbers.push(page_number(page));
             }
-            let quality = page.confidence();
+            let quality = page_confidence(page);
             confidence = Some(confidence.map_or(quality, |value| value.min(quality)));
         }
     }
@@ -537,14 +506,12 @@ where
         .flat_map(|unit| unit.page_numbers.iter().copied())
         .collect();
     // The text of each page a unit is on, as a page lookup returns it (`PdfDocument::page_texts`).
-    let nodes = nodes_by_id(document);
     let pages = document
-        .pages
-        .iter()
-        .filter(|page| page_numbers.contains(&page.number))
+        .page_nodes()
+        .filter(|page| page_numbers.contains(&page_number(page)))
         .filter_map(|page| {
-            let text = nodes.get(page.id.as_str()).map(|node| rendered_slice(text, &document.structure, node)).unwrap_or_default();
-            (!text.is_empty()).then_some(PdfLookupPage { page_number: page.number, text })
+            let text = rendered_slice(text, &document.structure, page);
+            (!text.is_empty()).then_some(PdfLookupPage { page_number: page_number(page), text })
         })
         .collect();
     let matches = selected.iter().map(|unit| unit.id.clone()).collect();
@@ -616,31 +583,14 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         // none is read by its own page numbers.
         let printed = page_number.to_string();
         let page = document
-            .structure
-            .nodes
-            .iter()
-            .find(|node| {
-                node.label
-                    .as_deref()
-                    .is_some_and(|label| label.starts_with("page"))
-                    && node
-                        .aliases
-                        .as_ref()
-                        .is_some_and(|aliases| aliases.iter().any(|alias| alias.trim() == printed))
-            })
-            .and_then(|node| node.page_indexes.first())
-            .and_then(|index| document.pages.iter().find(|page| page.index == *index))
-            .or_else(|| {
-                document
-                    .pages
-                    .iter()
-                    .find(|page| page.number == page_number)
-            });
+            .page_nodes()
+            .find(|page| page.aliases.as_ref().is_some_and(|aliases| aliases.iter().any(|alias| alias.trim() == printed)))
+            .or_else(|| document.page_nodes().find(|page| self::page_number(page) == page_number));
         let passage = document.passage_pages();
         let Some((page, geometry)) = page.and_then(|page| {
             passage
                 .iter()
-                .find(|geometry| geometry.page_number == page.number)
+                .find(|geometry| geometry.page_number == self::page_number(page))
                 .map(|geometry| (page, geometry))
         }) else {
             return result(input, PdfLookupStatus::NotFound, None);
@@ -662,12 +612,12 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
             PdfLookupUnit {
                 id: id.clone(),
                 kind: "line",
-                locator: format!("page {}, line {number}", page.number),
+                locator: format!("page {}, line {number}", self::page_number(page)),
                 text: words.clone(),
-                page_numbers: vec![page.number],
-                confidence: Some(page.confidence()),
+                page_numbers: vec![self::page_number(page)],
+                confidence: Some(page_confidence(page)),
                 confidence_basis: "page_text_quality",
-                provenance: page.provenance(),
+                provenance: page_provenance(page),
                 proposition: None,
                 note: None,
             }
@@ -679,17 +629,17 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
             Err(invalid) => return invalid,
         };
         if kind == "page" {
+            let pages: Vec<&StructureNode> = document.page_nodes().collect();
             let position = |number| {
                 u32::try_from(number)
                     .ok()
-                    .and_then(|number| document.pages.iter().position(|page| page.number == number))
+                    .and_then(|number| pages.iter().position(|page| page_number(page) == number))
             };
             let Some((start, end)) = ordered(position(start_number), position(end_number)) else {
                 return result(input, PdfLookupStatus::NotFound, None);
             };
-            let nodes = nodes_by_id(document);
-            return finish(document, &text, input, document.pages.len(), start, end, |index| {
-                page_unit(&document.structure, &text, &nodes, &document.pages[index])
+            return finish(document, &text, input, pages.len(), start, end, |index| {
+                page_unit(&document.structure, &text, pages[index])
             });
         }
         if end_number - start_number >= MAX_UNITS {
@@ -777,11 +727,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
     let Some(index) = candidates.first().copied() else {
         return result(input, PdfLookupStatus::NotFound, None);
     };
-    let pages: HashMap<_, _> = document
-        .pages
-        .iter()
-        .map(|page| (page.index, page))
-        .collect();
+    let pages: HashMap<_, _> = document.page_nodes().map(|page| (page_index(page), page)).collect();
     finish(document, &text, input, sections.len(), index, index, |index| {
         section_unit(&document.structure, &text, &pages, sections[index], index)
     })

@@ -277,39 +277,22 @@ impl ModelPack {
     }
 }
 
+/// PP-DocLayout over a checked model pack: what its identity is made of, read when it is made (cheaply, so a cache key can
+/// be taken before any page is read), and its OpenVINO session, opened when it first reads a page.
 pub struct PPDocLayout {
-    session: OpenVinoSession,
-    pack: ModelPack,
-    threshold: f32,
-    render_dpi: u16,
-    identity: String,
-}
-
-pub struct PreparedPPDoc {
     pack: ModelPack,
     runtime: PathBuf,
     cache_dir: Option<PathBuf>,
     device: String,
+    threads: usize,
     threshold: f32,
+    render_dpi: u16,
     identity: String,
-}
-
-impl PreparedPPDoc {
-    pub fn identity(&self) -> &str {
-        &self.identity
-    }
-
-    pub fn variant_id(&self) -> &str {
-        &self.pack.manifest.variant_id
-    }
+    session: Option<OpenVinoSession>,
 }
 
 impl PPDocLayout {
     pub fn new(options: &PPDocOptions) -> Result<Self> {
-        Self::from_prepared(options, Self::prepare(options)?)
-    }
-
-    pub fn prepare(options: &PPDocOptions) -> Result<PreparedPPDoc> {
         if !(0.0..=1.0).contains(&options.threshold) || !options.threshold.is_finite() {
             return fail("PPdoc threshold must be between zero and one");
         }
@@ -374,38 +357,16 @@ impl PPDocLayout {
                 "PPdoc identity changed before inference: expected {expected}, found {identity}"
             ));
         }
-        Ok(PreparedPPDoc {
-            pack,
-            runtime,
-            cache_dir,
-            device,
-            threshold,
-            identity,
-        })
-    }
-
-    pub fn from_prepared(options: &PPDocOptions, prepared: PreparedPPDoc) -> Result<Self> {
-        let PreparedPPDoc {
-            pack,
-            runtime,
-            cache_dir,
-            device,
-            threshold,
-            identity,
-        } = prepared;
-        let session = OpenVinoSession::new(
-            &runtime,
-            &pack.model,
-            &device,
-            options.threads,
-            cache_dir.as_deref(),
-        )?;
         Ok(Self {
-            session,
             pack,
+            runtime,
+            cache_dir,
+            device,
+            threads: options.threads,
             threshold,
             render_dpi: options.render_dpi,
             identity,
+            session: None,
         })
     }
 
@@ -453,8 +414,12 @@ impl PPDocLayout {
             &manifest.postprocess.model_nms,
             manifest.labels.len(),
         );
+        if self.session.is_none() {
+            self.session = Some(OpenVinoSession::new(&self.runtime, &self.pack.model, &self.device, self.threads, self.cache_dir.as_deref())?);
+        }
+        let session = self.session.as_mut().expect("the session is open");
         let (values, width, count) = run_openvino(
-            &mut self.session,
+            session,
             model,
             nms,
             classes,

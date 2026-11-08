@@ -5,7 +5,6 @@ use super::*;
 #[derive(Deserialize, Serialize)]
 pub struct PdfDocument {
     pub(crate) structure: legal_structure_model::DocumentStructure,
-    pub(crate) pages: Vec<ProjectionPage>,
     pub(crate) authority_text_units: Vec<Value>,
     pub(crate) summary: PdfSummary,
     /// The extraction's pages as witnesses, as read before the structure stage rewrote their lines.
@@ -78,25 +77,24 @@ pub struct PdfSummary {
     pub scanned_pages: Vec<usize>,
 }
 
-#[derive(Deserialize, Serialize)]
-pub(crate) struct ProjectionPage {
-    pub(crate) id: String,
-    pub(crate) index: usize,
-    pub(crate) number: u32,
-    pub(crate) source: String,
-    pub(crate) text_quality: f64,
+/// A page node's page (`PdfDocument::page_nodes`): its index.
+pub(crate) fn page_index(page: &StructureNode) -> usize {
+    page.page_indexes[0]
 }
 
-impl ProjectionPage {
-    /// How far the page's text is to be trusted, from 0 to 1.
-    pub(crate) fn confidence(&self) -> f64 {
-        self.text_quality.clamp(0.0, 1.0)
-    }
+/// A page node's page number, its label's ("page12").
+pub(crate) fn page_number(page: &StructureNode) -> u32 {
+    page.printed_label().parse().unwrap_or(0)
+}
 
-    /// Where the page's text was read from ("unknown" where it does not say).
-    pub(crate) fn provenance(&self) -> String {
-        if self.source.is_empty() { "unknown".to_owned() } else { self.source.clone() }
-    }
+/// How far a page's text is to be trusted, from 0 to 1.
+pub(crate) fn page_confidence(page: &StructureNode) -> f64 {
+    page.properties.get("text_quality").and_then(|quality| quality.parse::<f64>().ok()).unwrap_or(0.0).clamp(0.0, 1.0)
+}
+
+/// Where a page's text was read from ("unknown" where it does not say).
+pub(crate) fn page_provenance(page: &StructureNode) -> String {
+    page.properties.get("source").filter(|source| !source.is_empty()).cloned().unwrap_or_else(|| "unknown".to_owned())
 }
 
 pub(crate) fn lookup_payload_sha256(lookup: &PdfStructureLookup) -> String {
@@ -138,35 +136,16 @@ impl PdfDocument {
         cache_key: &str,
         status: String,
         metadata: PdfExtractionMetadata,
-        pages: Vec<Page>,
+        page_count: usize,
         evidence: Arc<Vec<PdfTextPage>>,
         authority_text_units: Vec<Value>,
         structure: DocumentStructure,
     ) -> Self {
-        let summary = summary(source_sha256, cache_key, pages.len(), status, metadata);
+        let summary = summary(source_sha256, cache_key, page_count, status, metadata);
         Self {
             evidence,
             printed: OnceLock::new(),
             structure,
-            pages: pages
-                .into_iter()
-                .map(
-                    |Page {
-                         id,
-                         index,
-                         number,
-                         source,
-                         text_quality,
-                         ..
-                     }| ProjectionPage {
-                        id,
-                        index,
-                        number,
-                        source,
-                        text_quality,
-                    },
-                )
-                .collect(),
             authority_text_units,
             summary,
         }
@@ -203,7 +182,12 @@ impl PdfDocument {
     }
 
     pub fn page_count(&self) -> usize {
-        self.pages.len()
+        self.summary.page_count
+    }
+
+    /// The document's pages, each its page node, in page order.
+    pub(crate) fn page_nodes(&self) -> impl Iterator<Item = &StructureNode> {
+        self.structure.nodes.iter().filter(|node| node.kind == NodeKind::Page && !node.page_indexes.is_empty())
     }
 
     /// Each page's printed label (its page node's first alias), by page index; none where the page prints none read.
@@ -232,11 +216,7 @@ impl PdfDocument {
 
     pub fn fingerprint(&self) -> DocumentFingerprint {
         let mut fingerprint = document_fingerprint(&self.structure);
-        let product = serialization_sha256(&(
-            &self.pages,
-            &self.summary,
-            &self.evidence,
-        ));
+        let product = serialization_sha256(&(&self.summary, &self.evidence));
         fingerprint.components.insert("pdf", product.clone());
         fingerprint.result_sha256 =
             serialization_sha256(&(fingerprint.result_sha256.as_str(), product));
@@ -247,7 +227,7 @@ impl PdfDocument {
         structure_lookup(self, request)
     }
 
-    /// The declared paragraph nodes of this PDF, in reading order.
+    /// Each paragraph number this PDF prints, with its printings (`PrintedParagraph`), in the order their text opens.
     /// Empty where it numbers none: it is then placed by its pages.
     pub fn printed_paragraphs(&self) -> &[PrintedParagraph] {
         self.printed.get_or_init(|| self.read_printed_paragraphs())
@@ -264,8 +244,8 @@ impl PdfDocument {
         match self.paragraph_range(from, to) {
             Ok(paragraphs) => {
                 // Each printing's extent: its words, its quotations and lists, as the structure reads them.
-                let ids = paragraphs.iter().flat_map(|paragraph| paragraph.ids.iter().map(String::as_str)).collect::<HashSet<_>>();
-                let mut ranges: Vec<ScalarRange> = self.structure.nodes.iter().filter(|node| ids.contains(node.id.as_str()))
+                let mut ranges: Vec<ScalarRange> = paragraphs.iter().flat_map(|(_, printings)| printings)
+                    .map(|&index| &self.structure.nodes[index])
                     .flat_map(|node| if node.extent.is_empty() { node.ranges.clone() } else { node.extent.clone() })
                     .collect();
                 ScalarRange::normalize_union(&mut ranges);
@@ -284,7 +264,7 @@ impl PdfDocument {
         if paragraphs.is_empty() {
             return Err(PdfLookupStatus::Unavailable);
         }
-        let at = |number: usize| paragraphs.iter().position(|p| p.number == number).ok_or(PdfLookupStatus::NotFound);
+        let at = |number: usize| paragraphs.iter().position(|(printed, _)| *printed == number).ok_or(PdfLookupStatus::NotFound);
         let (start, end) = (at(from)?, at(to)?);
         if (from..=to).any(|number| at(number).is_err()) || end < start {
             return Err(PdfLookupStatus::NotFound);
@@ -295,25 +275,13 @@ impl PdfDocument {
     /// Each paragraph number the structure labels, once, with every printing of it, as the structure engine reads
     /// them (`paragraph_printings`): the paragraph a pinpoint to that number addresses.
     fn read_printed_paragraphs(&self) -> Vec<PrintedParagraph> {
-        let printed = legal_structure_model::structure_analysis().paragraph_printings(&self.structure);
-        let mut paragraphs: Vec<PrintedParagraph> = printed.into_iter().map(|(number, printings)| {
-            let printings: Vec<&legal_structure_model::StructureNode> = printings.iter().map(|&index| &self.structure.nodes[index]).collect();
-            let mut ranges: Vec<ScalarRange> = printings.iter().flat_map(|node| self.structure.query_ranges(node).into_owned()).collect();
-            ScalarRange::normalize_union(&mut ranges);
-            let mut page_numbers: Vec<u32> = printings.iter().flat_map(|node| node.page_indexes.iter().map(|page| (*page + 1) as u32)).collect();
-            page_numbers.sort_unstable();
-            page_numbers.dedup();
-            PrintedParagraph {
-                ids: printings.iter().map(|node| node.id.clone()).collect(),
-                number,
-                start: ranges.first().map_or(0, |range| range.start),
-                end: ranges.iter().map(|range| range.end).max().unwrap_or(0),
-                ranges,
-                page_numbers,
-                line_ids: printings.iter().flat_map(|node| node.line_ids.iter().cloned()).collect(),
-            }
-        }).collect();
-        paragraphs.sort_by_key(|paragraph| (paragraph.start, paragraph.end));
+        let mut paragraphs = legal_structure_model::structure_analysis().paragraph_printings(&self.structure);
+        // In the order the text opens them: by the envelope of their printings' text.
+        paragraphs.sort_by_cached_key(|(_, printings)| {
+            let ranges = printings.iter().flat_map(|&index| self.structure.query_ranges(&self.structure.nodes[index]).into_owned());
+            ranges.fold(None, |span: Option<(usize, usize)>, range| Some(span.map_or((range.start, range.end), |(start, end)| (start.min(range.start), end.max(range.end)))))
+                .unwrap_or((0, 0))
+        });
         paragraphs
     }
 
@@ -321,10 +289,7 @@ impl PdfDocument {
     /// has none. One read instead of one lookup per page.
     pub fn page_texts(&self) -> Vec<String> {
         let text = ScalarText::new(self.structure.query_text());
-        let nodes = nodes_by_id(self);
-        self.pages.iter()
-            .map(|page| nodes.get(page.id.as_str()).map(|node| rendered_slice(&text, &self.structure, node)).unwrap_or_default())
-            .collect()
+        self.page_nodes().map(|page| rendered_slice(&text, &self.structure, page)).collect()
     }
 }
 

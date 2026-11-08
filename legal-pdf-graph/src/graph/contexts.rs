@@ -48,7 +48,10 @@ pub fn outline_contexts(
         let mut seen_lines = HashSet::new();
         node.line_ids = node.ranges.iter().flat_map(|range| index.line_ids(*range))
             .filter(|id| seen_lines.insert(id.clone())).collect();
-        node.page_indexes = index.page_indexes_for_line_ids(&node.line_ids);
+        // (A page node is its page, whatever lines it holds.)
+        if node.kind != NodeKind::Page {
+            node.page_indexes = index.page_indexes_for_line_ids(&node.line_ids);
+        }
         if let (Some(first), Some(last)) = (node.ranges.first(), node.ranges.last()) {
             node.range.start = first.start;
             node.range.end = last.end;

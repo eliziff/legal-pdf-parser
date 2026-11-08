@@ -232,13 +232,20 @@ pub fn structure_graph(pages: &mut [Page],
         }
     }).collect();
     let node_id = |u: usize| unit_ids[u].clone();
+    // Each page a node: its text's range (an empty one where its text would open, where it prints none), its index, and
+    // where its text was read from and how far it is to be trusted.
+    let mut page_end = 0;
     for page in pages.iter() {
-        let Some(range) = index.page_range(page.index) else { continue };
+        let range = index.page_range(page.index).unwrap_or(ScalarRange { start: page_end, end: page_end });
+        page_end = range.end;
         let mut node = StructureNode::new(page.id.clone(), NodeKind::Page, range, ORIGIN, Derivation::Native, None);
         node.label = Some(format!("page{}", page.number));
         node.aliases = page.printed_label.clone().map(|label| vec![label]);
         node.anchor.clone_from(&page.printed_label_line_id);
         node.line_ids = page.lines.iter().map(|l| l.id.clone()).collect();
+        node.page_indexes = vec![page.index];
+        node.properties.insert("source".to_owned(), page.source.clone());
+        node.properties.insert("text_quality".to_owned(), page.text_quality.to_string());
         nodes.push(node);
     }
     for (u, unit) in units.iter().enumerate() {
