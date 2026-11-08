@@ -796,7 +796,7 @@ fn recognized_extraction(
     finish_recognition(&mut extracted.pages, rasters);
     #[cfg(feature = "ppdoc")]
     if let Some(provider) = providers.ppdoc.as_mut() {
-        extracted.diagnostics.extend(profile::measure("ppdoc_annotate", || provider.annotate_pdf(bytes, &mut extracted.pages))?);
+        profile::measure("ppdoc_annotate", || provider.annotate_pdf(bytes, &mut extracted.pages))?;
     }
     Ok(extracted)
 }

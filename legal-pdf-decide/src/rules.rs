@@ -81,8 +81,6 @@ pub struct Decision {
     #[serde(skip)]
     pub residual: Vec<ResidualRecord>,
     #[serde(skip)]
-    conflicts: Vec<(Rule, Rule, Slot)>,
-    #[serde(skip)]
     pub sequences: Sequences,
     /// While the rules are heard (`hear`): no rule's claim keeps another from a line, every line no fence took (`free`)
     /// is open to each rule, and what each says stands in `heard`. `role` and `rule` hold the first reading of each line
@@ -148,16 +146,6 @@ fn joining_colon(text: &str) -> bool {
 }
 
 impl Decision {
-    /// Gives an open line a role by a strong rule; a line another rule decided keeps its own, and
-    /// where the roles differ the two rules are noted.
-    fn claim(&mut self, slot: Slot, role: Role, rule: Rule) -> bool {
-        let filled = self.fill(slot, role, rule);
-        if !filled && !self.hearing && self.role[slot.index()] != role {
-            self.conflicts.push((self.rule[slot.index()], rule, slot));
-        }
-        filled
-    }
-
     /// Gives an open line a role; a decided line keeps its own. While the rules are heard, it is a rule's reading of a
     /// line no fence took, for the one decision on it, and the line's first reading stands for the rules that ask what
     /// is around them.
@@ -195,9 +183,9 @@ impl Decision {
         self.heard.push(Heard { slot, role, rule: Rule::Residual, weight, joined });
     }
 
-    /// The one decision on a line: `winner` its reading, the unit, level and anchor only its rule gave standing, the
-    /// strong readings it beat (`others`) noted as disagreements. No winner leaves it open.
-    pub fn settle_line(&mut self, slot: Slot, winner: Option<Heard>, others: &[Heard]) {
+    /// The one decision on a line: `winner` its reading, the unit, level and anchor only its rule gave standing. No winner
+    /// leaves it open.
+    pub fn settle_line(&mut self, slot: Slot, winner: Option<Heard>) {
         let at = slot.index();
         let rule = winner.map_or(Rule::None, |heard| heard.rule);
         self.role[at] = winner.map_or(Role::Open, |heard| heard.role);
@@ -211,9 +199,6 @@ impl Decision {
         }
         if rule != Rule::Anchor {
             self.anchor[at] = 0;
-        }
-        for other in others.iter().filter(|other| other.role != Role::Open && other.role != self.role[at]) {
-            self.conflicts.push((rule, other.rule, slot));
         }
     }
 
@@ -273,12 +258,10 @@ impl Decision {
                 decision.fill(slot, Role::Furniture, Rule::EndnoteHead);
             }
             if notes.heading[at] {
-                decision.claim(slot, Role::Heading, Rule::NotesHeading);
+                decision.fill(slot, Role::Heading, Rule::NotesHeading);
             } else if notes.note[at].is_some() {
-                if beside_numbers {
-                    decision.conflicts.push((Rule::TranscriptLine, Rule::NoteBand, slot));
-                } else {
-                    decision.claim(slot, Role::Note, Rule::NoteBand);
+                if !beside_numbers {
+                    decision.fill(slot, Role::Note, Rule::NoteBand);
                 }
             }
             if !decision.open(slot) {
@@ -289,7 +272,7 @@ impl Decision {
             if dashed.is_some_and(|rest| {
                 legal_structure_model::structure_analysis().history_note(rest) || cited_share(evidence, slot, slots.line(pages, slot).text.len()) >= 0.8
             }) {
-                decision.claim(slot, Role::Heading, Rule::HistoryHeading);
+                decision.fill(slot, Role::Heading, Rule::HistoryHeading);
                 continue;
             }
             let opens = !line.starts_with(char::is_lowercase) && fences.continues[at].is_none();
@@ -336,7 +319,7 @@ impl Decision {
         let anchoring = anchors(pages, slots, evidence, fences, geometry, &named, outline, &fences.contents_entries);
         for (index, anchor) in anchoring.anchors.iter().enumerate() {
             for (k, &slot) in anchor.lines.iter().enumerate() {
-                let spoke = decision.claim(slot, Role::Heading, Rule::Anchor);
+                let spoke = decision.fill(slot, Role::Heading, Rule::Anchor);
                 decision.anchor[slot.index()] = index as u32 + 1;
                 decision.given[slot.index()] = anchor.level.min(u16::from(u8::MAX)) as u8;
                 decision.joined[slot.index()] |= k > 0;
@@ -389,7 +372,6 @@ impl Decision {
             }
         }
         heading_levels(pages, slots, evidence, fences, &sequences, geometry, self);
-        self.report(pages, slots);
         self.sequences = sequences;
     }
 
@@ -415,7 +397,7 @@ impl Decision {
         };
         for run in &runs.runs {
             for member in run.members.iter().filter(|member| quoted(member)) {
-                self.claim(member.slot, Role::Quote, Rule::QuotedNumber);
+                self.fill(member.slot, Role::Quote, Rule::QuotedNumber);
             }
         }
         // Titles alone, each directly over the next (a division's line between them aside), none of
@@ -456,11 +438,11 @@ impl Decision {
                 for k in first..last {
                     let member = &run.members[k];
                     for slot in [Some(member.slot), member.text].into_iter().flatten() {
-                        self.claim(slot, Role::Contents, Rule::TitleOnly);
+                        self.fill(slot, Role::Contents, Rule::TitleOnly);
                     }
                     if k + 1 < last {
                         for at in end(member) + 1..place(run.members[k + 1].slot) {
-                            self.claim(lines[at as usize], Role::Contents, Rule::TitleOnly);
+                            self.fill(lines[at as usize], Role::Contents, Rule::TitleOnly);
                         }
                     }
                 }
@@ -476,13 +458,13 @@ impl Decision {
                 let Some(kind) = member.kind else { continue };
                 if member.carries_prose {
                     let role = unit_role(kind);
-                    if self.claim(member.slot, role, Rule::Opener) {
+                    if self.fill(member.slot, role, Rule::Opener) {
                         self.unit[at] = Some((r as u32, kind));
                         self.join(member.text, role, Rule::Opener);
                     }
                 } else if member.title_shaped && self.open(member.slot) {
                     if evidence.words[at] & WORD_DIVISION != 0 {
-                        self.claim(member.slot, Role::Heading, Rule::DivisionHeading);
+                        self.fill(member.slot, Role::Heading, Rule::DivisionHeading);
                         self.join(member.text, Role::Heading, Rule::DivisionHeading);
                         continue;
                     }
@@ -498,7 +480,7 @@ impl Decision {
                     let over_terms = next.is_some_and(|next| self.role[next.index()] != Role::Heading && subsection(slots.line(pages, next).text.trim()));
                     // The clause's text after its caption is the clause's, set apart from it where the
                     // page parts them ("2.2 / Landlord's Work" over "The Landlord shall perform").
-                    if (evidence.instrument || over_terms) && followed && self.claim(member.slot, Role::Body, Rule::Caption) {
+                    if (evidence.instrument || over_terms) && followed && self.fill(member.slot, Role::Body, Rule::Caption) {
                         self.unit[at] = Some((r as u32, kind));
                         self.join(member.text, Role::Body, Rule::Caption);
                     }
@@ -562,7 +544,7 @@ impl Decision {
             return;
         }
         for member in counted {
-            self.claim(member.slot, Role::Heading, Rule::Ladder);
+            self.fill(member.slot, Role::Heading, Rule::Ladder);
             let title = title_line(member);
             self.join((title != member.slot).then_some(title), Role::Heading, Rule::Ladder);
         }
@@ -680,7 +662,7 @@ impl Decision {
                     continue;
                 }
                 for (k, &slot) in caption.iter().enumerate() {
-                    if self.claim(slot, Role::MarginalNote, Rule::MarginalNote) {
+                    if self.fill(slot, Role::MarginalNote, Rule::MarginalNote) {
                         self.joined[slot.index()] = k > 0;
                         self.heard_joined(k > 0);
                         decided.push(slot);
@@ -701,7 +683,7 @@ impl Decision {
                     && self.open(twin)
                     && legal_structure_model::structure_analysis().marginal_note_shaped(text(twin))
                 {
-                    self.claim(twin, Role::MarginalNote, Rule::MarginalNote);
+                    self.fill(twin, Role::MarginalNote, Rule::MarginalNote);
                 }
             }
         }
@@ -789,27 +771,6 @@ impl Decision {
         }
     }
 
-    /// The disagreements of strong rules, one diagnostic for each pair of rules: the rule that
-    /// kept the lines, the rule refused, and the lines.
-    fn report(&mut self, pages: &[Page], slots: &Slots) {
-        if self.conflicts.is_empty() {
-            return;
-        }
-        let mut conflicts = std::mem::take(&mut self.conflicts);
-        conflicts.sort_unstable_by_key(|(kept, refused, slot)| (*kept as u8, *refused as u8, *slot));
-        for pair in conflicts.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
-            let (kept, refused, first) = pair[0];
-            let mut diagnostic = Diagnostic::info(
-                "LINE_RULES_DISAGREE",
-                format!("Rule {} kept lines that rule {} read otherwise.", kept.name(), refused.name()),
-                Some(pages[slots.page(first)].index),
-            );
-            diagnostic.line_ids = pair.iter().map(|(_, _, slot)| slots.line(pages, *slot).id.clone()).collect();
-            diagnostic.details.insert("kept".to_owned(), json!(kept.name()));
-            diagnostic.details.insert("refused".to_owned(), json!(refused.name()));
-            self.diagnostics.push(diagnostic);
-        }
-    }
 }
 
 /// A line centred on its page.

@@ -441,7 +441,7 @@ impl PPDocLayout {
         ))
     }
 
-    pub fn annotate_pdf(&mut self, bytes: &[u8], pages: &mut [Page]) -> Result<Vec<Diagnostic>> {
+    pub fn annotate_pdf(&mut self, bytes: &[u8], pages: &mut [Page]) -> Result<()> {
         use hayro::hayro_interpret::InterpreterSettings;
         use hayro::hayro_syntax::Pdf;
         use hayro::vello_cpu::color::palette::css::WHITE;
@@ -496,8 +496,7 @@ impl PPDocLayout {
         crate::profile::measure("ppdoc_postprocess", || {
             postprocess_document(pages, &mut regions_by_page)
         });
-        let (mut pending, mut unmatched) =
-            (Vec::<(usize, usize, String, String)>::new(), Vec::new());
+        let (mut pending, mut covered) = (Vec::<(usize, usize, String, String)>::new(), true);
         for (page_position, page) in pages.iter().enumerate() {
             for (line_index, line) in page.lines.iter().enumerate() {
                 if line.exclude_from_body
@@ -513,7 +512,7 @@ impl PPDocLayout {
                 let Some(region_index) = best_region_index(line.bbox, regions)
                     .or_else(|| nearest_region_index(line.bbox, regions))
                 else {
-                    unmatched.push(line.id.clone());
+                    covered = false;
                     continue;
                 };
                 let region = &regions_by_page[page_position][region_index];
@@ -525,26 +524,15 @@ impl PPDocLayout {
                 ));
             }
         }
-        if !unmatched.is_empty() {
-            let mut diagnostic = Diagnostic::warning(
-                "PPDOC_LAYOUT_INCOMPLETE",
-                "PPdoc did not cover every text line; model regions were discarded.",
-                None,
-            );
-            diagnostic.line_ids = unmatched;
-            diagnostic
-                .details
-                .insert("detections".to_owned(), serde_json::json!(detection_count));
-            diagnostic
-                .details
-                .insert("matched_lines".to_owned(), serde_json::json!(pending.len()));
-            return Ok(vec![diagnostic]);
+        // A page the model did not cover line by line keeps the layout its lines had: the model's regions are discarded.
+        if !covered {
+            return Ok(());
         }
         for (page_index, line_index, label, region_id) in pending {
             let line = &mut pages[page_index].lines[line_index];
             (line.region_type, line.region_id) = (label, region_id);
         }
-        Ok(Vec::new())
+        Ok(())
     }
 }
 

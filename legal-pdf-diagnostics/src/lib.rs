@@ -24,36 +24,6 @@ pub fn line_family(line: &Line) -> &'static str {
     }
 }
 
-pub fn text_flow_faults(pages: &[Page]) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-    for page in pages {
-        let eligible = page.lines.iter().filter(|line| !matches!(line.region_type.as_str(), "header" | "footer") && !line.exclude_from_body).collect::<Vec<_>>();
-        for pair in eligible.windows(2) {
-            let (previous, current) = (pair[0], pair[1]);
-            if !hyphen_fragment_tail(&previous.text) {
-                continue;
-            }
-            let (continues, same) = (hyphen_continuation(&current.text), line_family(previous) == line_family(current));
-            if continues && !same {
-                let message = format!(
-                    "A hyphenated word spans the {}/{} boundary; either a region label or the order is wrong.",
-                    line_family(previous),
-                    line_family(current)
-                );
-                let mut diagnostic = Diagnostic::warning("REGION_BOUNDARY_FAULT", message, Some(page.index));
-                diagnostic.line_ids = vec![previous.id.clone(), current.id.clone()];
-                diagnostics.push(diagnostic);
-            } else if !continues && same {
-                let message = "A line ends mid-word but the next eligible line does not continue it.";
-                let mut diagnostic = Diagnostic::info("DANGLING_SOFT_HYPHEN", message, Some(page.index));
-                diagnostic.line_ids.push(previous.id.clone());
-                diagnostics.push(diagnostic);
-            }
-        }
-    }
-    diagnostics
-}
-
 pub fn status(diagnostics: &[Diagnostic], pages: &[Page]) -> String {
     let ocr = |diagnostic: &&Diagnostic| diagnostic.code == "OCR_REQUIRED";
     let ocr_pages: HashSet<Option<usize>> = diagnostics.iter().filter(ocr).map(|diagnostic| diagnostic.page_index).collect();

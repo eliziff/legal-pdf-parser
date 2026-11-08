@@ -176,7 +176,6 @@ fn output(pages: &mut [Page],
     let slots: &Slots = slots;
     let decided = decided(pages, slots, &fences);
     build_regions(pages);
-    diagnostics.extend(text_flow_faults(pages));
     let index = PdfTextIndex::from_pages(pages);
     let citations = graph::citation_spans(pages, slots, evidence);
     let pairing = note_pairing::pair_notes(pages, &decided, &citations, &index);
@@ -192,6 +191,5 @@ fn output(pages: &mut [Page],
     // reading of a marker names one of this reading's.
     let settled = Settled { index: &index, notes, runs, opened, within };
     let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &decided, &table, &views, &moves, doc, identity, settled)?;
-    diagnostics.extend(note_crossrefs(&structure_graph, &decided));
     Ok(StructureOutput { authority_text_units, diagnostics, structure_graph })
 }

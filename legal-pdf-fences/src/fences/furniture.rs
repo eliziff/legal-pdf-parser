@@ -69,14 +69,6 @@ impl Fences {
             self.folio_offset.is_some_and(|offset| label.parse::<i64>().is_ok_and(|number| number - i64::from(page.number) == offset))
         };
         let Some((label, line)) = (if agree { Some(first) } else { labels.iter().find(on_offset) }) else {
-            let mut diagnostic = Diagnostic::info(
-                "PRINTED_PAGE_LABEL_AMBIGUOUS",
-                "Conflicting header/footer page labels, none on the folios' offset, were left unresolved.",
-                Some(page.index),
-            );
-            diagnostic.line_ids = labels.iter().map(|(_, line)| page.lines[*line].id.clone()).collect();
-            diagnostic.details.insert("candidates".to_owned(), json!(labels.iter().map(|(label, _)| label).collect::<Vec<_>>()));
-            self.diagnostics.push(diagnostic);
             return None;
         };
         let slot = slots.at(page_slot, *line);

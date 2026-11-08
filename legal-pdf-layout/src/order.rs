@@ -220,10 +220,7 @@ pub fn page_order(
         body.extend(lane);
         decision
     };
-    let diagnostic = if decision.repair != OrderRepair::None {
-        let message = format!("Extraction order replaced by {}: {}.", decision.strategy, decision.reason);
-        Some(Diagnostic::info("COLUMN_ORDER_REPAIRED", message, Some(page.index)))
-    } else if decision.source_switches > 2 {
+    let diagnostic = if decision.repair == OrderRepair::None && decision.source_switches > 2 {
         let message = format!("Two-column page keeps an order that crosses columns {} times ({}).", decision.source_switches, decision.reason);
         Some(Diagnostic::warning("COLUMN_ORDER_UNCERTAIN", message, Some(page.index)))
     } else {

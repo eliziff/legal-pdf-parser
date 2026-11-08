@@ -182,7 +182,7 @@ fn settle(fences: &Fences, runs: &Runs, table: &LineTable, views: &[LineView], d
                     winner = Some((*reading, chosen, score));
                 }
             }
-            decision.settle_line(slot, winner.as_ref().map(|(reading, ..)| *reading), &readings);
+            decision.settle_line(slot, winner.as_ref().map(|(reading, ..)| *reading));
             weighed[context] = winner.as_ref().is_some_and(|(reading, ..)| reading.rule == Rule::Residual && reading.role == Role::Heading);
             winner.map_or_else(|| Move::plain(TEXT, false), |(_, chosen, _)| chosen)
         } else {
