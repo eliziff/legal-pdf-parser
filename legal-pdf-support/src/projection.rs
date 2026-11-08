@@ -27,7 +27,7 @@ pub use lookup::*;
 const MAX_UNITS: usize = 20;
 const MAX_CONTEXT: usize = 2;
 const MAX_RETURN_CHARS: usize = 60_000;
-const LOCATOR_KINDS: [&str; 12] = [
+const LOCATOR_KINDS: [&str; 15] = [
     "page",
     "line",
     "paragraph",
@@ -40,4 +40,7 @@ const LOCATOR_KINDS: [&str; 12] = [
     "subclause",
     "schedule",
     "article",
+    "rule",
+    "part",
+    "division",
 ];
