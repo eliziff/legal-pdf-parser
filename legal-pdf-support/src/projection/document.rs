@@ -8,58 +8,9 @@ pub struct PdfDocument {
     pub(crate) authority_text_units: Vec<legal_pdf_core::AuthorityTextUnit>,
     pub(crate) summary: PdfSummary,
     /// The extraction's pages as witnesses, as read before the structure stage rewrote their lines.
-    pub(crate) evidence: Arc<Vec<PdfTextPage>>,
+    pub(crate) evidence: Arc<Vec<Page>>,
     #[serde(skip)]
     pub(crate) printed: OnceLock<Vec<PrintedParagraph>>,
-}
-
-/// Display-space text geometry retained with the prepared document.
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PdfTextPage {
-    pub page_number: u32,
-    pub source: String,
-    pub width: f64,
-    pub height: f64,
-    pub lines: Vec<PdfTextLine>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub regions: Vec<legal_pdf_core::model::Region>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct PdfTextLine {
-    pub id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub text: String,
-    pub rect: [f64; 4],
-    pub words: Vec<PdfTextWord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub spans: Vec<legal_pdf_core::model::Span>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ocr: Option<legal_pdf_core::model::OcrEvidence>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub region_id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub region_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub source: String,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct PdfTextWord {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub id: String,
-    /// Line-local Unicode scalar boundaries, matching the physical Word witness.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end: Option<usize>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub inferred_geometry: bool,
-    pub text: String,
-    pub rect: [f64; 4],
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub underlined: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -141,7 +92,7 @@ impl PdfDocument {
         status: String,
         metadata: PdfExtractionMetadata,
         page_text_quality: Vec<f64>,
-        evidence: Arc<Vec<PdfTextPage>>,
+        evidence: Arc<Vec<Page>>,
         authority_text_units: Vec<legal_pdf_core::AuthorityTextUnit>,
         structure: DocumentStructure,
     ) -> Self {
@@ -156,23 +107,23 @@ impl PdfDocument {
     }
 
     /// Capture extraction witnesses before structural derivation rewrites lines.
-    pub fn passage_evidence(pages: &[Page]) -> Arc<Vec<PdfTextPage>> {
-        Arc::new(pages.iter().map(text_page).collect())
+    pub fn passage_evidence(pages: &[Page]) -> Arc<Vec<Page>> {
+        Arc::new(pages.to_vec())
     }
 
-    /// The pages passages are read from: the extraction witnesses, a recognized scan's lines each read in full with its
-    /// words in order (`recognized_witness_line`).
-    pub fn passage_pages(&self) -> Arc<Vec<PdfTextPage>> {
+    /// The pages passages are read from: the extraction witnesses, a recognized scan's lines each read in full
+    /// (`recognized_line`).
+    pub fn passage_pages(&self) -> Arc<Vec<Page>> {
         if self.evidence.iter().all(|page| page.source == "native") {
             return Arc::clone(&self.evidence);
         }
         Arc::new(self.evidence.iter().map(|page| if page.source == "native" { page.clone() } else {
-            PdfTextPage { lines: page.lines.iter().map(recognized_witness_line).collect(), ..page.clone() }
+            Page { lines: page.lines.iter().map(recognized_line).collect(), ..page.clone() }
         }).collect())
     }
 
     /// The pages recognition read, as it read them.
-    pub fn recognized_pages(&self) -> impl Iterator<Item = &PdfTextPage> {
+    pub fn recognized_pages(&self) -> impl Iterator<Item = &Page> {
         self.evidence.iter().filter(|page| page.source != "native")
     }
 
@@ -297,86 +248,10 @@ impl PdfDocument {
     }
 }
 
-/// A page's extraction witness: its size, regions and lines as extracted.
-fn text_page(page: &Page) -> PdfTextPage {
-    PdfTextPage {
-        page_number: page.number,
-        source: page.source.clone(),
-        width: page.width,
-        height: page.height,
-        regions: page.regions.clone(),
-        lines: page.lines.iter().map(physical_text_line).collect(),
+/// A recognized line read as a witness: its text in full, its words joined where recognition gave it none of its own.
+fn recognized_line(line: &Line) -> Line {
+    if !line.text.is_empty() {
+        return line.clone();
     }
-}
-
-pub(crate) fn physical_text_line(line: &Line) -> PdfTextLine {
-    PdfTextLine {
-        id: line.id.clone(),
-        text: line.text.clone(),
-        rect: line.bbox,
-        spans: line.spans.clone(),
-        ocr: line.ocr.clone(),
-        region_id: line.region_id.clone(),
-        region_type: line.region_type.clone(),
-        source: line.source.clone(),
-        words: line
-            .words
-            .iter()
-            .map(|word| PdfTextWord {
-                id: word.id.clone(),
-                text: word.text.clone(),
-                rect: word.bbox,
-                start: Some(word.start),
-                end: Some(word.end),
-                inferred_geometry: false,
-                underlined: word.underlined,
-            })
-            .collect(),
-    }
-}
-
-/// A recognized line read as a witness: its text in full, and its words in order. A line
-/// recognized without word boxes spaces its words across its own box.
-pub(crate) fn recognized_witness_line(line: &PdfTextLine) -> PdfTextLine {
-    let text = if line.text.is_empty() {
-        line.words
-            .iter()
-            .map(|word| word.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        line.text.clone()
-    };
-    let words = if line.words.is_empty() {
-        let [left, top, right, bottom] = line.rect;
-        let advance = (right - left) / text.chars().count().max(1) as f64;
-        let mut at = 0;
-        text.split(' ')
-            .filter_map(|word| {
-                let start = at;
-                at += word.chars().count() + 1;
-                (!word.is_empty()).then(|| PdfTextWord {
-                    id:String::new(),start:Some(start),end:Some(at-1),inferred_geometry:true,
-                    underlined: false,
-                    text: word.to_owned(),
-                    rect: [
-                        left + start as f64 * advance,
-                        top,
-                        left + (at - 1) as f64 * advance,
-                        bottom,
-                    ],
-                })
-            })
-            .collect()
-    } else {
-        line.words.clone()
-    };
-    PdfTextLine {
-        id: line.id.clone(),
-        text,
-        rect: line.rect,
-        words,
-        spans:line.spans.clone(),ocr:line.ocr.clone(),region_id:line.region_id.clone(),
-        region_type:line.region_type.clone(),source:line.source.clone(),
-    }
+    Line { text: line.words.iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" "), ..line.clone() }
 }

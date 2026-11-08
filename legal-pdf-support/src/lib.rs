@@ -11,6 +11,5 @@ mod projection;
 pub use ppdoc::{PPDocDetection, PPDocLayout, PPDocOptions};
 pub use projection::{
     numeric_range, PdfDocument, PdfLookupNote, PdfLookupPage, PdfLookupProposition,
-    PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup, PdfSummary, PdfTextLine,
-    PdfTextPage, PdfTextWord, PrintedParagraph,
+    PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStructureLookup, PdfSummary, PrintedParagraph,
 };

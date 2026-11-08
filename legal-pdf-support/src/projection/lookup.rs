@@ -303,7 +303,7 @@ pub(crate) fn page_unit(document: &DocumentStructure, text: &ScalarText<'_>, qua
 pub(crate) fn transcript_lines(
     document: &PdfDocument,
     page: &StructureNode,
-    geometry: &PdfTextPage,
+    geometry: &Page,
 ) -> Vec<(usize, String, String)> {
     let height = |rect: &[f64; 4]| (rect[3] - rect[1]).max(0.1);
     document
@@ -324,11 +324,11 @@ pub(crate) fn transcript_lines(
                 .filter(|line| {
                     line.id != label.id
                         && line.region_type != "line_label"
-                        && line.rect[3].min(label.rect[3]) - line.rect[1].max(label.rect[1])
-                            > 0.5 * height(&line.rect).min(height(&label.rect))
+                        && line.bbox[3].min(label.bbox[3]) - line.bbox[1].max(label.bbox[1])
+                            > 0.5 * height(&line.bbox).min(height(&label.bbox))
                 })
                 .collect::<Vec<_>>();
-            row.sort_by(|left, right| left.rect[0].total_cmp(&right.rect[0]));
+            row.sort_by(|left, right| left.bbox[0].total_cmp(&right.bbox[0]));
             let text = row
                 .iter()
                 .map(|line| line.text.trim())
@@ -665,7 +665,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         let Some((page, geometry)) = page.and_then(|page| {
             passage
                 .iter()
-                .find(|geometry| geometry.page_number == self::page_number(page))
+                .find(|geometry| geometry.number == self::page_number(page))
                 .map(|geometry| (page, geometry))
         }) else {
             return result(input, PdfLookupStatus::NotFound, None);
