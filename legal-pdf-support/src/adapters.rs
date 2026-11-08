@@ -12,7 +12,6 @@ pub(crate) fn to_toa_text_units_from_parts(
 ) -> Result<Vec<Value>> {
     let source_fragments: HashMap<_, _> = structure.source_fragments.iter().map(|fragment| (fragment.id.as_str(), fragment)).collect();
     let mut source_nodes: HashMap<_, _> = structure.nodes.iter().map(|node| (node.id.as_str(), node.id.as_str())).collect();
-    source_nodes.extend(structure.notes.iter().filter_map(|note| note.node_id.as_deref().map(|id| (note.id.as_str(),id))));
     let internal_by_pair: HashMap<&str, usize> = footnotes
         .iter()
         .enumerate()

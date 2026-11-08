@@ -183,7 +183,7 @@ fn output(
     let index = PdfTextIndex::from_pages(pages);
     let citations = graph::citation_spans(pages, slots, evidence);
     let pairing = note_pairing::pair_notes(analysis, pages, &decided, &citations, &index);
-    let (claims, graph_diagnostics) = map_note_pairs(&index, &pairing.pair_claims)?;
+    let (notes, graph_diagnostics) = map_note_pairs(&index, &pairing.pair_claims)?;
     let anchors = pairing.anchors;
     let footnotes = pairing.footnotes;
     diagnostics.extend(pairing.diagnostics);
@@ -202,7 +202,7 @@ fn output(
         }
     }
     tier0::in_slot_order(pages, slots);
-    let settled = Settled { index: &index, claims, anchors: &anchors, footnotes, diagnostics: graph_diagnostics, runs, opened, within };
+    let settled = Settled { index: &index, notes, anchors: &anchors, footnotes, diagnostics: graph_diagnostics, runs, opened, within };
     let (structure_graph, paragraphs, mut footnotes) = legal_pdf_emit::structure_graph(analysis, pages, slots, evidence, &fences, &table, &views, &moves, identity, settled)?;
     diagnostics.extend(unmatched_reference_diagnostics(pages, &footnotes, &anchors, &decided));
     attach_propositions(&mut footnotes, &paragraphs, &decided);

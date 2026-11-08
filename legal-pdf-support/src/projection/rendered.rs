@@ -289,13 +289,8 @@ pub(crate) fn attach_source_continuations(
             continuations.extend(links(node, &paragraph.text, &paragraph.source_spans, continuation_kind(node)).into_iter().flatten());
         }
     }
-    let mut notes = HashMap::<&str, &legal_structure_model::Note>::new();
-    for entry in &structure.notes {
-        notes.entry(entry.id.as_str()).or_insert(entry);
-    }
     for note in footnotes {
-        let node = notes.get(note.pair_id.as_str())
-            .and_then(|entry| entry.node_id.as_deref()).and_then(|id| nodes.get(id));
+        let node = nodes.get(note.pair_id.as_str());
         if let Some(node) = node {
             if let Some(found) = links(node, &note.body, &note.source_spans,
                 legal_structure_model::ContinuationKind::Note) {

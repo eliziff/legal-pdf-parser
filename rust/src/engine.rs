@@ -958,7 +958,7 @@ pub fn corpus_check_cached_extraction(input: impl AsRef<Path>, source_name: Stri
     let structure = json!({
         "schema_version": graph.schema_version,
         "node_count": graph.nodes.len(),
-        "note_count": graph.notes.len(),
+        "note_count": graph.nodes.iter().filter(|node| matches!(node.kind, legal_structure_model::NodeKind::Footnote | legal_structure_model::NodeKind::Endnote)).count(),
         "diagnostic_count": graph.diagnostics.len(),
         "by_kind": by_kind,
         "by_rule": by_rule,

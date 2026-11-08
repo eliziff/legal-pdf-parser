@@ -2,22 +2,23 @@
 
 use super::*;
 
-pub fn map_note_pairs(index: &PdfTextIndex, pairs: &[NotePairClaim]) -> Result<(Vec<NotePairClaimV2>, Vec<StructureDiagnostic>)> {
-    let (mut claims, mut diagnostics, mut pair_ids) = (Vec::new(), Vec::new(), HashSet::new());
+/// The pairer's notes, each a Footnote (or Endnote) node: its pair's id, its body's lines, its label's range, its calls.
+pub fn map_note_pairs(index: &PdfTextIndex, pairs: &[NotePairClaim]) -> Result<(Vec<StructureNode>, Vec<StructureDiagnostic>)> {
+    let (mut notes, mut diagnostics, mut pair_ids) = (Vec::new(), Vec::new(), HashSet::new());
     for pair in pairs {
         if pair.pair_id.is_empty() || !pair_ids.insert(pair.pair_id.as_str()) {
             return Err(Error::Message(format!("paired note '{}' has an empty or duplicate pair id", pair.pair_id)));
         }
         let fault = |what: &str| Error::Message(format!("paired note {} has {what}", pair.pair_id));
-        let label_line = index.line(&pair.label_anchor.line_id).ok_or_else(|| fault("an unknown label line"))?;
+        index.line(&pair.label_anchor.line_id).ok_or_else(|| fault("an unknown label line"))?;
         let label_range = index.global_range(&pair.label_anchor.line_id, pair.label_anchor.start, pair.label_anchor.end).ok_or_else(|| fault("an invalid label range"))?;
         let references = pair
             .reference_anchors
             .iter()
             .map(|anchor| {
-                let line = index.line(&anchor.line_id).ok_or_else(|| fault("an unknown reference line"))?;
+                index.line(&anchor.line_id).ok_or_else(|| fault("an unknown reference line"))?;
                 let range = index.global_range(&anchor.line_id, anchor.start, anchor.end).ok_or_else(|| fault("an invalid reference range"))?;
-                Ok(TextAnchorV2 { range, page_index: line.page_index, line_id: anchor.line_id.clone() })
+                Ok(range)
             })
             .collect::<Result<Vec<_>>>()?;
         if pair.body_line_ids.iter().any(|line_id| index.line(line_id).is_none()) {
@@ -30,7 +31,7 @@ pub fn map_note_pairs(index: &PdfTextIndex, pairs: &[NotePairClaim]) -> Result<(
         let empty = |range: &ScalarRange| range.start == range.end;
         let body_range = index.range_for_line_ids(&pair.body_line_ids).filter(|range| !empty(range));
         let Some(body_range) = body_range.filter(|_| {
-            (!pair.reference_anchors.is_empty() || pair.support.supports_label_only()) && !empty(&label_range) && !references.iter().any(|anchor| empty(&anchor.range))
+            (!pair.reference_anchors.is_empty() || pair.support.supports_label_only()) && !empty(&label_range) && !references.iter().any(empty)
         }) else {
             diagnostics.push(StructureDiagnostic {
                 code: "note_pair_unmaterialized".to_owned(),
@@ -40,24 +41,17 @@ pub fn map_note_pairs(index: &PdfTextIndex, pairs: &[NotePairClaim]) -> Result<(
             });
             continue;
         };
-        claims.push(NotePairClaimV2 {
-            pair_id: pair.pair_id.clone(),
-            support: pair.support.clone(),
-            kind: match pair.kind {
-                NotePairKind::Footnote => NoteKindV2::Footnote,
-                NotePairKind::Endnote => NoteKindV2::Endnote,
-            },
-            label: TextAnchorV2 { range: label_range, page_index: label_line.page_index, line_id: pair.label_anchor.line_id.clone() },
-            body: NoteBodyV2 {
-                range: body_range,
-                ranges: pair.body_line_ids.iter().filter_map(|id| index.line(id).map(|line| line.range)).collect(),
-                page_indexes: index.page_indexes_for_line_ids(&pair.body_line_ids),
-                line_ids: pair.body_line_ids.clone(),
-            },
-            references,
-        });
+        let kind = match pair.kind { NotePairKind::Footnote => NodeKind::Footnote, NotePairKind::Endnote => NodeKind::Endnote };
+        let mut node = StructureNode::new(pair.pair_id.clone(), kind, body_range, legal_pdf_structure_model::TRANSITION_ORIGIN, Derivation::Heuristic, None);
+        node.ranges = pair.body_line_ids.iter().filter_map(|id| index.line(id).map(|line| line.range)).collect();
+        node.page_indexes = index.page_indexes_for_line_ids(&pair.body_line_ids);
+        node.line_ids = pair.body_line_ids.clone();
+        node.marker_range = Some(label_range);
+        node.calls = references;
+        node.grammar = Some("region:note".to_owned());
+        notes.push(node);
     }
-    Ok((claims, diagnostics))
+    Ok((notes, diagnostics))
 }
 
 /// A heading's printed number, its first line `line` starting at `start` in the text and the heading holding `lines`

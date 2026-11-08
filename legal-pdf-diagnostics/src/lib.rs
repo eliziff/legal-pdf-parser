@@ -189,13 +189,8 @@ pub fn validate_pdf_components(
         return invalid("structure graph contains an unknown parent");
     }
     let valid_range = |range: &ScalarRange| range.start <= range.end && range.end <= text_length;
-    for note in &structure_graph.notes {
-        if note.node_id.as_deref().is_some_and(|id| !node_ids.contains(id))
-            || !note.label_ranges.iter().chain(&note.body_ranges).chain([&note.label_range, &note.body_range]).chain(&note.primary_reference).all(valid_range)
-            || note.references.iter().any(|reference| {
-                !valid_range(&reference.range) || reference.page_indexes.iter().any(unknown_page) || reference.line_ids.iter().any(unknown_line)
-            })
-        {
+    for note in structure_graph.nodes.iter().filter(|node| matches!(node.kind, legal_structure_model::NodeKind::Footnote | legal_structure_model::NodeKind::Endnote)) {
+        if !note.marker_range.iter().chain(&note.calls).all(valid_range) {
             return invalid(format!("structure note {} is invalid", note.id));
         }
     }

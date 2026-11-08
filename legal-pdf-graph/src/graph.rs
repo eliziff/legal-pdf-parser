@@ -8,8 +8,8 @@ use legal_pdf_structure_model::{Decided, Evidence, Role, Rule, Run, Slots};
 use legal_pdf_core::model::{NotePairClaim, NotePairKind, Page, PdfSourceSpan};
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::{
-    CandidateGrammar, Derivation, DiagnosticSeverity, NodeKind, NoteBodyV2, NoteKindV2, NotePairClaimV2, ScalarRange, ScalarText,
-    StructureDiagnostic, StructureNode, TextAnchorV2,
+    CandidateGrammar, Derivation, DiagnosticSeverity, NodeKind, ScalarRange, ScalarText,
+    StructureDiagnostic, StructureNode,
 };
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};

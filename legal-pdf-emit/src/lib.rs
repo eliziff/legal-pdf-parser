@@ -22,14 +22,14 @@ use legal_pdf_text::text_index::PdfTextIndex;
 use legal_structure_model::{NodeKind, ScalarRange, StructureAnalysis};
 use std::collections::{HashMap, HashSet};
 
-use legal_structure_model::{Derivation, DocumentStructure, Note, NoteKindV2, NotePairClaimV2, NoteReference, Origin, PrimaryRole, Scope, StructureDiagnostic, StructureNode};
+use legal_structure_model::{Derivation, DocumentStructure, Origin, PrimaryRole, Scope, StructureDiagnostic, StructureNode};
 
 /// What tier 0 settled before its moves (`tier0`): its lines are written and their regions built, the text indexed, and
-/// its notes the pairer's: their claims, their reference marks by line, the projection's notes, the claims left aside;
+/// its notes the pairer's: their nodes, their reference marks by line, the projection's notes, the claims left aside;
 /// and the run member each unit opens on, by the unit's first line (`runs`).
 pub struct Settled<'a> {
     pub index: &'a PdfTextIndex,
-    pub claims: Vec<NotePairClaimV2>,
+    pub notes: Vec<StructureNode>,
     pub anchors: &'a HashMap<String, Vec<legal_pdf_core::Anchor>>,
     pub footnotes: Vec<Footnote>,
     pub diagnostics: Vec<StructureDiagnostic>,
@@ -164,7 +164,6 @@ pub fn structure_graph(
     // Nodes, their ranges in scalar characters of the text; their parents are the outline's (`assemble_outline`).
     let line_range = |k: usize| index.line(&ids[k]).map(|l| l.range);
     let mut nodes: Vec<StructureNode> = Vec::new();
-    let mut notes: Vec<Note> = Vec::new();
     // A written page's line set apart keeps the id its line's kind gives it, as the projection reads such lines.
     let folios: HashSet<&str> = pages.iter().filter_map(|page| page.printed_label_line_id.as_deref()).collect();
     let unit_ids: Vec<String> = units.iter().enumerate().map(|(u, unit)| {
@@ -307,50 +306,15 @@ pub fn structure_graph(
             holder = nodes.len() - 1;
         }
         if kind == NodeKind::Footnote {
-            let label_range = marker_range.unwrap_or(ScalarRange { start: range.start, end: range.start });
-            let references: Vec<NoteReference> = unit.references.iter().filter_map(|&(k, start, end)| {
-                let range = index.global_range(&id_of(k), start as usize, end as usize)?;
-                Some(NoteReference { range, anchor: None, page_indexes: index.line(&ids[k]).map(|l| vec![l.page_index]).unwrap_or_default(), line_ids: vec![id_of(k)] })
-            }).collect();
-            notes.push(Note {
-                id: format!("{}-note", node_id(u)),
-                node_id: Some(node_id(u)),
-                kind: NoteKindV2::Footnote,
-                label_range,
-                body_range: range,
-                label_ranges: vec![label_range],
-                body_ranges: ranges,
-                primary_reference: references.first().map(|r| r.range),
-                references,
-            });
+            let calls = unit.references.iter().filter_map(|&(k, start, end)| index.global_range(&id_of(k), start as usize, end as usize)).collect();
+            if let Some(note) = nodes.iter_mut().rev().find(|node| node.id == node_id(u)) {
+                note.marker_range.get_or_insert(ScalarRange { start: range.start, end: range.start });
+                note.calls = calls;
+            }
         }
     }
-    // The pairer's notes: each claim its node and its note, over the lines it claims, whatever the moves made of them.
-    for (n, claim) in settled.claims.iter().enumerate() {
-        let id = format!("transition-note-{:06}", n + 1);
-        let kind = if claim.kind == NoteKindV2::Endnote { NodeKind::Endnote } else { NodeKind::Footnote };
-        let mut node = StructureNode::new(id.clone(), kind, claim.body.range, ORIGIN, Derivation::Heuristic, None);
-        node.ranges = claim.body.ranges.clone();
-        node.line_ids = claim.body.line_ids.clone();
-        node.grammar = Some("region:note".to_owned());
-        nodes.push(node);
-        notes.push(Note {
-            id: claim.pair_id.clone(),
-            node_id: Some(id),
-            kind: claim.kind,
-            label_range: claim.label.range,
-            body_range: claim.body.range,
-            label_ranges: vec![claim.label.range],
-            body_ranges: claim.body.ranges.clone(),
-            primary_reference: claim.references.first().map(|reference| reference.range),
-            references: claim.references.iter().map(|reference| NoteReference {
-                range: reference.range,
-                anchor: None,
-                page_indexes: vec![reference.page_index],
-                line_ids: vec![reference.line_id.clone()],
-            }).collect(),
-        });
-    }
+    // The pairer's notes, over the lines they claim, whatever the moves made of them.
+    nodes.append(&mut settled.notes);
     nodes.extend(legal_pdf_graph::graph::table_nodes(index, fences.tables.iter().enumerate(), ORIGIN)?);
     nodes.extend(legal_pdf_graph::graph::quotation_nodes(index, &decided, ORIGIN)?);
     // Text the parser read as no region's lies outside the body, as the gold leaves it: furniture.
@@ -413,7 +377,6 @@ pub fn structure_graph(
         Scope::complete(),
         vec![Origin { id: ORIGIN.to_owned() }],
         nodes,
-        notes,
         std::mem::take(&mut settled.diagnostics),
     );
     // The outline is tier 0's: each constituent document's and language's own stacks, a quotation within what quotes it.

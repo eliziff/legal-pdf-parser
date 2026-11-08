@@ -283,14 +283,15 @@ fn seed_annotations(structure: &DocumentStructure, text: &ScalarText<'_>, lines:
         }
     };
     let mut annotations = Vec::new();
-    for note in &structure.notes {
-        let mut ranges = note.label_ranges.iter().chain(&note.body_ranges).copied().collect();
+    for note in structure.nodes.iter().filter(|node| matches!(node.kind, NodeKind::Footnote | NodeKind::Endnote)) {
+        let label = note.marker_range.into_iter().collect::<Vec<_>>();
+        let body = if note.ranges.is_empty() { std::slice::from_ref(&note.range) } else { note.ranges.as_slice() };
+        let mut ranges = label.iter().chain(body).copied().collect();
         ScalarRange::normalize_union(&mut ranges);
         let spans = line_spans(text, lines, &ranges)?;
         if spans.is_empty() { continue; }
-        let references = note.references.iter().map(|reference| reference.range).collect::<Vec<_>>();
         annotations.push(annotation(&note.id, "note", spans, json!({"kind": note.kind,
-            "label": line_spans(text, lines, &note.label_ranges)?, "references": line_spans(text, lines, &references)?})));
+            "label": line_spans(text, lines, &label)?, "references": line_spans(text, lines, &note.calls)?})));
     }
     for table in structure.nodes.iter().filter(|node| node.kind == NodeKind::Table) {
         let rows: Vec<_> = structure.nodes.iter().filter(|node| node.kind == NodeKind::Row && node.parent_id.as_deref() == Some(table.id.as_str())).collect();
