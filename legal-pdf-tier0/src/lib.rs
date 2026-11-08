@@ -118,22 +118,12 @@ fn reading_of(view: &LineView, runs: &Runs, reading: Option<(u32, u32)>) -> Opti
 /// A reading of the line as the move it would make: a unit's opening on its marker, a labelled note's opening on its
 /// number, a heading's opening at `level`, else the line going on.
 fn candidate(view: &LineView, runs: &Runs, role: Role, kind: Option<UnitRole>, reading: Option<(u32, u32)>, level: u8, joined: bool) -> Move {
-    let mut chosen = plain(region_of(role, kind), kind.is_some());
-    if kind.is_some() {
-        chosen.reading = reading_of(view, runs, reading);
-    }
+    let chosen = Move { reading: kind.and_then(|_| reading_of(view, runs, reading)), ..plain(region_of(role, kind), kind.is_some()) };
     match role {
-        Role::Note => {
-            chosen.opens = view.label.is_some();
-            chosen.note = view.label;
-        }
-        Role::Heading => {
-            chosen.opens = !joined;
-            chosen.level = level.clamp(1, 9) as i8;
-        }
-        _ => {}
+        Role::Note => Move { opens: view.label.is_some(), note: view.label, ..chosen },
+        Role::Heading => Move { opens: !joined, level: level.clamp(1, 9) as i8, ..chosen },
+        _ => chosen,
     }
-    chosen
 }
 
 /// How far a candidate fits what is open: `State::features`, the features the fitted ranker reads, weighed here.
@@ -150,13 +140,7 @@ fn fit(state: &State, view: &LineView, chosen: &Move) -> f32 {
         };
     }
     if said("note_counts") {
-        score += if said("note_answers") {
-            ANSWERS
-        } else if said("note_next") {
-            NEXT_NOTE
-        } else {
-            STRAY_NOTE
-        };
+        score += if said("note_answers") { ANSWERS } else if said("note_next") { NEXT_NOTE } else { STRAY_NOTE };
     }
     score
 }
@@ -297,20 +281,16 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, table: &LineTable, 
     }
     let starts: HashSet<usize> = fences.starts.iter().filter_map(|start| place(&start.line_id)).collect();
     let mut state = State::default();
-    let moves = moves
-        .into_iter()
-        .enumerate()
-        .map(|(k, chosen)| {
-            let mut chosen = chosen.unwrap_or_else(|| plain(region_of(decision.role[table.order[k].index()], None), true));
-            chosen.starts = starts.contains(&k);
-            if chosen.opens && RANKED_BODY.contains(&chosen.region) {
-                chosen.depth = state.stack_depth(&views[k], &chosen).min(9) as u8;
-            }
-            state.apply(&views[k], &chosen);
-            chosen
-        })
-        .collect();
-    (moves, opened, within)
+    let mut walk = |(k, chosen): (usize, Option<Move>)| {
+        let mut chosen = chosen.unwrap_or_else(|| plain(region_of(decision.role[table.order[k].index()], None), true));
+        chosen.starts = starts.contains(&k);
+        if chosen.opens && RANKED_BODY.contains(&chosen.region) {
+            chosen.depth = state.stack_depth(&views[k], &chosen).min(9) as u8;
+        }
+        state.apply(&views[k], &chosen);
+        chosen
+    };
+    (moves.into_iter().enumerate().map(&mut walk).collect(), opened, within)
 }
 
 /// Each page's lines back in their slots, which `emit` addresses them by.
@@ -322,18 +302,7 @@ pub fn in_slot_order(pages: &mut [Page], slots: &Slots) {
 
 /// The notes and the one decision on each line.
 #[allow(clippy::too_many_arguments)]
-pub fn decide(
-    analysis: &dyn StructureAnalysis,
-    pages: &[Page],
-    slots: &Slots,
-    evidence: &Evidence,
-    fences: &Fences,
-    runs: &Runs,
-    outline: &[PdfOutlineEntry],
-    table: &LineTable,
-    views: &[LineView],
-    traced: bool,
-) -> (Notes, Decision) {
+pub fn decide(analysis: &dyn StructureAnalysis, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, outline: &[PdfOutlineEntry], table: &LineTable, views: &[LineView], traced: bool) -> (Notes, Decision) {
     let notes = Notes::read(analysis, pages, slots, evidence, fences, runs);
     let geometry = Geometry::of(pages);
     let mut decision = Decision::hear(analysis, pages, slots, evidence, fences, runs, &notes, outline, &geometry, traced);
@@ -349,33 +318,17 @@ pub fn reading_regions<'a>(pages: &'a [Page], decided: &Decided) -> Vec<(&'a Pag
     let mut regions: Vec<(&Page, &str, Vec<&Line>)> = Vec::new();
     let mut tails = HashMap::<DocumentContext, usize>::new();
     for page in pages {
-        let line_by_id: HashMap<&str, &Line> = page
-            .lines
-            .iter()
-            .map(|line| (line.id.as_str(), line))
-            .collect();
+        let line_by_id: HashMap<&str, &Line> = page.lines.iter().map(|line| (line.id.as_str(), line)).collect();
         let mut seen = HashSet::new();
-        for region in &page.regions {
-            if !matches!(region.kind.as_str(), "body" | "heading" | "caption" | "marginal_note" | "title") {
-                continue;
-            }
-            let lines: Vec<&Line> = region
-                .line_ids
-                .iter()
-                .filter_map(|id| line_by_id.get(id.as_str()).copied())
-                .filter(|line| !line.exclude_from_body)
-                .collect();
+        for region in page.regions.iter().filter(|region| matches!(region.kind.as_str(), "body" | "heading" | "caption" | "marginal_note" | "title")) {
+            let lines: Vec<&Line> = region.line_ids.iter().filter_map(|id| line_by_id.get(id.as_str()).copied()).filter(|line| !line.exclude_from_body).collect();
             for lines in lines.chunk_by(|left, right| context(&left.id) == context(&right.id)) {
                 let key = context(&lines[0].id);
                 let first = seen.insert(key);
                 // The other column's intervening regions do not close this context's paragraph.
                 if let Some(&slot) = tails.get(&key) {
                     let (_, kind, previous) = &mut regions[slot];
-                    if first
-                        && region.kind == "body"
-                        && *kind == "body"
-                        && legal_pdf_text::paragraphs::continues_onto(previous, lines)
-                    {
+                    if first && region.kind == "body" && *kind == "body" && legal_pdf_text::paragraphs::continues_onto(previous, lines) {
                         previous.extend_from_slice(lines);
                         continue;
                     }

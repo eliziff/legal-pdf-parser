@@ -1,6 +1,7 @@
 //! The shape of a line's text, as the readers test it: the enumerator opening it and the title
 //! after, capitals, a sentence's end, title case, brackets, a contents list's own title.
 
+use legal_pdf_core::regex;
 use regex::Regex;
 use std::sync::OnceLock;
 pub use legal_pdf_core::model::sentence_ended;
@@ -156,8 +157,7 @@ pub fn contents_heading(text: &str) -> bool {
 
 /// A bare page number: digits alone on the line, a dash on either side at most ("- 12 -").
 pub fn arabic_page_number(value: &str) -> Option<u32> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\s*-?\s*(\d{1,4})\s*-?\s*$").unwrap())
+    regex!(r"^\s*-?\s*(\d{1,4})\s*-?\s*$")
         .captures(value)
         .and_then(|capture| capture.get(1))
         .and_then(|value| value.as_str().parse().ok())
@@ -165,15 +165,13 @@ pub fn arabic_page_number(value: &str) -> Option<u32> {
 
 /// A line ending on a word broken by a hyphen.
 pub fn hyphen_fragment_tail(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"[A-Za-z]{2,}[-\u{00ac}\u{00ad}]$").unwrap())
+    regex!(r"[A-Za-z]{2,}[-\u{00ac}\u{00ad}]$")
         .is_match(text.trim_end())
 }
 
 /// A line opening on the rest of a broken word.
 pub fn hyphen_continuation(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[A-Za-z]{2,}").unwrap())
+    regex!(r"^[A-Za-z]{2,}")
         .is_match(text.trim_start())
 }
 

@@ -23,8 +23,7 @@ use legal_pdf_notes::notes::lanes::{note_promotions, LaneLines, LANE_BODY, LANE_
 
 /// A line saying a note runs on across the page: "(Footnote continued…)", "Notes continued".
 fn continued_note(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^\W*(?:foot)?notes?\s+continued\b").unwrap()).is_match(text)
+    regex!(r"(?i)^\W*(?:foot)?notes?\s+continued\b").is_match(text)
 }
 
 /// A page's note lines in one document and language, in reading order, and whether the first opens

@@ -3,12 +3,10 @@
 
 use legal_pdf_structure_model::{PageView, Slot};
 use legal_structure_model::text::{is_note_symbol, MAX_SYMBOL_LABEL_LEN};
-use legal_pdf_core::{line_font_size, median, union_bbox, Columns, Diagnostic, Line, Page, PageMeasure, Region};
-use regex::Regex;
+use legal_pdf_core::{line_font_size, median, regex, union_bbox, Columns, Diagnostic, Line, Page, PageMeasure, Region};
 use std::{
     cell::OnceCell,
     collections::{HashMap, HashSet},
-    sync::OnceLock,
 };
 
 pub mod tables;

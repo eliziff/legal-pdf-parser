@@ -4,6 +4,7 @@
 //! ladder reads it.
 
 use legal_pdf_text::heading_ladder::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
+use legal_pdf_core::regex;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -14,8 +15,7 @@ fn pattern(cell: &'static OnceLock<Regex>, source: &str) -> &'static Regex {
 /// A witness opening their evidence: "WENDY CUKIER, affirmed, questioned by Mr. Phillips:",
 /// "SCOTT REID, sworn".
 pub fn witness(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, r"^[A-Z][A-Za-z.'\- ]{1,60},\s*(?i:(?:previously\s+|solemnly\s+)?(?:sworn|affirmed|recalled))\b").is_match(text)
+    regex!(r"^[A-Z][A-Za-z.'\- ]{1,60},\s*(?i:(?:previously\s+|solemnly\s+)?(?:sworn|affirmed|recalled))\b").is_match(text)
 }
 
 /// An examination of a witness: "CROSS-EXAMINATION BY MR. SWAN:", "EXAMINATION-IN-CHIEF BY MS. LEE",
@@ -52,18 +52,16 @@ pub fn index_entry(text: &str) -> bool {
 
 /// A hearing's part, in capitals: "SUBMISSIONS BY MR. X", "RULING", "REASONS FOR JUDGMENT", "SENTENCE".
 pub fn hearing_part(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
     legal_pdf_text::text::all_caps(text) && text.split_whitespace().count() <= 10
-        && pattern(&RE, r"^(?:(?:REPLY|CLOSING|OPENING)\s+)?(?:SUBMISSIONS|STATEMENT|ARGUMENT|RULING|DECISION|JUDGMENT|SENTENCE|SENTENCING|(?:ORAL\s+)?REASONS\s+FOR\s+(?:JUDGMENT|RULING|SENTENCE|DECISION))\b").is_match(text)
+        && regex!(r"^(?:(?:REPLY|CLOSING|OPENING)\s+)?(?:SUBMISSIONS|STATEMENT|ARGUMENT|RULING|DECISION|JUDGMENT|SENTENCE|SENTENCING|(?:ORAL\s+)?REASONS\s+FOR\s+(?:JUDGMENT|RULING|SENTENCE|DECISION))\b").is_match(text)
 }
 
 /// A transcript's line that is a turn or a procedural event, never a heading: an examiner resuming
 /// ("BY MR. PHILLIPS:"), a speaker's turn ("Q.", "THE WITNESS:"), a recess, an exhibit marked, a
 /// discussion off the record.
 pub fn turn_or_event(analysis: &dyn legal_structure_model::StructureAnalysis, text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
     analysis.speaker_label(text).is_some()
-        || pattern(&RE, r"(?i)^(?:-{2,}|\(|\[)|^exhibit\s+no\b|off\s+the\s+record|^by\s+(?:mr|ms|mrs|miss|dr|me|madam)\.?\s").is_match(text)
+        || regex!(r"(?i)^(?:-{2,}|\(|\[)|^exhibit\s+no\b|off\s+the\s+record|^by\s+(?:mr|ms|mrs|miss|dr|me|madam)\.?\s").is_match(text)
 }
 
 /// A label never a heading, with or without its colon: counsel and appearances, a litigant's role
@@ -101,17 +99,15 @@ pub fn numbered(text: &str) -> bool {
 /// patterns, a bracketed one ("(a)" read as "a" in brackets), or a division word's numeral ("PART IV",
 /// "ARTICLE 5"), the word standing for the punctuation so that each word counts its own family.
 pub fn enumerator(text: &str) -> Option<(String, String)> {
-    static DIVISION: OnceLock<Regex> = OnceLock::new();
-    static BRACKETED: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
-    if let Some(found) = pattern(&DIVISION, r"(?i)^(part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|partie|chapitre|annexe)\s+[\x22\u{201c}\u{2018}'(]?([IVXLCDM]{1,7}|\d{1,3}|[A-Z])\b").captures(text) {
+    if let Some(found) = regex!(r"(?i)^(part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|partie|chapitre|annexe)\s+[\x22\u{201c}\u{2018}'(]?([IVXLCDM]{1,7}|\d{1,3}|[A-Z])\b").captures(text) {
         return Some((found[2].to_owned(), found[1].to_lowercase()));
     }
     if let Some(capture) = legal_pdf_text::text::heading_inline_re().captures(text).or_else(|| legal_pdf_text::text::heading_standalone_re().captures(text)) {
         let (value, punct, _) = legal_pdf_text::text::heading_enumerator(&capture);
         return Some((value.to_owned(), punct.to_owned()));
     }
-    pattern(&BRACKETED, r"^\(\s*(\d{1,3}|[A-Za-z]|[ivxlc]{1,6})\s*\)(?:\s|$)").captures(text).map(|found| (found[1].to_owned(), "()".to_owned()))
+    regex!(r"^\(\s*(\d{1,3}|[A-Za-z]|[ivxlc]{1,6})\s*\)(?:\s|$)").captures(text).map(|found| (found[1].to_owned(), "()".to_owned()))
 }
 
 /// A number and nothing else ("III.", "4", "(b)"), as the paragraph reader knows one: a heading's

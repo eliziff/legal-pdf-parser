@@ -15,19 +15,13 @@ use crate::headings::bookmarks::normalize_title;
 use legal_pdf_structure_model::{PageView, Slot};
 use legal_pdf_core::Line;
 use legal_structure_model::StructureAnalysis;
-use regex::Regex;
+use legal_pdf_core::regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
-
-fn pattern(cell: &'static OnceLock<Regex>, source: &str) -> &'static Regex {
-    cell.get_or_init(|| Regex::new(source).expect("contents list regex"))
-}
 
 /// A locator alone, its value and its place as printed ("12", "xiv", a range "18-43"): "12", "xiv",
 /// "p. 3", "[18] - [43]", "1 to 27".
 fn locator(text: &str) -> Option<(u32, String)> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, r"(?i)^\s*(?:p(?:age|p?\.|ara\.?)?\s*)?\[?(\d{1,4}|[ivxlc]{1,7})\]?(?:\s*(?:[-–]|to)\s*\[?(\d{1,4})\]?)?\s*$")
+    regex!(r"(?i)^\s*(?:p(?:age|p?\.|ara\.?)?\s*)?\[?(\d{1,4}|[ivxlc]{1,7})\]?(?:\s*(?:[-–]|to)\s*\[?(\d{1,4})\]?)?\s*$")
         .captures(text)
         .map(|found| (value(&found[1]), place(&found)))
 }
@@ -35,8 +29,7 @@ fn locator(text: &str) -> Option<(u32, String)> {
 /// A locator after a leader at a title's end ("Overview ........ 3"), or after a tab or a wide
 /// space the title is typeset with ("Introduction\u{2003}3"): where the title ends, and the locator.
 fn leader_locator(text: &str) -> Option<(usize, u32, String)> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|[\t\u{2002}\u{2003}\u{2007}])\s*(?:p(?:age|p?\.)?\s*)?\[?(\d{1,4}|[ivxlc]{1,6})\]?(?:\s*(?:[-–]|to)\s*\[?(\d{1,4})\]?)?\s*$")
+    regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|[\t\u{2002}\u{2003}\u{2007}])\s*(?:p(?:age|p?\.)?\s*)?\[?(\d{1,4}|[ivxlc]{1,6})\]?(?:\s*(?:[-–]|to)\s*\[?(\d{1,4})\]?)?\s*$")
         .captures(text)
         .map(|found| (found.get(0).map_or(text.len(), |all| all.start()), value(&found[1]), place(&found)))
 }
@@ -49,23 +42,20 @@ fn place(found: &regex::Captures) -> String {
 /// A paragraph range alone on its row ("[18] - [43]"): the locator of the title on the row above,
 /// wherever it is set.
 fn paragraph_range(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, r"^\s*\[\d{1,4}\]\s*(?:[-–]|to)\s*\[\d{1,4}\]\s*$").is_match(text)
+    regex!(r"^\s*\[\d{1,4}\]\s*(?:[-–]|to)\s*\[\d{1,4}\]\s*$").is_match(text)
 }
 
 /// A page's or a list's own title: the parser's contents titles ("TABLE OF CONTENTS", "TABLE OF
 /// PROVISIONS"), the same continued ("CONTENTS (cont'd)"), and an index's or a summary's ("INDEX
 /// OF EXHIBITS", "I N D E X", "SOMMAIRE").
 pub fn contents_title(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
     legal_pdf_text::text::contents_heading(text)
-        || pattern(&RE, r"(?i)^\s*(?:(?:table\s+of\s+)?contents|table\s+des\s+mati[eè]res|index(?:\s+of\s+\w+)?|sommaire|i\s*n\s*d\s*e\s*x)\b").is_match(text)
+        || regex!(r"(?i)^\s*(?:(?:table\s+of\s+)?contents|table\s+des\s+mati[eè]res|index(?:\s+of\s+\w+)?|sommaire|i\s*n\s*d\s*e\s*x)\b").is_match(text)
 }
 
 /// A word index's letter: "< A >", "- B -"; a heading over its entries, not an entry.
 pub fn index_letter(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    pattern(&RE, r"^\s*(?:<\s*[A-Z0-9]\s*>|-\s*[A-Z]\s*-)\s*$").is_match(text)
+    regex!(r"^\s*(?:<\s*[A-Z0-9]\s*>|-\s*[A-Z]\s*-)\s*$").is_match(text)
 }
 
 fn value(token: &str) -> u32 {
@@ -74,8 +64,7 @@ fn value(token: &str) -> u32 {
 
 /// Mostly a citation, its leader and locator aside: an authority's entry.
 fn citation(analysis: &dyn StructureAnalysis, text: &str) -> bool {
-    static TAIL: OnceLock<Regex> = OnceLock::new();
-    let title = pattern(&TAIL, r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})[\s\d,\[\]–-]*$").replace(text.trim(), "");
+    let title = regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})[\s\d,\[\]–-]*$").replace(text.trim(), "");
     let citations = analysis.citations(&title);
     let cited: usize = citations.iter().map(|found| found.range.len()).sum();
     !citations.is_empty() && cited * 3 >= title.trim().len()
@@ -179,10 +168,8 @@ fn rows<'a>(view: &PageView<'a>, input: &ListInput) -> Vec<Row<'a>> {
 /// page:line ("153:13, 22"), a clock's time aside. Multi-column concordances, whose headwords
 /// do not read alphabetically line by line, are found this way.
 fn reference_page(view: &PageView, input: &ListInput) -> bool {
-    static REFERENCE: OnceLock<Regex> = OnceLock::new();
-    static CLOCK: OnceLock<Regex> = OnceLock::new();
-    let reference = pattern(&REFERENCE, r"\b\d{1,4}:\d{1,2}\b");
-    let clock = pattern(&CLOCK, r"(?i)\b\d{1,2}:\d{2}\s*[ap]\.?\s?m\b");
+    let reference = regex!(r"\b\d{1,4}:\d{1,2}\b");
+    let clock = regex!(r"(?i)\b\d{1,2}:\d{2}\s*[ap]\.?\s?m\b");
     let lines: Vec<&Line> = view
         .iter()
         .filter(|(slot, line)| !input.set_aside(*slot) && !line.text.trim().is_empty())
@@ -228,8 +215,7 @@ fn agreement(
     recurrences: &HashMap<String, Vec<(usize, usize)>>,
     numbers: &[Option<u32>],
 ) -> (usize, usize) {
-    static PARAGRAPH: OnceLock<Regex> = OnceLock::new();
-    let paragraph = pattern(&PARAGRAPH, r"^\s*\[?(\d{1,4})[\].)]?(?:\s|$)");
+    let paragraph = regex!(r"^\s*\[?(\d{1,4})[\].)]?(?:\s|$)");
     let (mut agreeing, mut checked) = (0, 0);
     for (title, at) in entries {
         let Some(&(slot, line)) = recurrences.get(&opening(title)).and_then(|found| found.iter().find(|(slot, _)| *slot > list_slot)) else {
@@ -249,8 +235,7 @@ fn agreement(
 
 /// A title's first five words, its enumerator and locator aside.
 fn opening(text: &str) -> String {
-    static TAIL: OnceLock<Regex> = OnceLock::new();
-    let text = pattern(&TAIL, r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})\s*\S{1,8}\s*$").replace(text.trim(), "");
+    let text = regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})\s*\S{1,8}\s*$").replace(text.trim(), "");
     // Six words decide it: an enumerator to skip and five after it.
     let words: Vec<String> = text.split_whitespace().map(normalize_title).filter(|word| !word.is_empty()).take(6).collect();
     let skip = usize::from(words.len() > 2 && words[0].chars().all(|c| c.is_ascii_digit()));
@@ -470,43 +455,19 @@ pub fn read(views: &[PageView], input: &ListInput) -> Lists {
 /// Word-index and concordance pages: short headwords in alphabetical order, each
 /// followed by an occurrence count or `page:line` / `page/line` locators.
 pub fn index_pages(views: &[PageView]) -> HashSet<usize> {
-    static COUNTED: OnceLock<Regex> = OnceLock::new();
-    static HEADWORD: OnceLock<Regex> = OnceLock::new();
-    let counted = COUNTED.get_or_init(|| {
-        Regex::new(r"\[\d{1,3}\]\s+\d{1,4}[:/]\d{1,3}").expect("index entry regex")
-    });
-    let headword = HEADWORD.get_or_init(|| {
-        Regex::new(
-            r"^\s*(\S+(?:\s\S+){0,2}?)\s+(?:[\[(]\d{1,3}[\])]\s*$|(?:[\[(]\d{1,3}[\])]\s+)?\d{1,4}[:/]\d{1,3}(?:[\s,;]|$))",
-        )
-        .expect("index headword regex")
-    });
-    views
-        .iter()
-        .filter_map(|view| {
-            let text = view
-                .iter()
-                .map(|(_, line)| line.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let headwords = view
-                .iter()
-                .filter_map(|(_, line)| headword.captures(&line.text))
-                // A headword is a word: a paragraph range ("[1] - [17]") is no entry of an index.
-                .filter(|capture| capture[1].chars().any(char::is_alphabetic))
-                .map(|capture| {
-                    capture[1]
-                        .trim_start_matches(['\'', '"', '\u{2018}', '\u{201c}'])
-                        .to_lowercase()
-                })
-                .collect::<Vec<_>>();
-            let ascending = headwords
-                .windows(2)
-                .filter(|pair| pair[0] <= pair[1])
-                .count();
-            (counted.find_iter(&text).take(5).count() >= 5
-                || headwords.len() >= 5 && ascending * 5 >= (headwords.len() - 1) * 4)
-                .then_some(view.page.index)
-        })
-        .collect()
+    let counted = regex!(r"\[\d{1,3}\]\s+\d{1,4}[:/]\d{1,3}");
+    let headword = regex!(r"^\s*(\S+(?:\s\S+){0,2}?)\s+(?:[\[(]\d{1,3}[\])]\s*$|(?:[\[(]\d{1,3}[\])]\s+)?\d{1,4}[:/]\d{1,3}(?:[\s,;]|$))");
+    let index = |view: &PageView| {
+        let text = view.iter().map(|(_, line)| line.text.as_str()).collect::<Vec<_>>().join(" ");
+        let headwords = view
+            .iter()
+            .filter_map(|(_, line)| headword.captures(&line.text))
+            // A headword is a word: a paragraph range ("[1] - [17]") is no entry of an index.
+            .filter(|capture| capture[1].chars().any(char::is_alphabetic))
+            .map(|capture| capture[1].trim_start_matches(['\'', '"', '\u{2018}', '\u{201c}']).to_lowercase())
+            .collect::<Vec<_>>();
+        let ascending = headwords.windows(2).filter(|pair| pair[0] <= pair[1]).count();
+        counted.find_iter(&text).take(5).count() >= 5 || headwords.len() >= 5 && ascending * 5 >= (headwords.len() - 1) * 4
+    };
+    views.iter().filter(|view| index(view)).map(|view| view.page.index).collect()
 }

@@ -136,9 +136,8 @@ pub(crate) fn text_quality(lines: &[Line]) -> f64 {
     // Python's str.isprintable accepts Unicode L/M/N/P/S plus ASCII space,
     // and rejects every other separator/control/format/private/unassigned
     // scalar. The already-required regex crate exposes those categories.
-    static PRINTABLE: OnceLock<Regex> = OnceLock::new();
     let printable =
-        PRINTABLE.get_or_init(|| Regex::new(r"[\p{L}\p{M}\p{N}\p{P}\p{S} ]").expect("valid regex"));
+        regex!(r"[\p{L}\p{M}\p{N}\p{P}\p{S} ]");
     let mut count = lines.len().saturating_sub(1);
     let mut printable_count = 0;
     let mut trimmed = 0;

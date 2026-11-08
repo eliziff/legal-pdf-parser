@@ -1,6 +1,7 @@
 //! What the note band reads of single lines: a notes heading, a label's typography, a reference
 //! wrapped onto the next line, a reference above a label.
 
+use legal_pdf_core::regex;
 use legal_pdf_core::model::{Line, Page, Span};
 use legal_pdf_text::text::scalar_suffix;
 use legal_structure_model::text::{is_note_symbol, normalize_label, LabelPrefix};
@@ -11,18 +12,13 @@ use std::sync::OnceLock;
 /// "Notes", "Footnotes", "Endnotes": a heading, capitalized; a lowercase "note" alone on its line
 /// is a sentence's word wrapped ("... on the information or indictment, / note").
 pub fn endnote_heading(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
     text.starts_with(char::is_uppercase)
-        && RE.get_or_init(|| Regex::new(r"(?i)^(?:end|foot)?notes?$").unwrap()).is_match(text)
+        && regex!(r"(?i)^(?:end|foot)?notes?$").is_match(text)
 }
 
 pub fn continuing_note_heading(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)^(?:endnotes?|footnotes?|notes?)(?:\s*\(?(?:continued|cont'd)\)?)?$")
-            .unwrap()
-    })
+    regex!(r"(?i)^(?:endnotes?|footnotes?|notes?)(?:\s*\(?(?:continued|cont'd)\)?)?$")
     .is_match(text.trim())
 }
 
