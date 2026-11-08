@@ -186,8 +186,8 @@ impl PdfDocument {
     /// Exact printed membership for geometry, without the text response-size limit: each paragraph's extent, its
     /// own lines and everything set within it (its list's items, its block quotations), every printing of it.
     pub fn paragraph_source_ranges(&self, locator: &str) -> (PdfLookupStatus, Vec<ScalarRange>) {
-        let range = numeric_range("paragraph", locator)
-            .or_else(|| legal_structure_model::structure_analysis().parse_ordinal("paragraph", locator).map(|n| (n, n)));
+        let range = legal_locator::ordinal_range("paragraph", locator)
+            .or_else(|| legal_locator::parse_ordinal("paragraph", locator).map(|n| (n, n)));
         let Some((from, to)) = range.filter(|(a, b)| a <= b && b - a < 100) else {
             return (PdfLookupStatus::Invalid, Vec::new());
         };

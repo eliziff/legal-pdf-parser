@@ -17,6 +17,7 @@ resolver = "2"
 legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "cbecf0a8c2b91860115c0ab5749fbb3552c787a7" }
 legal-layout = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "cbecf0a8c2b91860115c0ab5749fbb3552c787a7" }
 legal-structure-model = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "cbecf0a8c2b91860115c0ab5749fbb3552c787a7" }
+legal-locator = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "cbecf0a8c2b91860115c0ab5749fbb3552c787a7" }
 legal-structure-features = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "cbecf0a8c2b91860115c0ab5749fbb3552c787a7" }
 pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 

@@ -369,45 +369,12 @@ pub(crate) fn section_unit(
     PdfLookupUnit::new(section, rendered_slice(text, document, section).trim().to_owned(), confidence)
 }
 
-pub fn numeric_range(kind: &str, raw: &str) -> Option<(usize, usize)> {
-    let value = nfkc_text(raw);
-    let value = value
-        .trim()
-        .trim_start_matches('#')
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim();
-    let prefix = match kind {
-        "page" => legal_pdf_core::regex!(r"(?i)^(?:pages?|pp?\.?)[\s:_=-]*"),
-        "line" => legal_pdf_core::regex!(r"(?i)^(?:lines?|ll?\.?)[\s:_=-]*"),
-        _ => legal_pdf_core::regex!(r"(?i)^(?:paragraphs?|paras?|pars?)\.?[\s:_=-]*"),
-    };
-    let stripped = prefix.replace(value, "");
-    let captures = legal_pdf_core::regex!(r"(?i)^(\d{1,6})\s*(?:-|–|—|\.\.|to)\s*(\d{1,6})$")
-        .captures(&stripped)?;
-    // An end shorter than its start keeps the start's leading figures: "142-54" runs to 154, "138-9" to 139.
-    let (first, end) = (&captures[1], &captures[2]);
-    let last = if end.len() < first.len() { format!("{}{end}", &first[..first.len() - end.len()]) } else { end.to_owned() };
-    Some((first.parse().ok()?, last.parse().ok()?))
-}
-
-pub(crate) fn normalize_footnote(raw: &str) -> String {
-    let value = nfkc_text(raw);
-    legal_pdf_core::regex!(r"(?i)^(?:footnotes?|notes?|fn)\s*[#.:_-]?\s*")
-        .replace(value.trim(), "")
-        .to_lowercase()
-}
-
+/// A typed section locator's place, as a provision's fragment names it ("s. 5 (2)" is "sec5(2)").
 pub(crate) fn normalized_section(raw: &str) -> Option<String> {
-    let value = nfkc_text(raw);
-    let compact: String = legal_pdf_core::regex!(r"(?i)^(?:ss?\.?|sections?)\s*")
-        .replace(value.trim(), "")
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect();
-    let normalized = legal_structure_model::structure_analysis().numbered_section_locator(&compact);
-    (!normalized.is_empty()).then_some(normalized)
+    match legal_locator::section_locator(&nfkc_text(raw)) {
+        Some(legal_locator::SectionLocator::Section(label)) => Some(format!("sec{label}")),
+        _ => None,
+    }
 }
 
 pub(crate) fn section_alias(raw: &str) -> String {
@@ -446,14 +413,14 @@ pub(crate) fn section_matches(section: &StructureNode,
 }
 
 pub(crate) fn exact_footnotes(document: &PdfDocument, notes: &[&StructureNode], locator: &str, input: &PdfLookupRequest) -> Vec<usize> {
-    let query = normalize_footnote(locator);
+    let query = legal_locator::note_label(locator);
     (0..notes.len()).filter(|&at| {
         let note = notes[at];
         let label = note.label.as_deref().unwrap_or("");
         input.occurrence.is_none_or(|number| notes[..=at].iter().filter(|other| other.label.as_deref().unwrap_or("") == label).count() == number)
             && input.page.is_none_or(|number| note.calls.first().and_then(|call| page_at(document, call.start)) == Some(number)
                 || note.page_indexes.iter().any(|page| *page as u32 + 1 == number))
-            && (normalize_footnote(&note.id) == query || normalize_footnote(label) == query)
+            && (legal_locator::note_label(&note.id) == query || legal_locator::note_label(label) == query)
     }).collect()
 }
 
@@ -569,12 +536,12 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         .filter(|value| !value.is_empty());
     // The numbers a page, paragraph or line locator runs from and to, in order.
     let numbers = || {
-        let inline = numeric_range(kind, &input.locator);
+        let inline = legal_locator::ordinal_range(kind, &input.locator);
         let start_number = inline
             .map(|item| item.0)
-            .or_else(|| legal_structure_model::structure_analysis().parse_ordinal(kind, &input.locator));
+            .or_else(|| legal_locator::parse_ordinal(kind, &input.locator));
         let end_number = end_locator
-            .map(|end| legal_structure_model::structure_analysis().parse_ordinal(kind, end))
+            .map(|end| legal_locator::parse_ordinal(kind, end))
             .unwrap_or_else(|| inline.map(|item| item.1).or(start_number));
         match (start_number, end_number) {
             (Some(start), Some(end)) if start <= end => Ok((start, end)),
