@@ -19,7 +19,7 @@ use legal_pdf_fences::{Continuation, Fences};
 use legal_pdf_layout::Geometry;
 use legal_pdf_structure_model::{Evidence, Role, Slot, Slots, SourceTag};
 use std::collections::{BTreeMap, HashMap, HashSet};
-pub use legal_pdf_structure_model::{Member, Place, Run, Runs};
+use legal_pdf_structure_model::{Member, Place, Run, Runs};
 use legal_structure_model::{
     CandidateEvidenceV2, CandidateGrammar, CandidateObservationV2, ResolutionRuleV2, StructureAnalysis, StructureCandidateRun,
     StructureMarkerCandidate, UnitRole,

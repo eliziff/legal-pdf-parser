@@ -51,6 +51,7 @@ legal-pdf-extraction-processor = { path = "legal-pdf-extraction-processor", opti
 legal-pdf-language = { path = "legal-pdf-language", optional = true }
 legal-pdf-ocr = { path = "legal-pdf-ocr", optional = true }
 legal-pdf-structure = { path = "legal-pdf-structure", optional = true }
+legal-pdf-diagnostics = { path = "legal-pdf-diagnostics" }
 legal-pdf-support = { path = "legal-pdf-support", optional = true }
 legal-pdf-pages = { path = "legal-pdf-pages", optional = true }
 legal-structure-model = { workspace = true }

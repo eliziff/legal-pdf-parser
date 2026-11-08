@@ -17,7 +17,8 @@
 //!   unit of its own.
 
 use legal_pdf_core::model::{Footnote, Line, Page, PdfOutlineEntry};
-use legal_pdf_decide::{Decision, Fences, Geometry, Heard, Notes};
+use legal_pdf_decide::{Decision, Geometry, Heard, Notes};
+use legal_pdf_fences::Fences;
 use legal_pdf_graph::graph;
 use legal_pdf_machine::lines::LineTable;
 use legal_pdf_machine::machine::{LineView, Move, State, TemplateView, CANDIDATE, RANKED_BODY};

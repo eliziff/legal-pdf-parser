@@ -15,6 +15,7 @@ legal-pdf-notes = { path = "../legal-pdf-notes" }
 legal-pdf-constituents = { path = "../legal-pdf-constituents" }
 legal-pdf-graph = { path = "../legal-pdf-graph" }
 legal-pdf-decide = { path = "../legal-pdf-decide" }
+legal-pdf-fences = { path = "../legal-pdf-fences" }
 legal-pdf-machine = { path = "../legal-pdf-machine" }
 legal-pdf-tier0 = { path = "../legal-pdf-tier0" }
 legal-pdf-emit = { path = "../legal-pdf-emit" }

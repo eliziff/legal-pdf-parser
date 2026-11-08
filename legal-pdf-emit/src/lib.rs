@@ -13,7 +13,7 @@
 use legal_pdf_constituents as constituents;
 use legal_pdf_core::model::{Footnote, Line, Page, Paragraph};
 use legal_pdf_core::{Error, Result};
-use legal_pdf_decide::{decided, Fences};
+use legal_pdf_fences::{decided, Fences};
 use legal_pdf_machine::lines::LineTable;
 use legal_pdf_machine::machine::{stream_of, LineView, Move, Stands, State, Streams, MARGIN, OPENING};
 use legal_pdf_structure_model::regions::{HEADING, LINE_LABEL, NOTE, PAGE_LABEL, REGIONS, TABLE};

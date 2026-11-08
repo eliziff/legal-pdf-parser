@@ -42,7 +42,8 @@
 //! - The parse's output is tier 0's (`tier0::output`) whatever the tier: LEGALPDF_TRANSITION_DOC has DOC score its moves.
 
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
-use legal_pdf_decide::{Decision, Fences, Notes};
+use legal_pdf_decide::{Decision, Notes};
+use legal_pdf_fences::Fences;
 use legal_pdf_structure_model::evidence::WORD_SPEAKER;
 use legal_pdf_structure_model::{Evidence, Slot, Slots};
 use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::OnceLock};
@@ -60,7 +61,7 @@ mod joint;
 #[macro_use]
 mod encoder;
 mod doc;
-pub use legal_pdf_tier0 as tier0;
+use legal_pdf_tier0 as tier0;
 
 /// A class the local scores hold below this probability competes only where the state proposes it: a
 /// guard on the parse's cost, not a judgement.

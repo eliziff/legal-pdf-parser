@@ -4,9 +4,8 @@ use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, Result};
 use legal_pdf_extraction_processor::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
-use legal_pdf_structure::{
-    status, validate_document, validate_pdf_components, StructureIdentity, StructureOutput,
-};
+use legal_pdf_diagnostics::{status, validate_document, validate_pdf_components};
+use legal_pdf_structure::{StructureIdentity, StructureOutput};
 use legal_pdf_support::{profile, PdfDocument};
 #[cfg(feature = "ppdoc")]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};

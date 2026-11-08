@@ -10,6 +10,7 @@
 //! document's outline is found on its lines and every heading levelled (`levels`), and the decision
 //! written to the pages once (`write`).
 
+use legal_pdf_structure_model::{Held, Member, PageView, Paragraphs, Role, Rule, Run, Runs, Slot, Slots};
 use legal_pdf_core::model::{Diagnostic, Line, Page, PdfOutlineEntry};
 use legal_pdf_headings::headings::native::date_line;
 use legal_pdf_headings::headings;
@@ -27,14 +28,10 @@ use legal_pdf_core::regex;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 
-pub use legal_pdf_evidence as evidence;
-pub use evidence::*;
-pub use legal_pdf_fences::paragraphs;
-pub use paragraphs::{Held, Paragraphs};
-pub use legal_pdf_fences::fences;
-pub use fences::*;
-pub use legal_pdf_runs as runs;
-pub use runs::*;
+use legal_pdf_evidence::*;
+use legal_pdf_fences::paragraphs;
+use legal_pdf_fences::*;
+use legal_pdf_runs::*;
 pub mod notes;
 pub use notes::*;
 pub mod rules;

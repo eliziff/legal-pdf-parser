@@ -12,7 +12,6 @@ pub mod write;
 use measures::{Counts, Numbers, PageMeasures};
 use notes::NoteWalk;
 use write::Written;
-pub use legal_pdf_structure_model::{Held, Paragraphs};
 
 /// The stream a line is read in, apart from the column it stands in (`Fences::translation`): a judgment in one language
 /// reads a statute quoted in two columns in its one stream.

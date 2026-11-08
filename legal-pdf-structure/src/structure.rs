@@ -2,7 +2,7 @@
 //! structure graph out. Each stage is a crate of its own over the contract (`legal_pdf_structure_model`); this calls
 //! them in order and caches what the first three read:
 //!
-//! 0. The pages normalized (`legal_pdf_decide::evidence::normalize`): a transcript's line numbers parted from the lines
+//! 0. The pages normalized (`legal_pdf_evidence::normalize`): a transcript's line numbers parted from the lines
 //!    they were read into, a table's rulings cleared from under its words, each line given its slot.
 //! 1. Measured (`Evidence`): each page's words, rows and note separator; each line's type, its source's tag, its marker,
 //!    note label, reference tokens, words and citations; the document's bookmarks and whether it is an instrument.
@@ -25,8 +25,11 @@
 
 pub use legal_pdf_structure_model::StructureIdentity;
 use legal_pdf_decide as decide;
+use legal_pdf_evidence::{normalize, Evidence};
+use legal_pdf_fences::{decided, Fences};
+use legal_pdf_structure_model::{Runs, Slots};
 pub(crate) use decide::*;
-pub use legal_pdf_diagnostics::*;
+use legal_pdf_diagnostics::*;
 use legal_pdf_graph::graph;
 pub use graph::PdfTextIndex;
 use legal_pdf_layout::build_regions;

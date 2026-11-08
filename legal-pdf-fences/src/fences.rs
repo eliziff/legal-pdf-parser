@@ -25,7 +25,6 @@ pub mod order;
 pub mod quotations;
 pub mod tables;
 
-pub use legal_pdf_structure_model::{Role, Rule};
 use legal_pdf_structure_model::Decided;
 
 /// Why a line goes on with the one before it in reading order.
