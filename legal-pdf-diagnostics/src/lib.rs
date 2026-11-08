@@ -6,7 +6,7 @@ use legal_pdf_core::model::{Diagnostic, Line, Page};
 use legal_pdf_core::{Error, Result};
 use legal_pdf_furniture::printed_label;
 use legal_pdf_structure_model::TRANSITION_ORIGIN;
-use legal_structure_model::{utf16_len, DocumentStructure, NodeKind, ResolutionRuleV2, ScalarRange};
+use legal_structure_model::{utf16_len, DocumentStructure, NodeKind, ScalarRange};
 use std::collections::{HashMap, HashSet};
 
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
@@ -111,7 +111,7 @@ pub fn validate_pdf_components(
             && grammar != Some("heading_section")
             && !grammar.is_some_and(|grammar| grammar.starts_with(constituents::GRAMMAR))
             && (node.locator_kind.as_deref().is_none_or(str::is_empty)
-                || (node.origin_id != TRANSITION_ORIGIN && node.proof.as_ref().is_none_or(|proof| proof.rule != ResolutionRuleV2::HierarchySection)));
+                || node.origin_id != TRANSITION_ORIGIN);
         if node.id.is_empty()
             || !node_ids.insert(node.id.as_str())
             || node.range.start > node.range.end

@@ -821,7 +821,6 @@ fn structure_examples(graph: &DocumentStructure) -> Value {
                 "parent_id": node.parent_id,
                 "page_indexes": node.page_indexes,
                 "line_ids": node.line_ids,
-                "rule": node.proof.as_ref().map(|proof| proof.rule),
             })
         };
         examples.insert(kind.name().to_owned(), slots.into_iter().map(example).collect());
@@ -855,9 +854,6 @@ pub fn corpus_check_cached_extraction(input: impl AsRef<Path>) -> Result<Value> 
     let by_kind = count(&mut graph.nodes.iter().map(|node| node.kind.name().to_owned()));
     let sections = graph.nodes.iter().filter(|node| node.kind == legal_structure_model::NodeKind::Section);
     let sections_by_locator_kind = count(&mut sections.map(|node| node.locator_kind.clone().unwrap_or_else(|| "unknown".to_owned())));
-    let proofs = graph.nodes.iter().filter_map(|node| node.proof.as_ref().map(|proof| (node.id.as_str(), proof))).collect::<Vec<_>>();
-    let name = |value: serde_json::Result<Value>| value.ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_else(|| "unknown".to_owned());
-    let by_rule = count(&mut proofs.iter().map(|(_, proof)| name(serde_json::to_value(proof.rule))));
     let heading_derived_sections = graph
         .nodes
         .iter()
@@ -868,11 +864,9 @@ pub fn corpus_check_cached_extraction(input: impl AsRef<Path>) -> Result<Value> 
         "node_count": graph.nodes.len(),
         "note_count": graph.nodes.iter().filter(|node| matches!(node.kind, legal_structure_model::NodeKind::Footnote | legal_structure_model::NodeKind::Endnote)).count(),
         "by_kind": by_kind,
-        "by_rule": by_rule,
         "sections_by_locator_kind": sections_by_locator_kind,
         "heading_derived_section_count": heading_derived_sections,
         "graph_sha256": serialization_sha256(graph)?,
-        "proofs_sha256": serialization_sha256(&proofs)?,
         "examples": structure_examples(graph),
     });
     Ok(json!({
