@@ -61,6 +61,8 @@ impl PdfLookupRequest {
 pub struct PdfLookupUnit {
     pub node: StructureNode,
     pub text: String,
+    /// The pages (from 1) it stands on (`page_numbers`).
+    pub pages: Vec<u32>,
     pub confidence: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub printings: Vec<StructureNode>,
@@ -72,7 +74,7 @@ pub struct PdfLookupUnit {
 
 impl PdfLookupUnit {
     fn new(node: &StructureNode, text: String, confidence: Option<f64>) -> Self {
-        Self { node: node.clone(), text, confidence, printings: Vec::new(), occurrence: None, reference_page: None }
+        Self { node: node.clone(), text, pages: Vec::new(), confidence, printings: Vec::new(), occurrence: None, reference_page: None }
     }
 
     /// The pages (from 1) the unit stands on: its note's first call's, then its node's and its printings'.
@@ -474,6 +476,12 @@ where
             Some(format!("Exact ranges are limited to {MAX_UNITS} units")),
         );
     }
+    // Each unit with the pages it stands on.
+    let mut unit_at = |index| {
+        let mut unit = unit_at(index);
+        unit.pages = unit.page_numbers();
+        unit
+    };
     let before: Vec<_> = (selected_start.saturating_sub(input.context_blocks)..selected_start)
         .map(&mut unit_at)
         .collect();
@@ -509,7 +517,7 @@ where
         .iter()
         .chain(selected.iter())
         .chain(after.iter())
-        .flat_map(PdfLookupUnit::page_numbers)
+        .flat_map(|unit| unit.pages.iter().copied())
         .collect();
     // The text of each page a unit is on, as a page lookup returns it (`PdfDocument::page_texts`).
     let pages = document
