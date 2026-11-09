@@ -108,10 +108,11 @@ struct ReadPage<'a> {
 }
 
 /// A line of a passage: its part of the source line (the line's id, and the passage's span of it where it holds part),
-/// that part's rectangle and its words.
+/// that part's rectangle, text and available word boxes. A recognized line may have only line geometry.
 pub struct PassageLine {
     pub id: String,
     pub rect: Rect,
+    pub text: String,
     pub words: Vec<(String, Rect)>,
 }
 
@@ -221,7 +222,7 @@ impl PdfDocument {
         let printed = (target.locator_kind == "paragraph").then(|| status == PdfLookupStatus::Found && complete
             && !selected_pages.is_empty() && selected_pages.iter().all(|page| !unavailable.contains(&((*page - 1) as usize))));
         let pages = read.into_iter().map(|page| {
-            let words = page.lines.iter().flat_map(|line| &line.words).map(|(text, _)| text.as_str()).collect::<Vec<_>>().join(" ");
+            let words = page.lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join(" ");
             let mut width = 0;
             let text = words.chars().take_while(|c| { width += c.len_utf16(); width <= 2_000 }).collect::<String>();
             PassagePage {
@@ -244,19 +245,25 @@ fn read_lines(page: &Page, whole_page: bool, selected: &HashMap<&str, Vec<Scalar
     let mut lines = Vec::new();
     for line in &page.lines {
         if whole_page {
+            let words = line.words.iter().map(|word| (word.text.clone(), word.bbox)).collect::<Vec<_>>();
+            let text = if words.is_empty() { line.text.clone() }
+                else { words.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join(" ") };
             lines.push(PassageLine { id: line.id.clone(), rect: line.bbox,
-                words: line.words.iter().map(|word| (word.text.clone(), word.bbox)).collect() });
+                text, words });
             continue;
         }
         let source = ScalarText::new(&line.text);
         for range in selected.get(line.id.as_str()).into_iter().flatten() {
             let id = format!("{}:{}-{}", line.id, range.start, range.end);
-            // A line the extraction gives no word boxes stands in its own ("Q Have you ever heard of a -- the use of a");
-            // a line recognition read with none is marked by none.
+            // A recognized line has its measured rectangle even where its recognizer supplies no word boxes.
+            // It can be marked whole; a partial line still needs word witnesses.
             if line.words.is_empty() {
-                if page.source == "native" {
-                    let text = source.slice_utf16(range.start..range.end).unwrap_or_default().to_owned();
-                    lines.push(PassageLine { id, rect: line.bbox, words: vec![(text, line.bbox)] });
+                // Canonical marker recovery can add a bracket to the logical line. Its range still
+                // covers the whole original recognition; clip to that original for its physical reading.
+                if page.source == "native" || range.start == 0 && range.end >= source.utf16_len() {
+                    let text = source.slice_utf16(range.start..range.end.min(source.utf16_len())).unwrap_or_default().to_owned();
+                    let words = if page.source == "native" { vec![(text.clone(), line.bbox)] } else { Vec::new() };
+                    lines.push(PassageLine { id, rect: line.bbox, text, words });
                 }
                 continue;
             }
@@ -271,7 +278,8 @@ fn read_lines(page: &Page, whole_page: bool, selected: &HashMap<&str, Vec<Scalar
             }).collect::<Vec<_>>();
             // A mark no word box covers costs that mark, not the page its line stands on.
             let Some(rect) = words.iter().map(|(_, rect)| *rect).reduce(union) else { continue };
-            lines.push(PassageLine { id, rect, words });
+            let text = words.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join(" ");
+            lines.push(PassageLine { id, rect, text, words });
         }
     }
     lines
@@ -300,6 +308,10 @@ fn place_quote(pages: &[ReadPage], status: PdfLookupStatus, quote: &QuoteSelecti
     let after = passage_words(slice(quote.end, context.utf16_len()));
     if selected.is_empty() || [&before[..], &selected[..], &after[..]].concat() != needle {
         return none(PdfLookupStatus::Invalid);
+    }
+    // Line rectangles support a whole paragraph, without inventing boxes for words within it.
+    if pages.iter().filter(|page| page.available).any(|page| page.lines.iter().any(|line| line.words.is_empty())) {
+        return none(PdfLookupStatus::Unavailable);
     }
     let words = pages.iter().filter(|page| page.available)
         .flat_map(|page| page.lines.iter().flat_map(move |line| line.words.iter().flat_map(move |(text, rect)|

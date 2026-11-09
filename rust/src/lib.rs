@@ -14,6 +14,8 @@ pub type RecognitionProgress<'a> = Option<&'a (dyn Fn(usize, usize) + Sync)>;
 #[cfg(feature = "pdf")]
 pub use legal_pdf_pages::{reread, Bands};
 #[cfg(feature = "pdf")]
+pub use legal_pdf_extraction_processor::{pdf_opening, PdfOpening, PdfOpeningPage};
+#[cfg(feature = "pdf")]
 pub use page_map::{page_evidence, page_map, EdgeLine, PageEvidence, PdfPageBinding};
 #[cfg(feature = "ocr")]
 pub use legal_pdf_ocr::read_bands;

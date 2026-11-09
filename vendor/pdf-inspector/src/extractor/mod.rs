@@ -154,10 +154,11 @@ pub(crate) use xobjects::FormWalkBudget;
 /// Extract source-faithful text and classify a PDF the caller already loaded.
 pub fn extract_fidelity_from_doc(
     doc: &Document,
+    page_filter: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PdfTypeResult), PdfError> {
     let font_cmaps = FontCMaps::from_doc(doc);
     let (extraction, _, _, evidence, _, _) =
-        extract_positioned_text_from_doc_fidelity(doc, &font_cmaps, None)?;
+        extract_positioned_text_from_doc_fidelity(doc, &font_cmaps, page_filter)?;
     let mut detection = detect_from_page_evidence(
         &evidence,
         read_document_info(doc),

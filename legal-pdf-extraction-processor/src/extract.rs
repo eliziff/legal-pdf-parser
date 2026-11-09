@@ -9,7 +9,7 @@ use std::collections::HashMap;
 pub fn extract_pdf(bytes: &[u8]) -> Result<ExtractedPdf> {
     let document = profile::measure("extract.load_document", || processor::load_extraction_document(bytes))?;
     let page_geometries = profile::measure("extract.page_geometry", || processor::page_geometries(&document));
-    let ((items, rects, lines, painted_rules), detection) = profile::measure("extract.fidelity", || pdf_inspector::extract_fidelity_from_doc(&document)).map_err(processor::pdf::unreadable)?;
+    let ((items, rects, lines, painted_rules), detection) = profile::measure("extract.fidelity", || pdf_inspector::extract_fidelity_from_doc(&document, None)).map_err(processor::pdf::unreadable)?;
     let embedded_page_labels = processor::embedded_page_labels(&document, page_geometries.len());
     let outline = processor::embedded_outline(&document);
     // Keep direct inline roles and enclosing heading/list-item roles as separate evidence.
@@ -93,4 +93,53 @@ pub fn extract_pdf(bytes: &[u8]) -> Result<ExtractedPdf> {
         }
     }
     Ok(extracted)
+}
+
+/// Native opening-page witnesses for identifying a downloaded source. No recognition or structure inference.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfOpening {
+    pub page_count: usize,
+    pub pages: Vec<PdfOpeningPage>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfOpeningPage {
+    #[serde(flatten)]
+    pub page: legal_pdf_core::model::Page,
+    pub margin_text: String,
+}
+
+pub fn pdf_opening(bytes: &[u8]) -> Result<PdfOpening> {
+    use pdf_inspector::types::{ItemType, TextLine};
+    use std::collections::{BTreeMap, HashSet};
+    let document = processor::load_extraction_document(bytes)?;
+    let mut geometries = processor::page_geometries(&document);
+    let page_count = geometries.len();
+    let selected = HashSet::from([1, 2]);
+    geometries.retain(|number, _| selected.contains(number));
+    let ((items, _, _, rules), detection) = pdf_inspector::extract_fidelity_from_doc(&document, Some(&selected))
+        .map_err(processor::pdf::unreadable)?;
+    // The same source line owns fragments of a vertical margin stamp. Its baseline and advance,
+    // rather than its words, establish that it stands vertically at the page's edge.
+    let mut margins = BTreeMap::<(u32, u32, u32), TextLine>::new();
+    for item in &items {
+        let (Some((_, geometry)), Some(source)) = (geometries.get(&item.page), item.fidelity.as_ref()) else { continue };
+        let x = f64::from(source.baseline[0]) - geometry.x0;
+        if !matches!(item.item_type, ItemType::Text) || source.advance[1].abs() <= source.advance[0].abs() * 4.0
+            || x < 0.0 || x > geometry.raw_width || x > geometry.raw_width * 0.12 && x < geometry.raw_width * 0.88 {
+            continue;
+        }
+        margins.entry((item.page, source.text_object, source.source_line)).or_insert_with(|| TextLine {
+            items: Vec::new(), y: item.y, page: item.page, adaptive_threshold: 0.1,
+        }).items.push(item.clone());
+    }
+    let extracted = processor::assemble_pdf(&geometries, items, rules, detection)?;
+    let pages = extracted.pages.into_iter().map(|page| {
+        let margin_text = margins.iter().filter(|((number, ..), _)| *number == page.number)
+            .map(|(_, line)| processor::pdf::assemble_line(line).text).collect::<Vec<_>>().join("\n");
+        PdfOpeningPage { page, margin_text }
+    }).collect();
+    Ok(PdfOpening { page_count, pages })
 }
