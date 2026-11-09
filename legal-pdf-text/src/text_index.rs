@@ -28,7 +28,10 @@ impl PdfTextIndex {
         for page in pages {
             let (mut page_start, mut page_end) = (None, cursor);
             let mut previous: Option<&Line> = None;
-            for line in &page.lines {
+            // A page holds its lines as extracted; the decision writes each one's place in the reading order.
+            let mut lines: Vec<&Line> = page.lines.iter().collect();
+            lines.sort_by_key(|line| line.reading_order);
+            for line in lines {
                 if !index.lines.is_empty() {
                     // A number set on a line of its own with its paragraph beside it on the same row (`beside`: "1." then
                     // "In this decision ...", a hanging "[35]" read apart from its text) reads as one printed line: the grammars
