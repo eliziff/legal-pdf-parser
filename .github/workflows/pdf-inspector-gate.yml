@@ -9,6 +9,7 @@ name: PDF Inspector source gold
     - '!vendor/pdf-inspector/src/bin/**'
     - vendor/pdf-inspector/external/bcmaps/**
     - tools/pdf-inspector-regression.json
+    - tools/check-pdf-source-gold.py
   pull_request:
     paths:
     - vendor/pdf-inspector/Cargo.toml
@@ -16,6 +17,7 @@ name: PDF Inspector source gold
     - '!vendor/pdf-inspector/src/bin/**'
     - vendor/pdf-inspector/external/bcmaps/**
     - tools/pdf-inspector-regression.json
+    - tools/check-pdf-source-gold.py
 permissions:
   contents: read
 jobs:
@@ -72,3 +74,5 @@ jobs:
         if ($LASTEXITCODE -ne 0) { throw "Candidate legalpdf build failed" }
         & (Join-Path $target debug/legalpdf.exe) _pdf-inspector-gate $gateManifest $env:LEGALPDF_CORPUS_ROOT > $headSnapshot
         if ($LASTEXITCODE -ne 0) { throw "Candidate PDF Inspector product gate failed" }
+        python head/tools/check-pdf-source-gold.py $headSnapshot head/tools/pdf-inspector-regression.json
+        if ($LASTEXITCODE -ne 0) { throw "PDF source gold or frozen regression check failed" }
