@@ -16,10 +16,11 @@
 //! 4. Notes (`Notes`): each document's note band and the lanes that take more lines for notes (`legal_pdf_notes`).
 //! 5. Decided (`transition::tier0`): every rule heard on every line (`Decision::hear`), one decision on each line in
 //!    reading order (`settle`), the headings' levels (`Decision::finish`). Paragraph numbers are fixed input.
-//! 6. Written once (`write_lines`): each line's region, note mode, block and place in its page's reading order.
-//! 7. Derived from what was written: regions (`legal_pdf_layout::build_regions`), notes paired (the engine's pairer,
-//!    `legal_pdf_notes::note_pairing`), propositions and cross-references (`note_context`), and the moves the decided
-//!    lines make emitted as the structure graph (`transition::emit`, `legal_pdf_graph`).
+//! 6. Written once (`write_lines`): each line's place in its page's reading order; and read by slot, each line's zone
+//!    and block (`zones`, `blocks`).
+//! 7. Derived from the decision: notes paired (the engine's pairer, over `note_lines`), a note band's line no note holds
+//!    given back to the body, propositions and cross-references (`note_context`), and the moves the decided lines make
+//!    (`tier0::moves_of`, over `tier0::reading_regions`) emitted as the structure graph (`legal_pdf_emit`).
 //!
 //! Measure a change with the grader's digest (`structure-gold digest`): every parse hashed, two builds compared.
 
@@ -31,8 +32,7 @@ use legal_pdf_structure_model::{Runs, Slots};
 pub(crate) use decide::*;
 use legal_pdf_graph::graph;
 pub use graph::PdfTextIndex;
-use legal_pdf_layout::build_regions;
-use legal_pdf_notes::{note_context, note_pairing};
+use legal_pdf_notes::note_context;
 use note_context::*;
 /// The transition parser's walk over tier 0's reading, and its fitted readers (DOC with `encoder`).
 use legal_pdf_transition as transition;
@@ -42,7 +42,7 @@ use legal_pdf_machine::lines::LineTable;
 use legal_pdf_machine::machine::LineView;
 use std::path::Path;
 
-use legal_pdf_core::model::{Diagnostic, Page, PdfOutlineEntry};
+use legal_pdf_core::model::{Diagnostic, LineZone, Page, PdfOutlineEntry};
 use legal_structure_model::StructureNode;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::DocumentStructure;
@@ -55,36 +55,22 @@ pub struct StructureOutput {
     pub structure_graph: DocumentStructure,
 }
 
-/// What the measuring, fencing and numbering of a document read, cached by its input pages: the
-/// evidence, the fences, contexts and reading order, the runs, and the text the runs' repair
-/// rewrote.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Measured {
-    evidence: Evidence,
-    fences: Fences,
-    runs: Runs,
-}
-
-/// A line written in the note band that no note holds (the pairer made no note of its label, or
-/// bounded the note's body short of it) is the body's, and joins its paragraph rather than
-/// standing alone: on the gold, 6,825 such lines were no notes, 2,146 were. Whether any was.
-fn give_back(pages: &mut [Page], notes: &[StructureNode]) -> bool {
-    let held: HashSet<&str> = notes.iter().flat_map(|note| &note.line_ids).map(String::as_str).collect();
-    let mut given_back = false;
-    for line in pages.iter_mut().flat_map(|page| &mut page.lines) {
-        if line.region_type == "footnote" && !held.contains(line.id.as_str()) {
-            line.region_type = "body".to_owned();
-            line.note_region_mode.clear();
-            given_back = true;
+/// A line of the note band that no note holds (the pairer made no note of its label, or bounded the note's body short of
+/// it) is the body's, and joins its paragraph rather than standing alone: on the gold, 6,825 such lines were no notes,
+/// 2,146 were.
+fn give_back(zones: &mut [LineZone], slots: &Slots, notes: &[StructureNode]) {
+    let mut held = vec![false; zones.len()];
+    for slot in notes.iter().flat_map(|note| &note.line_ids).filter_map(|id| slots.of_id(id)) {
+        held[slot.index()] = true;
+    }
+    for (zone, held) in zones.iter_mut().zip(held) {
+        if matches!(zone, LineZone::Note(_)) && !held {
+            *zone = LineZone::Body;
         }
     }
-    given_back
 }
-
-/// The document's structure, reading what the measuring, fencing and numbering read from `cache` where it is there
-/// (a file named for the input pages and the code that reads them) and writing it there where not.
-/// The notes, the decision and everything after it are read on every run. With `trace`, the decision is also written
-/// to that folder (`decide::trace`); the parse is the same.
+/// The document's structure. With `trace`, the decision is also written to that folder (`decide::trace`); the parse is
+/// the same.
 pub fn derive(pages: &mut [Page],
     separators: &[Option<f64>],
     outline: &[PdfOutlineEntry],
@@ -161,27 +147,28 @@ fn output(pages: &mut [Page],
     if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision);
     }
-    write_lines(pages, slots, evidence, &fences, &notes, &decision);
+    write_lines(pages, slots, &fences, &decision);
+    let blocks = blocks(pages, slots, evidence, &fences, &decision);
+    let mut zones = zones(slots, evidence, &fences, &notes, &decision);
     // The lines are read in reading order from here on, the pairer's and the output's: each page's put in it once.
     slots.read_in_order(pages, &fences.order);
     let slots: &Slots = slots;
     let decided = decided(pages, slots, &fences);
-    build_regions(pages);
-    let index = PdfTextIndex::from_pages(pages);
+    let pages: &[Page] = pages;
+    // A line joins the one before it where evidence reads that line's marker standing beside it (`Evidence::beside`).
+    let index = PdfTextIndex::from_pages(pages, |before, line| slots.of_id(&before.id).and_then(|at| evidence.beside[at.index()]).is_some_and(|beside| slots.of_id(&line.id) == Some(beside)));
     let citations = graph::citation_spans(pages, slots, evidence);
-    let pairing = note_pairing::pair_notes(pages, &decided, &citations, &index);
+    let lines = note_lines(pages, slots, &fences, &notes, &decision, &zones, &blocks, &citations);
+    let pairing = legal_structure_model::structure_analysis().pair_footnotes(&lines, &|at, start, end| index.global_range(lines[at].id, start, end));
     let notes = pairing.notes;
     diagnostics.extend(pairing.diagnostics);
-    if give_back(pages, &notes) {
-        build_regions(pages);
-    }
-    diagnostics.extend(unmatched_reference_diagnostics(pages, &notes, &index, &decided));
-    let pages: &[Page] = pages;
-    let views = LineView::all(pages, slots, evidence, &fences, &table, None);
-    let moves = tier0::moves_of(slots, &fences, runs, &views, &decision, &tier0::reading_regions(pages, &decided), &notes);
-    // A tier scores the moves, the output stays this one: the walk takes the DOC tier's move for each line, but for the
-    // notes, the pairer's (a line either reads as a note keeps this reading's move). DOC reads the same table, so its
-    // reading of a marker names one of this reading's.
+    give_back(&mut zones, slots, &notes);
+    diagnostics.extend(unmatched_reference_diagnostics(fences.order.iter().map(|&slot| (slots.line(pages, slot), zones[slot.index()])), &notes, &index, &decided));
+    let views = LineView::all(slots, evidence, &fences, &table);
+    let moves = tier0::moves_of(slots, &fences, runs, &views, &decision, &tier0::reading_regions(pages, slots, &fences, &zones, &blocks), &notes);
+    // The writer takes DOC's move for each line where DOC read one, but for the notes, the pairer's (a line either reads
+    // as a note keeps this reading's move). DOC reads the same table, so its reading of a marker names one of this
+    // reading's.
     let settled = Settled { index: &index, notes, runs };
     let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &decided, &table, &moves, doc, identity, settled)?;
     Ok(StructureOutput { authority_text_units, diagnostics, structure_graph })

@@ -1,7 +1,7 @@
 //! What a note says of the text around it: its proposition (the sentence it attaches to), its
 //! cross-references to other notes, and the references no note answers.
 
-use legal_pdf_core::model::{Diagnostic, Page};
+use legal_pdf_core::model::{Diagnostic, Line, LineZone};
 use legal_pdf_core::AuthorityTextUnit;
 use legal_pdf_text::text_index::PdfTextIndex;
 use legal_structure_model::{DocumentStructure, NodeKind, ScalarText, StructureNode};
@@ -102,13 +102,13 @@ pub fn attach_propositions(structure: &mut DocumentStructure, units: &[Authority
 
 /// A detached superscript no note's call stands on, and a body superscript that reads as a known note's label but no
 /// call stands on.
-pub fn unmatched_reference_diagnostics(pages: &[Page], notes: &[StructureNode], index: &PdfTextIndex, decided: &Decided) -> Vec<Diagnostic> {
+pub fn unmatched_reference_diagnostics<'a>(lines: impl Iterator<Item = (&'a Line, LineZone)>, notes: &[StructureNode], index: &PdfTextIndex, decided: &Decided) -> Vec<Diagnostic> {
     let context_of = |note: &StructureNode| note.line_ids.first().map_or((0, false), |id| decided.document_context(id));
     let labels: HashSet<_> = notes.iter().map(|note| (context_of(note), note.label.as_deref().unwrap_or(""))).collect();
     let calls: HashSet<(usize, usize)> = notes.iter().flat_map(|note| &note.calls).map(|call| (call.start, call.end)).collect();
     let first_calls: HashSet<usize> = notes.iter().filter_map(|note| note.calls.first()).map(|call| call.start).collect();
     let mut diagnostics = Vec::new();
-    for line in pages.iter().flat_map(|page| page.lines.iter()) {
+    for (line, zone) in lines {
         // A detached reference's characters (as recognition places it) stand in the line's UTF-16 code units.
         let units = |characters: usize| (characters <= line.text.chars().count()).then(|| line.text.chars().take(characters).map(char::len_utf16).sum::<usize>());
         for detached in &line.detached_references {
@@ -118,7 +118,7 @@ pub fn unmatched_reference_diagnostics(pages: &[Page], notes: &[StructureNode], 
             }
         }
         let holds_first_call = index.line(&line.id).is_some_and(|placed| first_calls.iter().any(|&start| placed.range.start <= start && start < placed.range.end));
-        if line.exclude_from_body || !matches!(line.region_type.as_str(), "body" | "heading") || holds_first_call {
+        if !matches!(zone, LineZone::Body | LineZone::Heading) || holds_first_call {
             continue;
         }
         let context = decided.document_context(&line.id);

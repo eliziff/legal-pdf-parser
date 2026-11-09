@@ -1,232 +1,122 @@
-use crate::engine::{parse_pdf, ParseOptions};
-#[cfg(feature = "ppdoc")]
-use crate::PPDocOptions;
-use crate::{Error, Result};
+//! A PDF's parse as a caller asks for it: one request, checked as it is read, that the parse reads as it stands.
+
+use crate::engine::parse_pdf;
+use crate::RecognitionProgress;
 #[cfg(feature = "ocr")]
 use crate::OcrOptions;
+#[cfg(feature = "ppdoc")]
+use crate::PPDocOptions;
+use crate::Result;
 pub use legal_pdf_support::{PdfDocument, PdfSummary};
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
 use std::path::PathBuf;
 
 const MAX_SELECTED_PAGES: usize = 1_000;
 
-fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
-}
-
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PdfRequest {
-    profile: Option<legal_structure_model::DetectionProfile>,
-    cache_dir: Option<PathBuf>,
-    ocr_cache_dir: Option<PathBuf>,
-    #[serde(default, deserialize_with = "present")]
-    cache_key: Option<String>,
-    #[serde(default, deserialize_with = "present")]
-    expected_source_sha256: Option<String>,
-    #[serde(default, deserialize_with = "present")]
-    max_output_bytes: Option<usize>,
-    #[serde(default, deserialize_with = "present")]
-    pages: Option<Vec<usize>>,
-    supplied_ocr: Option<crate::supplied_ocr::SuppliedOcr>,
-    id: Option<String>,
-    url: Option<String>,
+    pub(crate) profile: Option<legal_structure_model::DetectionProfile>,
+    pub(crate) cache_dir: Option<PathBuf>,
+    /// Where page recognition (OCR) and its scanner rasters are cached: apart from the parse cache, keyed by the OCR
+    /// code and settings alone, so no parser change discards them. Defaults to `ocr` in the cache directory.
+    pub(crate) ocr_cache_dir: Option<PathBuf>,
+    /// The parse cached under this key, and no other: none where it is no longer cached.
+    #[serde(default, deserialize_with = "sha256")]
+    pub cache_key: Option<String>,
+    #[serde(default, deserialize_with = "sha256")]
+    pub expected_source_sha256: Option<String>,
+    pub(crate) max_output_bytes: Option<usize>,
+    /// Zero-based, sorted, the pages eligible for OCR (`pages`, from 1). Native extraction still inspects the whole PDF
+    /// so physical page numbering stays authoritative.
+    #[serde(default, rename = "pages", deserialize_with = "selected_pages")]
+    pub ocr_pages: Option<Vec<usize>>,
+    pub(crate) supplied_ocr: Option<crate::supplied_ocr::SuppliedOcr>,
+    pub id: Option<String>,
+    pub(crate) url: Option<String>,
     #[cfg(feature = "ocr")]
-    #[serde(default, deserialize_with = "present")]
-    ocr: Option<OcrRequest>,
+    #[serde(default, deserialize_with = "ocr")]
+    pub(crate) ocr: Option<OcrOptions>,
     #[cfg(not(feature = "ocr"))]
-    #[serde(default, deserialize_with = "present")]
-    ocr: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "ocr", deserialize_with = "unsupported")]
+    _ocr: Option<()>,
     #[cfg(feature = "ppdoc")]
-    #[serde(default, deserialize_with = "present")]
-    layout: Option<LayoutRequest>,
+    #[serde(default, rename = "layout", deserialize_with = "layout")]
+    pub(crate) ppdoc: Option<PPDocOptions>,
     #[cfg(not(feature = "ppdoc"))]
-    #[serde(default, deserialize_with = "present")]
-    layout: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "layout", deserialize_with = "unsupported")]
+    _layout: Option<()>,
 }
 
-#[cfg(feature = "ocr")]
-#[derive(Deserialize)]
-#[serde(tag = "provider", deny_unknown_fields)]
-enum OcrRequest {
-    #[cfg(feature = "ocr")]
-    #[serde(rename = "indra")]
-    Indra {
-        #[serde(default)]
-        settings: OcrOptions,
-    },
-    #[cfg(not(feature = "ocr"))]
-    #[serde(rename = "indra")]
-    Indra {
-        #[serde(rename = "settings", default = "ignored_any")]
-        _settings: serde::de::IgnoredAny,
-    },
+fn sha256<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<String>, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+        Ok(Some(value))
+    } else {
+        Err(D::Error::custom("a document request's hash must be lowercase SHA-256"))
+    }
 }
 
-#[cfg(feature = "ppdoc")]
-#[derive(Deserialize)]
-#[serde(tag = "provider", deny_unknown_fields)]
-enum LayoutRequest {
-    #[serde(rename = "ppdoc")]
-    Ppdoc {
-        #[serde(default)]
-        settings: PPDocOptions,
-    },
-}
-
-#[cfg(all(feature = "ocr", not(feature = "ocr")))]
-fn ignored_any() -> serde::de::IgnoredAny {
-    serde::de::IgnoredAny
-}
-
-fn selected_pages(pages: Option<&[usize]>) -> Result<Option<Vec<usize>>> {
-    let Some(pages) = pages else {
-        return Ok(None);
-    };
+fn selected_pages<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<Vec<usize>>, D::Error> {
+    let pages = Vec::<usize>::deserialize(deserializer)?;
     if pages.is_empty() || pages.len() > MAX_SELECTED_PAGES {
-        return Err(Error::Message(format!(
-            "document request pages requires 1 to {MAX_SELECTED_PAGES} pages"
-        )));
+        return Err(D::Error::custom(format!("document request pages requires 1 to {MAX_SELECTED_PAGES} pages")));
     }
     if pages.contains(&0) {
-        return Err(Error::Message(
-            "document request pages must be positive integers".to_owned(),
-        ));
+        return Err(D::Error::custom("document request pages must be positive integers"));
     }
-    let mut selected = pages.iter().map(|page| page - 1).collect::<Vec<_>>();
+    let mut selected = pages.into_iter().map(|page| page - 1).collect::<Vec<_>>();
     selected.sort_unstable();
     selected.dedup();
     Ok(Some(selected))
 }
 
-fn sha256_field(value: &Option<String>, key: &str) -> Result<Option<String>> {
-    value
-        .as_ref()
-        .map(|value| {
-            if value.len() == 64
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            {
-                Ok(value.clone())
-            } else {
-                Err(Error::Message(format!(
-                    "document request {key} must be lowercase SHA-256"
-                )))
-            }
-        })
-        .transpose()
+#[cfg(feature = "ocr")]
+fn ocr<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<OcrOptions>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(tag = "provider", deny_unknown_fields)]
+    enum Provider {
+        #[serde(rename = "indra")]
+        Indra {
+            #[serde(default)]
+            settings: OcrOptions,
+        },
+    }
+    let Provider::Indra { settings } = Provider::deserialize(deserializer)?;
+    Ok(Some(settings))
 }
 
-fn parse_options(request: &PdfRequest) -> Result<ParseOptions> {
-    let mut options = ParseOptions {
-        profile: request.profile,
-        cache_dir: request.cache_dir.clone(),
-        ocr_cache_dir: request.ocr_cache_dir.clone(),
-        supplied_ocr: request.supplied_ocr.clone(),
-        ocr_pages: selected_pages(request.pages.as_deref())?,
-        cache_key: sha256_field(&request.cache_key, "cache_key")?,
-        max_output_bytes: request.max_output_bytes,
-        use_cache: true,
-        expected_source_sha256: sha256_field(
-            &request.expected_source_sha256,
-            "expected_source_sha256",
-        )?,
-        ..ParseOptions::default()
-    };
-
-    if request.supplied_ocr.is_some() && (request.ocr.is_some() || request.cache_key.is_some()) {
-        return Err(Error::Message(
-            "Supplied OCR cannot be combined with a provider or cache key".into(),
-        ));
+#[cfg(feature = "ppdoc")]
+fn layout<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<PPDocOptions>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(tag = "provider", deny_unknown_fields)]
+    enum Provider {
+        #[serde(rename = "ppdoc")]
+        Ppdoc {
+            #[serde(default)]
+            settings: PPDocOptions,
+        },
     }
-    #[cfg(feature = "ocr")]
-    if let Some(request) = &request.ocr {
-        options.ocr = match request {
-            #[cfg(feature = "ocr")]
-            OcrRequest::Indra { settings } => Some(settings.clone()),
-            #[cfg(not(feature = "ocr"))]
-            OcrRequest::Indra { .. } => {
-                return Err(Error::Message(
-                    "indra requires a legalpdf binary built with the indra feature"
-                        .to_owned(),
-                ));
-            }
-        };
-    }
-    #[cfg(not(feature = "ocr"))]
-    if request.ocr.is_some() {
-        return Err(Error::Message(
-            "this legalpdf binary was built without the `ocr` feature".to_owned(),
-        ));
-    }
-
-    #[cfg(feature = "ppdoc")]
-    if let Some(LayoutRequest::Ppdoc { settings }) = &request.layout {
-        options.ppdoc = Some(settings.clone());
-    }
-    #[cfg(not(feature = "ppdoc"))]
-    if request.layout.is_some() {
-        return Err(Error::Message(
-            "layout requires a legalpdf binary built with a layout feature".to_owned(),
-        ));
-    }
-    Ok(options)
+    let Provider::Ppdoc { settings } = Provider::deserialize(deserializer)?;
+    Ok(Some(settings))
 }
 
-fn validate_selected_pages(selected: Option<&[usize]>, count: usize) -> Result<()> {
-    let Some(selected) = selected else {
-        return Ok(());
-    };
-    if selected.iter().any(|page| *page >= count) {
-        return Err(Error::Message(
-            "document request pages contains a page beyond the source PDF".to_owned(),
-        ));
-    }
-    Ok(())
+#[cfg(any(not(feature = "ocr"), not(feature = "ppdoc")))]
+fn unsupported<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<()>, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(D::Error::custom("this legalpdf binary was built without the provider the request names"))
 }
 
-pub fn derive_pdf_document(bytes: &[u8], request: &PdfRequest) -> Result<PdfDocument> {
-    let options = parse_options(request)?;
-    let document = parse_pdf(Some(bytes), &options, None)?
-        .ok_or_else(|| Error::Message("PDF cache miss after parsing source bytes".to_owned()))?;
-    finish_pdf_document(document, request, &options)
+/// The PDF's document as `request` asks for it: read from its parse cache, or, given its bytes, parsed. None where
+/// there are no bytes and nothing is cached, or where the request names a cache key no longer cached.
+pub fn read_pdf(bytes: Option<&[u8]>, request: &PdfRequest) -> Result<Option<PdfDocument>> {
+    parse_pdf(bytes, request, None, false)
 }
 
 /// Prepares the PDF and caches its reading, reporting recognized pages of the pages to recognize as they finish.
-pub fn prepare_pdf_document(
-    bytes: &[u8],
-    request: &PdfRequest,
-    progress: crate::engine::RecognitionProgress<'_>,
-) -> Result<PdfSummary> {
-    let mut options = parse_options(request)?;
-    options.require_cache_write = true;
-    let document = parse_pdf(Some(bytes), &options, progress)?
-        .ok_or_else(|| Error::Message("PDF cache miss after parsing source bytes".to_owned()))?;
-    validate_selected_pages(options.ocr_pages.as_deref(), document.page_count())?;
+pub fn prepare_pdf_document(bytes: &[u8], request: &PdfRequest, progress: RecognitionProgress<'_>) -> Result<PdfSummary> {
+    let document = parse_pdf(Some(bytes), request, progress, true)?
+        .ok_or_else(|| crate::Error::Message("PDF cache miss after parsing source bytes".to_owned()))?;
     Ok(document.summary().clone())
-}
-
-pub fn restore_pdf_document(request: &PdfRequest) -> Result<Option<PdfDocument>> {
-    let options = parse_options(request)?;
-    parse_pdf(None, &options, None)?
-        .map(|document| finish_pdf_document(document, request, &options))
-        .transpose()
-}
-
-fn finish_pdf_document(
-    mut document: PdfDocument,
-    request: &PdfRequest,
-    options: &ParseOptions,
-) -> Result<PdfDocument> {
-    validate_selected_pages(options.ocr_pages.as_deref(), document.page_count())?;
-    let structure = document.structure_mut();
-    if let Some(id) = &request.id {
-        structure.document_id = id.to_owned();
-    }
-    structure.url = request.url.clone();
-    Ok(document)
 }

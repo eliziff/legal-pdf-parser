@@ -3,7 +3,7 @@
 
 use legal_pdf_structure_model::{PageView, Slot};
 use legal_structure_model::text::{is_note_symbol, MAX_SYMBOL_LABEL_LEN};
-use legal_pdf_core::{line_font_size, median, regex, union_bbox, Columns, Diagnostic, Line, Page, PageMeasure, Region};
+use legal_pdf_core::{line_font_size, median, regex, Columns, Diagnostic, Line, Page, PageMeasure};
 use std::{
     cell::OnceCell,
     collections::{HashMap, HashSet},
@@ -19,12 +19,10 @@ pub mod order;
 pub use order::*;
 pub mod note_lines;
 pub use note_lines::*;
-pub mod regions;
-pub use regions::*;
 
 
 /// What a page's columns are: one, two of like width, a body beside a narrower margin's, or more than two.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ColumnKind {
     Single,
     Two,

@@ -2,6 +2,7 @@
 //! a line of a region. The one vocabulary the decision's writer and the transition parser read.
 
 use crate::{Edge, Role};
+use legal_pdf_core::model::{LineZone, NoteMode};
 
 /// The regions a line may be in, the gold's (`labels::REGIONS`).
 pub const REGIONS: [&str; 17] = [
@@ -46,18 +47,17 @@ pub fn region_of(role: Role, kind: Option<legal_structure_model::UnitRole>) -> u
     }
 }
 
-/// The name a page gives a line of `region` (`Line::region_type`): a page's head or foot by its edge, a note, a
-/// heading, a title, a marginal note or a line label as itself, the rest the body.
-pub fn page_region(region: u8, edge: Option<Edge>) -> &'static str {
-    match region {
-        LINE_LABEL => "line_label",
-        PAGE_LABEL | FURNITURE if edge == Some(Edge::Bottom) => "footer",
-        PAGE_LABEL | FURNITURE => "header",
-        NOTE => "footnote",
-        HEADING => "heading",
-        TITLE => "title",
-        MARGINAL_NOTE => "marginal_note",
-        _ => "body",
+/// Where a line of `role` stands on its page: a page's head or foot by its edge, a note in a band of `note`'s kind, a
+/// heading or title, a marginal note or a line label as itself, the rest the body.
+pub fn zone_of(role: Role, edge: Option<Edge>, note: NoteMode) -> LineZone {
+    match region_of(role, None) {
+        LINE_LABEL => LineZone::LineLabel,
+        PAGE_LABEL | FURNITURE if edge == Some(Edge::Bottom) => LineZone::Footer,
+        PAGE_LABEL | FURNITURE => LineZone::Header,
+        NOTE => LineZone::Note(Some(note)),
+        HEADING | TITLE => LineZone::Heading,
+        MARGINAL_NOTE => LineZone::MarginalNote,
+        _ => LineZone::Body,
     }
 }
 

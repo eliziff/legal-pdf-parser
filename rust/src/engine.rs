@@ -1,9 +1,9 @@
+use crate::{PdfRequest, RecognitionProgress};
 use legal_pdf_core::model::{PARSER_VERSION, SCHEMA_VERSION};
 use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, FailureKind, Result};
 use legal_pdf_extraction_processor::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
-use legal_pdf_diagnostics::validate_pdf_components;
 use legal_pdf_structure::{StructureIdentity, StructureOutput};
 use legal_pdf_support::{profile, PdfDocument, PdfStatus};
 #[cfg(feature = "ppdoc")]
@@ -23,9 +23,6 @@ use std::time::SystemTime;
 
 const EXTRACTION_CACHE_SCHEMA: &str = "legalpdf.extraction-cache.v1";
 const PARSE_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-
-/// Recognized pages so far, and pages to recognize, as recognition proceeds.
-pub type RecognitionProgress<'a> = Option<&'a (dyn Fn(usize, usize) + Sync)>;
 
 #[cfg(feature = "ocr")]
 struct DeferredOcrProvider<'a> {
@@ -121,26 +118,6 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
                 .as_ref()
                 .and_then(|path| read_gzip_json::<CachedOcrPage>(path).ok())
                 .filter(|cached| cached.key == key && cached.page.page_index == request.page_index);
-            // LEGALPDF_RECOGNITION_ADOPT: an OCR code change that leaves recognition as it was
-            // (its raster pass, its plumbing) adopts the page's newest earlier reading.
-            let cached = cached.or_else(|| {
-                std::env::var_os("LEGALPDF_RECOGNITION_ADOPT")?;
-                let root = self.cache_root.as_ref()?;
-                let mut earlier = fs::read_dir(root)
-                    .ok()?
-                    .flatten()
-                    .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
-                    .collect::<Vec<_>>();
-                earlier.sort_by(|a, b| b.0.cmp(&a.0));
-                let page = earlier.into_iter().find_map(|(_, file)| {
-                    read_gzip_json::<CachedOcrPage>(&file).ok().filter(|cached| cached.page.page_index == request.page_index)
-                })?;
-                let adopted = CachedOcrPage { key: key.clone(), page: page.page };
-                if let Some(path) = &path {
-                    let _ = write_gzip_json(path, &adopted);
-                }
-                Some(adopted)
-            });
             if let Some(cached) = cached {
                 if let Some(path) = &path {
                     touch_cache(path);
@@ -150,10 +127,6 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
                 missing.push(request.clone());
                 paths.insert(request.page_index, (key, path));
             }
-        }
-        // LEGALPDF_RECOGNITION_TRACE: how many of the pages asked for the recognition cache held.
-        if std::env::var_os("LEGALPDF_RECOGNITION_TRACE").is_some() {
-            eprintln!("recognition\t{} cached\t{} to read", results.len(), missing.len());
         }
         let progress = self.progress;
         let report = |done: usize| {
@@ -260,50 +233,6 @@ struct CachedExtraction<T = ExtractedPdf> {
     extraction: T,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ParseOptions {
-    pub profile: Option<DetectionProfile>,
-    pub cache_dir: Option<PathBuf>,
-    /// Where page recognition (OCR) and its scanner rasters are cached: apart from the parse
-    /// cache, keyed by the OCR code and settings alone, so no parser change discards them.
-    /// Defaults to `ocr` in the cache directory.
-    pub ocr_cache_dir: Option<PathBuf>,
-    pub cache_key: Option<String>,
-    pub require_cache_write: bool,
-    pub use_cache: bool,
-    pub expected_source_sha256: Option<String>,
-    pub max_output_bytes: Option<usize>,
-    pub supplied_ocr: Option<crate::supplied_ocr::SuppliedOcr>,
-    #[cfg(feature = "ocr")]
-    pub ocr: Option<OcrOptions>,
-    /// Zero-based pages eligible for OCR. Native extraction still inspects the
-    /// complete PDF so physical page numbering stays authoritative.
-    pub ocr_pages: Option<Vec<usize>>,
-    #[cfg(feature = "ppdoc")]
-    pub ppdoc: Option<PPDocOptions>,
-}
-
-impl Default for ParseOptions {
-    fn default() -> Self {
-        Self {
-            profile: None,
-            cache_dir: None,
-            ocr_cache_dir: None,
-            cache_key: None,
-            require_cache_write: false,
-            use_cache: true,
-            expected_source_sha256: None,
-            max_output_bytes: None,
-            supplied_ocr: None,
-            #[cfg(feature = "ocr")]
-            ocr: None,
-            ocr_pages: None,
-            #[cfg(feature = "ppdoc")]
-            ppdoc: None,
-        }
-    }
-}
-
 fn default_cache_dir() -> PathBuf {
     if let Some(root) = std::env::var_os("OPEN_LEGAL_DATA_HOME").filter(|value| !value.is_empty()) {
         return PathBuf::from(root).join("apps/legalpdf/cache");
@@ -321,8 +250,8 @@ fn default_cache_dir() -> PathBuf {
     base.join("OpenLegalData/legalpdf")
 }
 
-fn validate_output_size(document: &PdfDocument, options: &ParseOptions) -> Result<()> {
-    match options.max_output_bytes {
+fn validate_output_size(document: &PdfDocument, request: &PdfRequest) -> Result<()> {
+    match request.max_output_bytes {
         Some(limit) if document.structure().query_text().len() > limit => Err(Error::Message("PDF document text exceeds the read limit".to_owned())),
         _ => Ok(()),
     }
@@ -369,16 +298,8 @@ fn cache_key(
 fn derive_extracted(
     extracted: &mut ExtractedPdf,
     source_hash: &str,
-    cache_root: Option<&Path>,
     semantic_profile: Option<DetectionProfile>,
 ) -> Result<StructureOutput> {
-    // Reader state depends on source pages, navigation hints and the engine's layout services.
-    let reader_cache = cache_root.and_then(|root| {
-        let analysis = legal_pdf_core::layout_analysis().source_sha256();
-        let ablated = std::env::var("LEGALPDF_ABLATE").ok();
-        let key = serialization_sha256(&(env!("LEGAL_PDF_READER_SHA256"), analysis, semantic_profile, &extracted.pages, &extracted.separators, &extracted.outline, ablated)).ok()?;
-        Some(parse_cache_root(root).join("reader").join(format!("{key}.json.gz")))
-    });
     let mut derived = legal_pdf_structure::derive(
         &mut extracted.pages,
         &extracted.separators,
@@ -388,7 +309,6 @@ fn derive_extracted(
             profile: semantic_profile,
             page_labels: extracted.metadata.embedded_page_labels.clone(),
         },
-        reader_cache.as_deref(),
         std::env::var_os("LEGALPDF_DECISION_TRACE").map(PathBuf::from).as_deref(),
     )?;
     extracted.diagnostics.append(&mut derived.diagnostics);
@@ -435,16 +355,12 @@ fn derive_document(
     mut extracted: ExtractedPdf,
     source_hash: &str,
     key: &str,
-    cache_root: Option<&Path>,
     semantic_profile: Option<DetectionProfile>,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
     let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
     let derived = profile::measure("derive_document", || {
-        derive_extracted(&mut extracted, source_hash, cache_root, semantic_profile)
-    })?;
-    profile::measure("build.validate_document", || {
-        validate_pdf_components(&extracted.pages, &derived.structure_graph)
+        derive_extracted(&mut extracted, source_hash, semantic_profile)
     })?;
     let document_status = if extracted.diagnostics.is_empty() { PdfStatus::Ready } else { PdfStatus::Degraded };
     if let Some(pages) = pages {
@@ -466,7 +382,7 @@ fn derive_document(
 pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPdf> {
     let source_hash = format!("{:x}", Sha256::digest(pdf));
     let recognizer = std::env::var_os("LEGALPDF_INDRA_MODEL_PACK").is_some() && std::env::var_os("LEGALPDF_ONNXRUNTIME").is_some();
-    let options = ParseOptions {
+    let options = PdfRequest {
         cache_dir: Some(cache_dir.to_owned()),
         ocr: recognizer.then(OcrOptions::default),
         #[cfg(feature = "ppdoc")]
@@ -478,7 +394,7 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
             device: std::env::var("LEGALPDF_PPDOC_DEVICE").ok(),
             ..PPDocOptions::default()
         }),
-        ..ParseOptions::default()
+        ..PdfRequest::default()
     };
     let ocr = options.ocr.as_ref().map(OcrProvider::prepare).transpose()?;
     let providers = Providers {
@@ -487,7 +403,7 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
         #[cfg(feature = "ppdoc")]
         ppdoc: options.ppdoc.as_ref().map(PPDocLayout::new).transpose()?,
     };
-    recognized_extraction(pdf, &source_hash, &options, Some(cache_dir), providers, None)
+    recognized_extraction(pdf, &source_hash, &options, Some(cache_dir), providers, None, false)
 }
 
 /// What the structure gold's inputs are keyed by: the extraction schema and the models the
@@ -507,15 +423,14 @@ pub fn gold_structure_document(
     source_hash: &str,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
-    derive_document(extracted, source_hash, "structure-gold", None, None, pages)
+    derive_document(extracted, source_hash, "structure-gold", None, pages)
 }
 
 /// A cached extraction through the structure stage, as a parse reads it, checked: the pages as the stage left them and the
 /// structure, its revision taken, with the extraction's diagnostics.
 fn corpus_structure(source_hash: &str, mut extracted: ExtractedPdf) -> Result<(ExtractedPdf, DocumentStructure)> {
-    let mut derived = derive_extracted(&mut extracted, source_hash, None, None)?;
+    let mut derived = derive_extracted(&mut extracted, source_hash, None)?;
     derived.structure_graph.refresh_revision()?;
-    profile::measure("build.validate_document", || validate_pdf_components(&extracted.pages, &derived.structure_graph))?;
     Ok((extracted, derived.structure_graph))
 }
 
@@ -537,7 +452,7 @@ fn touch_cache(path: &Path) {
 }
 
 /// The OCR cache's root for a parse cache root: the request's own, else `ocr` beside `parse-v1`.
-fn ocr_cache_root(root: &Path, options: &ParseOptions) -> PathBuf {
+fn ocr_cache_root(root: &Path, options: &PdfRequest) -> PathBuf {
     options.ocr_cache_dir.clone().unwrap_or_else(|| root.join("ocr"))
 }
 
@@ -606,10 +521,41 @@ fn cached_document(root: &Path, key: &str, source_hash: &str) -> Option<PdfDocum
     Some(cached)
 }
 
+/// The PDF's document as `options` asks for it, named by its id and URL there: read from the parse cache, or parsed from
+/// `bytes` and cached (where `require_cache_write`, failing where it cannot be). None where no bytes are given and none
+/// is cached, or where the cache key asked for is no longer cached.
 pub(crate) fn parse_pdf(
     bytes: Option<&[u8]>,
-    options: &ParseOptions,
+    options: &PdfRequest,
+    progress: RecognitionProgress<'_>,
+    require_cache_write: bool,
+) -> Result<Option<PdfDocument>> {
+    #[cfg(feature = "ocr")]
+    let provider_named = options.ocr.is_some();
+    #[cfg(not(feature = "ocr"))]
+    let provider_named = false;
+    if options.supplied_ocr.is_some() && (provider_named || options.cache_key.is_some()) {
+        return Err(Error::Message("Supplied OCR cannot be combined with a provider or cache key".into()));
+    }
+    let Some(mut document) = parsed_pdf(bytes, options, progress, require_cache_write)? else {
+        return Ok(None);
+    };
+    if options.ocr_pages.as_ref().is_some_and(|pages| pages.iter().any(|page| *page >= document.page_count())) {
+        return Err(Error::Message("document request pages contains a page beyond the source PDF".to_owned()));
+    }
+    let structure = document.structure_mut();
+    if let Some(id) = &options.id {
+        structure.document_id = id.to_owned();
+    }
+    structure.url = options.url.clone();
+    Ok(Some(document))
+}
+
+fn parsed_pdf(
+    bytes: Option<&[u8]>,
+    options: &PdfRequest,
     #[cfg_attr(not(feature = "ocr"), allow(unused_variables))] progress: RecognitionProgress<'_>,
+    require_cache_write: bool,
 ) -> Result<Option<PdfDocument>> {
     let source_hash = if let Some(bytes) = bytes {
         if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 || !bytes[..bytes.len().min(1024)].windows(5).any(|window| window == b"%PDF-") {
@@ -623,9 +569,9 @@ pub(crate) fn parse_pdf(
     } else {
         options.expected_source_sha256.clone().ok_or_else(|| Error::Message("PDF cache lookup requires expected_source_sha256".to_owned()))?
     };
-    let cache_root = options.use_cache.then(|| options.cache_dir.clone().unwrap_or_else(default_cache_dir));
+    let cache_root = options.cache_dir.clone().unwrap_or_else(default_cache_dir);
     if let Some(key) = options.cache_key.as_deref() {
-        let cached = cache_root.as_deref().and_then(|root| cached_document(root, key, &source_hash));
+        let cached = cached_document(&cache_root, key, &source_hash);
         if let Some(document) = &cached {
             validate_output_size(document, options)?;
         }
@@ -652,7 +598,7 @@ pub(crate) fn parse_pdf(
     };
     let ocr_pair = ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
     let key = cache_key(&source_hash, identity, ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile)?;
-    if let Some(cached) = cache_root.as_deref().and_then(|root| cached_document(root, &key, &source_hash)) {
+    if let Some(cached) = cached_document(&cache_root, &key, &source_hash) {
         validate_output_size(&cached, options)?;
         return Ok(Some(cached));
     }
@@ -666,16 +612,14 @@ pub(crate) fn parse_pdf(
         #[cfg(feature = "ppdoc")]
         ppdoc: ppdoc_prepared.take(),
     };
-    let extracted = recognized_extraction(bytes, &source_hash, options, cache_root.as_deref(), providers, progress)?;
-    let parsed = derive_document(extracted, &source_hash, &key, cache_root.as_deref(), options.profile, None)?;
+    let extracted = recognized_extraction(bytes, &source_hash, options, Some(&cache_root), providers, progress, require_cache_write)?;
+    let parsed = derive_document(extracted, &source_hash, &key, options.profile, None)?;
     validate_output_size(&parsed, options)?;
-    if let Some(root) = &cache_root {
-        let cache_path = parse_cache_root(root).join("documents").join(format!("{key}.json.gz"));
-        match profile::measure("document_cache_write", || write_gzip_json(&cache_path, &parsed)) {
-            Ok(()) => maybe_prune_document_cache(root, &ocr_cache_root(root, options)),
-            Err(error) if options.require_cache_write => return Err(error),
-            Err(_) => {}
-        }
+    let cache_path = parse_cache_root(&cache_root).join("documents").join(format!("{key}.json.gz"));
+    match profile::measure("document_cache_write", || write_gzip_json(&cache_path, &parsed)) {
+        Ok(()) => maybe_prune_document_cache(&cache_root, &ocr_cache_root(&cache_root, options)),
+        Err(error) if require_cache_write => return Err(error),
+        Err(_) => {}
     }
     Ok(Some(parsed))
 }
@@ -697,10 +641,11 @@ struct Providers {
 fn recognized_extraction(
     bytes: &[u8],
     source_hash: &str,
-    options: &ParseOptions,
+    options: &PdfRequest,
     cache_root: Option<&Path>,
     mut providers: Providers,
     #[cfg_attr(not(feature = "ocr"), allow(unused_variables))] progress: RecognitionProgress<'_>,
+    require_cache_write: bool,
 ) -> Result<ExtractedPdf> {
     #[cfg(feature = "ocr")]
     let mut ocr_provider = {
@@ -746,11 +691,11 @@ fn recognized_extraction(
         }
         cached.extraction
     } else {
-        let extracted = profile::measure("extract_pdf", || extract_pdf(bytes, None, None))?;
+        let extracted = profile::measure("extract_pdf", || extract_pdf(bytes))?;
         if let Some(path) = &extraction_path {
             let entry = CachedExtraction { schema_version: EXTRACTION_CACHE_SCHEMA.to_owned(), source_sha256: source_hash.to_owned(), extraction: &extracted };
             let result = profile::measure("extraction_cache_write", || write_gzip_json(path, &entry));
-            if options.require_cache_write {
+            if require_cache_write {
                 result?;
             }
         }

@@ -8,7 +8,7 @@ use legal_pdf_core::model::Word;
 
 /// The page's transcript line numbers, as the decision wrote them.
 pub fn line_labels<'a>(page: &'a Page) -> impl Iterator<Item = &'a Line> + 'a {
-    page.lines.iter().filter(|line| line.region_type == "line_label")
+    page.lines.iter().filter(|line| line.exclude_from_body)
 }
 
 /// A line's transcript line number, printed apart or read into the line it numbers.

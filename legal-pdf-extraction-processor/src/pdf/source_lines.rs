@@ -27,7 +27,7 @@ pub(crate) fn make_line(text_line: TextLine, page_index: usize, local_index: usi
         spans,
         words,
         detached_references: vec![],
-        region_type: "text".to_owned(),
+        source_tag: "text".to_owned(),
         source: "native".to_owned(),
         ..Default::default()
     })

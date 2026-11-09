@@ -11,19 +11,20 @@
 //!   the judgment reader counts or holds (`Fences::paragraphs`) goes by its rules' worth alone, the residual
 //!   does not weigh it, and `read_judgment_paragraphs` writes the numbers as t0 does;
 //! - what follows the decision (`Decision::finish`): the title, the levels;
-//! - the decided lines written (`write_lines`), their regions built, their notes paired (`note_pairing`), the pairer's
+//! - the decided lines written (`write_lines`), their notes paired (the engine's pairer, over `note_lines`), the pairer's
 //!   pairs fixed input to the moves, as paragraph numbers are;
 //! - the moves (`moves_of`): each of the document's reading regions a unit, each note a unit, each line set apart a
 //!   unit of its own.
 
-use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
+use legal_pdf_core::model::{Line, LineZone, Page, PdfOutlineEntry};
+use legal_pdf_layout::opens_turn;
 use legal_pdf_decide::{Decision, Geometry, Heard, Notes};
 use legal_pdf_fences::Fences;
 use legal_pdf_graph::graph;
 use legal_pdf_machine::lines::LineTable;
 use legal_pdf_machine::machine::{LineView, Move, State, CANDIDATE};
 use legal_pdf_structure_model::regions::{region_of, CONTENTS, HEADING, MARGINAL_NOTE, NOTE, TEXT, TITLE};
-use legal_pdf_structure_model::{Decided, DocumentContext, Evidence, Role, Rule, Runs, Slot, Slots};
+use legal_pdf_structure_model::{Evidence, Role, Rule, Runs, Slot, Slots};
 use std::collections::{HashMap, HashSet};
 use legal_structure_model::{StructureNode, UnitRole};
 
@@ -250,32 +251,49 @@ pub fn decide(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fence
     (notes, decision)
 }
 
-/// The pages' written regions as the document reads them: each region's lines in one reading context, a body's going
-/// on over a page in the region it continues. Each with its first page and its kind.
-pub fn reading_regions<'a>(pages: &'a [Page], decided: &Decided) -> Vec<(&'a Page, &'a str, Vec<&'a Line>)> {
-    let context = |id: &str| decided.reading_context(id);
-    let mut regions: Vec<(&Page, &str, Vec<&Line>)> = Vec::new();
-    let mut tails = HashMap::<DocumentContext, usize>::new();
-    for page in pages {
-        let line_by_id: HashMap<&str, &Line> = page.lines.iter().map(|line| (line.id.as_str(), line)).collect();
+/// The document's reading regions. On each page, a region is a run of its lines in reading order whose zone and block
+/// go on (on a transcript's page, the body's by turns, a turn running from the line that opens it to the next that opens
+/// one; a line label parting none). Each region of the body, a heading or title or a marginal note is read in its
+/// reading contexts, a body's going on over a page in the region it continues.
+pub fn reading_regions(pages: &[Page], slots: &Slots, fences: &Fences, zones: &[LineZone], blocks: &[usize]) -> Vec<Vec<Slot>> {
+    let context = |slot: Slot| (fences.ctx[slot.index()], fences.at(slot.index()).translation);
+    let mut regions: Vec<(bool, Vec<Slot>)> = Vec::new();
+    let mut tails = HashMap::<_, usize>::new();
+    for page_slot in 0..pages.len() {
+        let range = slots.on(page_slot);
+        let order = &fences.order[range.start as usize..range.end as usize];
+        let transcript = order.iter().any(|slot| zones[slot.index()] == LineZone::LineLabel);
+        let mut groups: Vec<Vec<Slot>> = Vec::new();
+        for &slot in order.iter().filter(|slot| zones[slot.index()] != LineZone::LineLabel) {
+            let zone = zones[slot.index()];
+            match groups.last_mut() {
+                Some(group) if {
+                    let prior = group[group.len() - 1].index();
+                    zones[prior] == zone
+                        && if transcript && zone == LineZone::Body { !opens_turn(slots.line(pages, slot)) } else { blocks[prior] == blocks[slot.index()] }
+                } => group.push(slot),
+                _ => groups.push(vec![slot]),
+            }
+        }
         let mut seen = HashSet::new();
-        for region in page.regions.iter().filter(|region| matches!(region.kind.as_str(), "body" | "heading" | "caption" | "marginal_note" | "title")) {
-            let lines: Vec<&Line> = region.line_ids.iter().filter_map(|id| line_by_id.get(id.as_str()).copied()).filter(|line| !line.exclude_from_body).collect();
-            for lines in lines.chunk_by(|left, right| context(&left.id) == context(&right.id)) {
-                let key = context(&lines[0].id);
+        for group in groups.iter().filter(|group| matches!(zones[group[0].index()], LineZone::Body | LineZone::Heading | LineZone::MarginalNote)) {
+            let body = zones[group[0].index()] == LineZone::Body;
+            for lines in group.chunk_by(|&left, &right| context(left) == context(right)) {
+                let key = context(lines[0]);
                 let first = seen.insert(key);
                 // The other column's intervening regions do not close this context's paragraph.
-                if let Some(&slot) = tails.get(&key) {
-                    let (_, kind, previous) = &mut regions[slot];
-                    if first && region.kind == "body" && *kind == "body" && legal_pdf_text::paragraphs::continues_onto(previous, lines) {
-                        previous.extend_from_slice(lines);
+                if let Some(&at) = tails.get(&key) {
+                    let read = |lines: &[Slot]| lines.iter().map(|&slot| slots.line(pages, slot)).collect::<Vec<&Line>>();
+                    let (previous_body, previous) = &regions[at];
+                    if first && body && *previous_body && legal_pdf_text::paragraphs::continues_onto(&read(previous), &read(lines)) {
+                        regions[at].1.extend_from_slice(lines);
                         continue;
                     }
                 }
                 tails.insert(key, regions.len());
-                regions.push((page, region.kind.as_str(), lines.to_vec()));
+                regions.push((body, lines.to_vec()));
             }
         }
     }
-    regions
+    regions.into_iter().map(|(_, lines)| lines).collect()
 }

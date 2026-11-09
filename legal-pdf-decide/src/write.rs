@@ -1,8 +1,7 @@
-//! The decision written to the pages, once: each line's region, note mode, whether it is held out of
-//! the body (a transcript's line number), whether its number counts a numbered paragraph (no note's
-//! label then), whether its opening number is no note's label (a heading's, or one the note band
-//! refused), its place in its page's reading order and its block; each page's printed label and the
-//! line printing it.
+//! The decision as the readers after it take it: written to the pages once (each line's place in
+//! its page's reading order, whether it is held out of the body as a transcript's line number, each
+//! page's printed label and the line printing it), and read by slot (each line's zone and block, and
+//! the lines as the note pairer reads them).
 //!
 //! A block is one printed paragraph or unit: it starts where a unit opens (its marker and the line
 //! beside it one start), where a heading, title or marginal note starts (its wrapped lines going on
@@ -18,6 +17,7 @@
 use super::*;
 use legal_pdf_text::paragraphs::{measure_of, paragraphs_of, Measure};
 use legal_structure_model::UnitRole;
+use legal_pdf_core::model::{LineZone, NoteLine, NoteMode, NotePage};
 
 /// The kinds of line a block holds only one of.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,18 +46,32 @@ fn class(role: Role) -> Class {
 }
 
 /// `write`, each page's lines left in their places.
-pub fn write_lines(
-    pages: &mut [Page],
-    slots: &Slots,
-    evidence: &Evidence,
-    fences: &Fences,
-    notes: &Notes,
-    decision: &Decision,
-) {
-    let count = slots.len();
-    // A page's note lines that go on with the last note of the page before: its first, and those
-    // after it up to the next label.
-    let mut continuation = vec![false; count];
+pub fn write_lines(pages: &mut [Page], slots: &Slots, fences: &Fences, decision: &Decision) {
+    for (page_slot, page) in pages.iter_mut().enumerate() {
+        let range = slots.on(page_slot);
+        for (place, &slot) in fences.order[range.start as usize..range.end as usize].iter().enumerate() {
+            page.lines[(slot.0 - range.start) as usize].reading_order = place + 1;
+        }
+        for (line, slot) in page.lines.iter_mut().zip(range.clone().map(Slot)) {
+            line.exclude_from_body = decision.role[slot.index()] == Role::LineLabel;
+        }
+        match &fences.folios[page_slot] {
+            Some((slot, label)) => {
+                page.printed_label = Some(label.clone());
+                page.printed_label_line_id = Some(page.lines[(slot.0 - range.start) as usize].id.clone());
+            }
+            None => {
+                page.printed_label = None;
+                page.printed_label_line_id = None;
+            }
+        }
+    }
+}
+
+/// Each line's zone, by slot: its decided role's, a note's in the band of its kind (a page's note lines that go on with
+/// the last note of the page before, its first and those after it up to the next label, a continuation's).
+pub fn zones(slots: &Slots, evidence: &Evidence, fences: &Fences, notes: &Notes, decision: &Decision) -> Vec<LineZone> {
+    let mut continuation = vec![false; slots.len()];
     for segment in notes.segments.iter().filter(|segment| segment.continued) {
         let Some((first, rest)) = segment.lines.split_first() else { continue };
         continuation[first.index()] = true;
@@ -65,55 +79,64 @@ pub fn write_lines(
             continuation[slot.index()] = true;
         }
     }
-    let blocks = blocks(pages, slots, evidence, fences, decision);
-    for (page_slot, page) in pages.iter_mut().enumerate() {
-        let range = slots.on(page_slot);
-        for (place, &slot) in fences.order[range.start as usize..range.end as usize].iter().enumerate() {
-            page.lines[(slot.0 - range.start) as usize].reading_order = place + 1;
-        }
-        for (line, slot) in page.lines.iter_mut().zip(range.clone().map(Slot)) {
-            let at = slot.index();
-            let role = decision.role[at];
-            line.region_type = legal_pdf_structure_model::regions::page_region(legal_pdf_structure_model::regions::region_of(role, None), fences.edge[at]).to_owned();
-            line.note_region_mode = match (role, notes.note[at]) {
-                (Role::Note, _) if continuation[at] => "footnote_continuation",
-                (Role::Note, Some(NoteKind::Endnote)) => "endnote",
-                (Role::Note, _) => "footnote",
-                _ => "",
-            }
-            .to_owned();
-            line.exclude_from_body = role == Role::LineLabel;
-            line.paragraph_label_candidate = matches!(decision.unit[at], Some((_, UnitRole::Paragraph))) || notes.paragraph_label[at];
-            line.suppress_footnote_label = notes.suppressed[at] || role == Role::Heading;
-            if let Some(block) = blocks[at] {
-                line.block_index = block;
-            }
-        }
-        match &fences.folios[page_slot] {
-            Some((slot, label)) => {
-                let line = &page.lines[(slot.0 - range.start) as usize];
-                page.printed_label = Some(label.clone());
-                page.printed_label_source = Some(line.region_type.clone());
-                page.printed_label_line_id = Some(line.id.clone());
-            }
-            None => {
-                page.printed_label = None;
-                page.printed_label_source = None;
-                page.printed_label_line_id = None;
-            }
-        }
-    }
+    (0..slots.len())
+        .map(|at| {
+            let mode = match notes.note[at] {
+                _ if continuation[at] => NoteMode::Continuation,
+                Some(NoteKind::Endnote) => NoteMode::Endnote,
+                _ => NoteMode::Footnote,
+            };
+            legal_pdf_structure_model::regions::zone_of(decision.role[at], fences.edge[at], mode)
+        })
+        .collect()
 }
 
+/// The document's lines as the note pairer reads them, in reading order (the pages read in it): each line's zone and
+/// block, by slot, whether its opening number is no note's label (a heading's, or one the note band refused) or counts a
+/// numbered paragraph (which pairing may overturn), its constituent document and language, and its citations (by line
+/// id).
+#[allow(clippy::too_many_arguments)]
+pub fn note_lines<'a>(
+    pages: &'a [Page],
+    slots: &Slots,
+    fences: &Fences,
+    notes: &Notes,
+    decision: &Decision,
+    zones: &[LineZone],
+    blocks: &[usize],
+    citations: &'a BTreeMap<String, Vec<legal_pdf_core::model::ScalarRange>>,
+) -> Vec<NoteLine<'a>> {
+    fences
+        .order
+        .iter()
+        .map(|&slot| {
+            let at = slot.index();
+            let line = slots.line(pages, slot);
+            let context = fences.at(at);
+            NoteLine {
+                id: &line.id,
+                text: &line.text,
+                layout: Some(line),
+                page: NotePage::of(&pages[slots.page(slot)]),
+                zone: zones[at],
+                block: Some(blocks[at]),
+                label_suppressed: notes.suppressed[at] || decision.role[at] == Role::Heading,
+                paragraph_label: matches!(decision.unit[at], Some((_, UnitRole::Paragraph))) || notes.paragraph_label[at],
+                part: 2 * usize::from(context.document) + usize::from(context.translation),
+                citations: citations.get(&line.id).map_or(&[], Vec::as_slice),
+            }
+        })
+        .collect()
+}
 /// Whether two lines of a page stand on one row.
 fn same_row(evidence: &Evidence, slots: &Slots, a: Slot, b: Slot) -> bool {
     let row = evidence.row(slots, a);
     row != u32::MAX && slots.page(a) == slots.page(b) && evidence.row(slots, b) == row
 }
 
-/// Each line's block, by slot (none for a line label, folio or furniture, which keeps its own),
-/// numbered on each page after the page's own blocks.
-fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, decision: &Decision) -> Vec<Option<usize>> {
+/// Each line's block, by slot, numbered on each page after the page's own blocks; a line label, folio or furniture keeps
+/// its own.
+pub fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, decision: &Decision) -> Vec<usize> {
     let count = slots.len();
     let role = &decision.role;
     let counted = |slot: Slot| matches!(class(role[slot.index()]), Class::Body | Class::Contents | Class::Table);
@@ -229,5 +252,5 @@ fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, d
             previous = Some(slot);
         }
     }
-    blocks
+    blocks.into_iter().enumerate().map(|(at, block)| block.unwrap_or_else(|| slots.line(pages, Slot(at as u32)).block_index)).collect()
 }

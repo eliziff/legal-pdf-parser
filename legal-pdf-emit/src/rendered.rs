@@ -91,8 +91,8 @@ pub fn render(pages: &[Page], structure: &mut DocumentStructure) -> Result<Vec<R
                 if notes {
                     previous_owner = None;
                 }
-                for line in lines.iter().filter(|line| (note_lines.contains(line.id.as_str())
-                    || matches!(line.region_type.as_str(), "footnote" | "endnote" | "note")) == notes) {
+                for line in lines.iter().filter(|line| note_lines.contains(line.id.as_str()) == notes) {
+
                     let edits = structure.manuscript_edits.get(&line.id).map(Vec::as_slice).unwrap_or_default();
                     if line.text.trim().is_empty() && edits.is_empty() {
                         continue;

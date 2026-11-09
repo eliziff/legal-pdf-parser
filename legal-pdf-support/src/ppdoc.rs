@@ -477,8 +477,8 @@ impl PPDocLayout {
             for (line_index, line) in page.lines.iter().enumerate() {
                 if line.exclude_from_body
                     || line.text.trim().is_empty()
-                    || legal_pdf_core::is_heading_role(&line.region_type)
-                    || line.region_type == "LI"
+                    || legal_pdf_core::is_heading_role(&line.source_tag)
+                    || line.source_tag == "LI"
                 {
                     continue;
                 }
@@ -506,7 +506,7 @@ impl PPDocLayout {
         }
         for (page_index, line_index, label, region_id) in pending {
             let line = &mut pages[page_index].lines[line_index];
-            (line.region_type, line.region_id) = (label, region_id);
+            (line.source_tag, line.region_id) = (label, region_id);
         }
         Ok(())
     }

@@ -13,7 +13,8 @@
 //! unit it opens and says whether its number counts. Every place a run names is a line's slot and a
 //! place in its text.
 
-use legal_pdf_core::model::{Line, Page};
+use legal_pdf_core::model::{Line, LineZone, NoteMode, Page};
+use legal_pdf_structure_model::regions as zones;
 use legal_pdf_core::{layout_analysis, Error, Result};
 use legal_pdf_fences::{Continuation, Fences};
 use legal_pdf_layout::Geometry;
@@ -29,66 +30,42 @@ use legal_structure_model::{
 /// language with its lines in reading order (`repair_label_dropouts`): each rewritten line's slot
 /// and its text before. The repair reads a fenced running head or folio as the page's head or
 /// foot, a line label as one, and a line under the note separator as a note's.
-fn repair_markers(pages: &mut [Page], slots: &Slots, fences: &Fences) -> Vec<(Slot, String)> {
+fn repair_markers(pages: &mut [Page], fences: &Fences) -> Vec<(Slot, String)> {
     if !pages.iter().flat_map(|page| &page.lines).any(Line::recognized) {
         return Vec::new();
     }
-    let mut lines: Vec<Option<Line>> = pages.iter_mut().flat_map(|page| std::mem::take(&mut page.lines)).map(Some).collect();
+    // (Before the pages are read in reading order, a slot is its line's place among the pages' lines.)
+    let mut lines: Vec<Option<&mut Line>> = pages.iter_mut().flat_map(|page| page.lines.iter_mut()).map(Some).collect();
     let mut groups: BTreeMap<(u16, bool), Vec<Slot>> = BTreeMap::new();
     for &slot in &fences.order {
         groups.entry((fences.at(slot.index()).document, fences.at(slot.index()).translation)).or_default().push(slot);
     }
     let mut repaired = Vec::new();
     for group in groups.values() {
-        let mut view: Vec<Page> = Vec::new();
-        // Each line's slot and what the repair's reading changed on it: its region, note mode and
-        // place in the reading order; and its text before.
-        let mut held: Vec<(Slot, String, String, usize, String)> = Vec::with_capacity(group.len());
-        for (position, &slot) in group.iter().enumerate() {
-            let page = &pages[slots.page(slot)];
-            if view.last().is_none_or(|last| last.index != page.index) {
-                // (The page's lines are taken already.)
-                let page = Page { regions: Vec::new(), printed_label: None, printed_label_source: None, printed_label_line_id: None, ..page.clone() };
-                view.push(page);
-            }
-            let Some(mut line) = lines[slot.index()].take() else {
-                continue;
-            };
+        let mut view = Vec::with_capacity(group.len());
+        let mut before = Vec::with_capacity(group.len());
+        for &slot in group {
+            let Some(line) = lines[slot.index()].take() else { continue };
             let at = slot.index();
-            // (The repair asks only whether a line is the page's head or foot, or a note's; which edge, never.)
-            let region = match fences.role[at] {
-                role @ (Role::LineLabel | Role::Furniture | Role::PageLabel) => legal_pdf_structure_model::regions::region_of(role, None),
-                _ if fences.band[at] => legal_pdf_structure_model::regions::NOTE,
-                _ => legal_pdf_structure_model::regions::TEXT,
+            // (The repair asks only whether a line is the page's head or foot, or a note's.)
+            let zone = match fences.role[at] {
+                role @ (Role::LineLabel | Role::Furniture | Role::PageLabel) => zones::zone_of(role, fences.edge[at], NoteMode::Footnote),
+                _ if fences.band[at] => LineZone::Note(Some(NoteMode::Footnote)),
+                _ => LineZone::Body,
             };
-            let (region, mode) = (legal_pdf_structure_model::regions::page_region(region, fences.edge[at]), if region == legal_pdf_structure_model::regions::NOTE { "footnote" } else { "" });
-            held.push((
-                slot,
-                std::mem::replace(&mut line.region_type, region.to_owned()),
-                std::mem::replace(&mut line.note_region_mode, mode.to_owned()),
-                std::mem::replace(&mut line.reading_order, position),
-                line.text.clone(),
-            ));
-            view.last_mut().expect("a page for the line").lines.push(line);
+            before.push((slot, line.text.clone()));
+            view.push((line, zone));
         }
         legal_structure_model::structure_analysis().repair_label_dropouts(&mut view);
-        for (mut line, (slot, region, mode, order, text)) in view.into_iter().flat_map(|page| page.lines).zip(held) {
-            line.region_type = region;
-            line.note_region_mode = mode;
-            line.reading_order = order;
+        for ((line, _), (slot, text)) in view.into_iter().zip(before) {
             if line.text != text {
                 repaired.push((slot, text));
             }
-            lines[slot.index()] = Some(line);
         }
-    }
-    for (page_slot, page) in pages.iter_mut().enumerate() {
-        page.lines = slots.on(page_slot).filter_map(|slot| lines[slot as usize].take()).collect();
     }
     repaired.sort_unstable_by_key(|(slot, _)| *slot);
     repaired
 }
-
 /// A reading context's lines as one text, line under line, a marker standing alone on its line
 /// run on with the line beside it that carries its text, and a citation wrapped from one line to the
 /// next run on as one ("[1997]" over "1 S.C.R. 748": the volume opening the line is no marker): each
@@ -413,7 +390,7 @@ fn aligned_siblings(pages: &[Page], slots: &Slots, view: &View, run: &StructureC
 /// spine is read, its running heads naming its sections fenced (`confirm_section_heads`). The pages' `geometry` is read
 /// once their markers are restored.
 pub fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences, geometry: &Geometry) -> Result<Runs> {
-    let repaired = legal_pdf_core::profile::measure("runs.repair", || repair_markers(pages, slots, fences));
+    let repaired = legal_pdf_core::profile::measure("runs.repair", || repair_markers(pages, fences));
     let pages: &[Page] = pages;
     legal_pdf_evidence::reread(evidence, pages, slots, &repaired);
     fences.read_numbers(pages, slots, evidence, !repaired.is_empty());

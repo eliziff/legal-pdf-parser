@@ -1,12 +1,12 @@
 //! A PDF's extraction, whole: its pages' text and geometry by pdf-inspector, its page labels, outline
-//! and tagged structure roles, assembled with any recognition into the extracted document.
+//! and tagged structure roles, assembled into the extracted document, which recognition reads after (`recognize_pdf`).
 
 use crate as processor;
 use crate::ExtractedPdf;
-use legal_pdf_core::{profile, PdfOcrProvider, Result};
+use legal_pdf_core::{profile, Result};
 use std::collections::HashMap;
 
-pub fn extract_pdf(bytes: &[u8], ocr: Option<&mut dyn PdfOcrProvider>, ocr_pages: Option<&[usize]>) -> Result<ExtractedPdf> {
+pub fn extract_pdf(bytes: &[u8]) -> Result<ExtractedPdf> {
     let document = profile::measure("extract.load_document", || processor::load_extraction_document(bytes))?;
     let page_geometries = profile::measure("extract.page_geometry", || processor::page_geometries(&document));
     let ((items, rects, lines, painted_rules), detection) = profile::measure("extract.fidelity", || pdf_inspector::extract_fidelity_from_doc(&document)).map_err(processor::pdf::unreadable)?;
@@ -65,7 +65,7 @@ pub fn extract_pdf(bytes: &[u8], ocr: Option<&mut dyn PdfOcrProvider>, ocr_pages
     drop(document);
     drop(lines);
     let mut extracted =
-        profile::measure("extract.assemble", || processor::assemble_pdf(bytes, &page_geometries, items, painted_rules, detection, ocr, ocr_pages))?;
+        profile::measure("extract.assemble", || processor::assemble_pdf(&page_geometries, items, painted_rules, detection))?;
     processor::add_rect_regions(&mut extracted.pages, &page_geometries, &rects);
     extracted.metadata.embedded_page_labels = embedded_page_labels;
     extracted.outline = outline;
@@ -86,9 +86,9 @@ pub fn extract_pdf(bytes: &[u8], ocr: Option<&mut dyn PdfOcrProvider>, ocr_pages
                 });
             }
             if let Some(role) = legal_pdf_core::tagged_heading(line, |span| block(span).and_then(|roles| roles.0.as_deref())) {
-                line.region_type = role.to_owned();
+                line.source_tag = role.to_owned();
             } else if legal_pdf_core::tagged_line_role(line, |span| block(span).and_then(|roles| roles.1)).is_some() {
-                line.region_type = "LI".to_owned();
+                line.source_tag = "LI".to_owned();
             }
         }
     }

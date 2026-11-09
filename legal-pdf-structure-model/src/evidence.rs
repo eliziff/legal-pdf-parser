@@ -75,7 +75,7 @@ impl SourceTag {
     /// The tag a line's source puts on it: its structure tree's heading or list item where its region
     /// is plain text, else its region's label.
     pub fn of(line: &Line) -> Self {
-        let source = line.region_type.trim();
+        let source = line.source_tag.trim();
         if matches!(source, "text" | "body" | "" | "unknown" | "unknown_region") {
             return legal_pdf_core::tagged_heading(line, |span| span.structure_role.as_deref())
                 .or_else(|| {

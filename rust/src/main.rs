@@ -3,7 +3,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use legalpdf::{
-    derive_pdf_document, Error, PdfLookupRequest, PdfRequest,
+    read_pdf, Error, PdfLookupRequest, PdfRequest,
     PdfStructureLookup, Result,
 };
 use serde::{Deserialize, Serialize};
@@ -203,10 +203,10 @@ fn pdf_inspector_gate_command(arguments: &[String]) -> Result<i32> {
         );
         let cache_dir = caches.document(index)?;
         let request: PdfRequest = serde_json::from_value(serde_json::json!({
-            "cache_dir": cache_dir,
-            "expected_source_sha256": entry.sha256,
+            "cacheDir": cache_dir,
+            "expectedSourceSha256": entry.sha256,
         }))?;
-        let document = derive_pdf_document(&bytes, &request)?;
+        let document = read_pdf(Some(&bytes), &request)?.ok_or_else(|| Error::Message("PDF cache miss after parsing source bytes".to_owned()))?;
         if document.page_count() != entry.pages {
             return Err(Error::Message(format!(
                 "PDF Inspector page count mismatch: {} expected {}, got {}",

@@ -22,6 +22,8 @@ mod document;
 pub use document::*;
 mod lookup;
 pub use lookup::*;
+mod passage;
+pub use passage::*;
 
 const MAX_UNITS: usize = 20;
 const MAX_CONTEXT: usize = 2;

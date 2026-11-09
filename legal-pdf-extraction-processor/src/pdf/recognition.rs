@@ -51,7 +51,7 @@ pub(crate) fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) ->
             marker: None,
         }),
         region_id: result.region_id,
-        region_type: result.region_type,
+        source_tag: result.region_type,
         source: "ocr".to_owned(),
         ..Default::default()
     })

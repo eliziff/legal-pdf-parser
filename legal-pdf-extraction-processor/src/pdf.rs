@@ -68,13 +68,10 @@ pub fn page_geometries(document: &Document) -> PageGeometryMap {
 }
 
 pub fn assemble_pdf(
-    pdf: &[u8],
     geometries: &PageGeometryMap,
     mut items: Vec<TextItem>,
     painted_rules: Vec<PdfLine>,
     detection: PdfTypeResult,
-    ocr: Option<&mut dyn PdfOcrProvider>,
-    ocr_pages: Option<&[usize]>,
 ) -> Result<ExtractedPdf> {
     if geometries.is_empty() {
         return Err(Error::Message("PDF has no pages".to_owned()));
@@ -173,7 +170,5 @@ pub fn assemble_pdf(
     crate::paragraph_recovery::picture_numbers(&mut pages, &pictures, &weak_pages);
     let image_regions = image_regions(&pages, pictures, &weak_pages);
     let metadata = PdfExtractionMetadata { embedded_page_labels: Vec::new(), pages_needing_ocr: weak_pages.into_iter().collect(), ocr_routed_pages: Vec::new(), scanned_pages };
-    let mut extracted = ExtractedPdf { pages, separators, diagnostics, outline: Vec::new(), image_regions, metadata };
-    recognize_pdf(pdf, &mut extracted, ocr, ocr_pages)?;
-    Ok(extracted)
+    Ok(ExtractedPdf { pages, separators, diagnostics, outline: Vec::new(), image_regions, metadata })
 }

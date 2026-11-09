@@ -9,18 +9,14 @@ pub use legal_pdf_pages::{EdgeLine, PageEvidence, PdfPageBinding};
 pub fn page_evidence(document: &PdfDocument) -> Vec<PageEvidence> {
     let observed = document.page_labels();
     let embedded = &document.summary().embedded_page_labels;
-    let passage = document.passage_pages();
-    let read: Vec<&legal_pdf_core::model::Page> = passage.iter().chain(document.recognized_pages()).collect();
+    let read = document.passage_pages();
     (0..observed.len().max(embedded.len()))
         .map(|index| {
             let number = index as u32 + 1;
             let page = read.iter().find(|page| page.number == number);
             let lines = page.map(|page| {
                 page.lines.iter()
-                    .map(|line| EdgeLine {
-                        text: if line.text.is_empty() { line.words.iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" ") } else { line.text.clone() },
-                        rect: line.bbox,
-                    })
+                    .map(|line| EdgeLine { text: line.text.clone(), rect: line.bbox })
                     .collect()
             }).unwrap_or_default();
             PageEvidence {

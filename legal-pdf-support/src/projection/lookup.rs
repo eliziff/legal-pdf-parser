@@ -316,7 +316,7 @@ pub(crate) fn transcript_lines<'a>(
                 .iter()
                 .filter(|line| {
                     line.id != label.id
-                        && line.region_type != "line_label"
+                        && !line.exclude_from_body
                         && line.bbox[3].min(label.bbox[3]) - line.bbox[1].max(label.bbox[1])
                             > 0.5 * height(&line.bbox).min(height(&label.bbox))
                 })
