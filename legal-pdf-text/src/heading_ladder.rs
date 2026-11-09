@@ -9,10 +9,6 @@ const MAX_COUNTER_VALUE: u32 = 200;
 const MAX_OUTLINE_DEPTH: usize = 6;
 const FOOTNOTE_SUSPECT_MIN_VALUE: u32 = 15;
 
-fn roman_to_int(value: &str) -> Option<u32> {
-    legal_structure_model::layout::roman_value(value).filter(|number| *number <= MAX_COUNTER_VALUE)
-}
-
 pub type EnumeratorInterpretation = (String, u32, usize);
 
 pub fn enumerator_interpretations(value: &str, punct: &str) -> Vec<EnumeratorInterpretation> {
@@ -27,7 +23,7 @@ pub fn enumerator_interpretations(value: &str, punct: &str) -> Vec<EnumeratorInt
     }
     let upper = value.to_uppercase();
     // Small numerals count a family of their own ("(i)", "(ii)" under "(a)").
-    let roman = || roman_to_int(value).map(|number| (format!("{}_{punct}", if value == upper { "roman" } else { "lower_roman" }), number, 0));
+    let roman = || legal_structure_model::layout::roman_value(value).filter(counted).map(|number| (format!("{}_{punct}", if value == upper { "roman" } else { "lower_roman" }), number, 0));
     if (value == upper || value == value.to_lowercase()) && regex!(r"^[IVXLCDM]{2,7}$").is_match(&upper) {
         return roman().into_iter().collect();
     }
