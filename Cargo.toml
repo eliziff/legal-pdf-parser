@@ -11,14 +11,13 @@ exclude = ["vendor/pdf-inspector"]
 default-members = ["."]
 resolver = "2"
 
-# legal-structure is a repository of its own, pinned here; a checkout beside it overrides the pin with a [patch] in
-# its own Cargo configuration (as Beaver's does), never by a path into another repository.
+# First-party dependencies are the independent main checkouts beside this repository.
 [workspace.dependencies]
-legal-structure = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "cbecf0a8c2b91860115c0ab5749fbb3552c787a7" }
-legal-layout = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "cbecf0a8c2b91860115c0ab5749fbb3552c787a7" }
-legal-structure-model = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "cbecf0a8c2b91860115c0ab5749fbb3552c787a7" }
-legal-locator = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "cbecf0a8c2b91860115c0ab5749fbb3552c787a7" }
-legal-structure-features = { git = "https://github.com/eliziff/legal-structure-parser.git", rev = "cbecf0a8c2b91860115c0ab5749fbb3552c787a7" }
+legal-structure = { path = "../legal-structure" }
+legal-layout = { path = "../legal-structure/layout" }
+legal-structure-model = { path = "../legal-structure/model" }
+legal-locator = { path = "../legal-structure/locator" }
+legal-structure-features = { path = "../legal-structure/features" }
 pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 
 [features]

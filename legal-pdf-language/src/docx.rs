@@ -98,9 +98,10 @@ fn parse_element(reader: &NsReader<&[u8]>, start: &BytesStart<'_>, namespace: Op
     Ok(XmlElement { namespace, local, attributes, children: Vec::new(), self_closing })
 }
 
-fn parse_xml(raw: &[u8]) -> Result<XmlDocument> {
+fn parse_xml(raw: &[u8], strict: bool) -> Result<XmlDocument> {
     let mut reader = NsReader::from_reader(raw);
     reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = strict;
     let (mut buffer, mut roots, mut stack) = (Vec::new(), Vec::new(), Vec::<XmlElement>::new());
     loop {
         let node = match reader.read_event_into(&mut buffer).map_err(|error| failed("XML error", error))? {
@@ -114,7 +115,20 @@ fn parse_xml(raw: &[u8]) -> Result<XmlDocument> {
                 Some(XmlNode::Element(parse_element(&reader, &start, namespace, true)?))
             }
             Event::End(_) => Some(XmlNode::Element(stack.pop().ok_or_else(|| Error::Message("XML has an unmatched end tag".to_owned()))?)),
-            Event::Eof => break,
+            Event::Eof => {
+                // A text-only recovery keeps an unclosed paragraph, as the edit reader does. Operations that
+                // rewrite the package require balanced XML and never enter this recovery.
+                if !strict {
+                    while let Some(element) = stack.pop() {
+                        let node = XmlNode::Element(element);
+                        match stack.last_mut() {
+                            Some(parent) => parent.children.push(node),
+                            None => roots.push(node),
+                        }
+                    }
+                }
+                break;
+            }
             Event::Decl(_) => None,
             other => Some(XmlNode::Raw(other.into_owned())),
         };
@@ -233,20 +247,6 @@ fn normalized_docx_paragraph(paragraph: &XmlElement) -> Result<String> {
     let mut text = String::new();
     docx_paragraph_text(paragraph, &mut text)?;
     Ok(normalize_docx_text(&text))
-}
-
-fn tolerant_docx_paragraphs(xml: &str) -> Result<Vec<String>> {
-    static PARAGRAPHS: LazyLock<Regex> = LazyLock::new(|| literal(r"(?s)<w:p\b[^>]*>.*?</w:p>"));
-    static DELETIONS: LazyLock<Regex> = LazyLock::new(|| literal(r"(?s)<w:del\b[^>]*>.*?</w:del>"));
-    PARAGRAPHS
-        .find_iter(xml)
-        .map(|paragraph| {
-            let accepted = DELETIONS.replace_all(paragraph.as_str(), "");
-            let mut texts = TEXT.captures_iter(&accepted).map(|captures| quick_xml::escape::unescape(&captures[1]).map(|text| text.into_owned()));
-            let value = texts.try_fold(String::new(), |value, text| text.map(|text| value + &text)).map_err(|error| Error::Message(error.to_string()))?;
-            Ok(normalize_docx_text(&value))
-        })
-        .collect()
 }
 
 static SUPRA: LazyLock<Regex> = LazyLock::new(|| {
@@ -579,7 +579,7 @@ fn relationship_targets(files: &[(String, Vec<u8>)], name: &str) -> Result<HashM
     let Some(raw) = file_bytes(files, name) else {
         return Ok(HashMap::new());
     };
-    let document = parse_xml(raw)?;
+    let document = parse_xml(raw, true)?;
     let relationship = |element: &XmlElement| Some((element.attribute(None, "Id")?.to_owned(), element.attribute(None, "Target")?.to_owned()));
     Ok(document.root()?.direct_elements().filter(|element| element.local == "Relationship").filter_map(relationship).collect())
 }
@@ -683,7 +683,7 @@ fn footnote_numbering(parent: &XmlElement, inherited: FootnoteNumbering) -> Foot
 /// Return body paragraphs followed by Word footnotes in citation-review order.
 pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<legal_pdf_core::AuthorityTextUnit>> {
     let files = read_docx_files(bytes, Some(&["word/document.xml", "word/footnotes.xml", "word/_rels/footnotes.xml.rels", "word/settings.xml"]))?;
-    let document = parse_xml(file_bytes(&files, "word/document.xml").ok_or_else(|| Error::Message("DOCX has no word/document.xml".to_owned()))?)?;
+    let document = parse_xml(file_bytes(&files, "word/document.xml").ok_or_else(|| Error::Message("DOCX has no word/document.xml".to_owned()))?, true)?;
     let body = document.root()?.child("body").ok_or_else(|| Error::Message("DOCX has no document body".to_owned()))?;
     let mut paragraphs = Vec::new();
     body_paragraphs(body, &mut Vec::new(), &mut paragraphs);
@@ -701,7 +701,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<legal_pdf_core::Author
     }
     sections.push(body.child("sectPr"));
     let defaults = FootnoteNumbering { start: Some(1), restart: FootnoteRestart::Continuous, format: NoteFormat::Decimal };
-    let settings = file_bytes(&files, "word/settings.xml").map(parse_xml).transpose()?;
+    let settings = file_bytes(&files, "word/settings.xml").map(|xml| parse_xml(xml, true)).transpose()?;
     let global = settings.as_ref().map(|settings| settings.root()).transpose()?.map_or(defaults, |settings| footnote_numbering(settings, defaults));
     // A section prints its notes in the format its own properties name, decimal when they name none: an author
     // note's chicago section leaves the body's notes decimal, whatever settings.xml mirrors from that first section.
@@ -738,7 +738,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<legal_pdf_core::Author
     let (mut footnotes, mut footnote_numbers) = (Vec::new(), HashMap::new());
     if let Some(xml) = file_bytes(&files, "word/footnotes.xml") {
         let targets = relationship_targets(&files, "word/_rels/footnotes.xml.rels")?;
-        let document = parse_xml(xml)?;
+        let document = parse_xml(xml, true)?;
         let mut elements = Vec::new();
         walk_elements(document.root()?, &mut elements);
         for footnote in elements.into_iter().filter(|element| element.is(W_NS, "footnote")) {
@@ -1172,16 +1172,16 @@ fn docx_document_xml(bytes: &[u8]) -> Result<Vec<u8>> {
 fn docx_structure_input(bytes: &[u8], include_tables: bool) -> Result<(Vec<String>, Vec<legal_structure_model::AuthoritativeTableCell>)> {
     use legal_structure_model::{AuthoritativeTableCell, ScalarRange};
     let xml = docx_document_xml(bytes)?;
-    let Ok(document) = parse_xml(&xml) else {
-        let xml = std::str::from_utf8(&xml).map_err(|error| failed("DOCX XML is not UTF-8", error))?;
-        return Ok((tolerant_docx_paragraphs(xml)?, Vec::new()));
+    let (document, recovered) = match parse_xml(&xml, true) {
+        Ok(document) => (document, false),
+        Err(_) => (parse_xml(&xml, false)?, true),
     };
     let body = document.root()?.child("body").ok_or_else(|| Error::Message("DOCX has no document body".to_owned()))?;
     let mut all = Vec::new();
     walk_elements(body, &mut all);
     let canonical_elements = all.iter().copied().filter(|element| element.is(W_NS, "p") && !element.self_closing).collect::<Vec<_>>();
     let paragraphs = canonical_elements.iter().map(|paragraph| normalized_docx_paragraph(paragraph)).collect::<Result<Vec<_>>>()?;
-    if !include_tables {
+    if !include_tables || recovered {
         return Ok((paragraphs, Vec::new()));
     }
     let (mut starts, mut text_length) = (Vec::with_capacity(paragraphs.len()), 0);
