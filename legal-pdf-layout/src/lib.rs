@@ -1,5 +1,5 @@
-//! A page's layout: its geometry, columns, languages, tables, reading order, note-band lines and
-//! regions, each in its own module; the line geometry they share is here.
+//! A page's layout: its geometry, columns, languages, tables, reading order and note-band lines,
+//! each in its own module; the line geometry they share is here.
 
 use legal_pdf_structure_model::{PageView, Slot};
 use legal_structure_model::text::{is_note_symbol, MAX_SYMBOL_LABEL_LEN};
