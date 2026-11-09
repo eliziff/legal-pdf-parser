@@ -1,5 +1,4 @@
 mod docx;
-mod error;
 mod process;
 
 pub use docx::{
@@ -7,4 +6,3 @@ pub use docx::{
     fix_docx_supra_cross_references, DocxSupraCleanup,
     MAX_DOCX_SUPRA_BYTES,
 };
-pub use error::{Error, Result};

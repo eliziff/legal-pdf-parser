@@ -16,7 +16,7 @@ def main():
         (home, "/home"), (os.environ.get("RUSTUP_HOME", home / ".rustup"), "/rustup"),
         (os.environ.get("CARGO_HOME", home / ".cargo"), "/cargo"), (owner.parent, "/workspace")])
     subprocess.run(["cargo", "build", "--offline", "--locked", "--release", "-p", "legal-pdf-ocr",
-                    "--features", "indra", "--bin", "legalocr"], cwd=owner, env=env, check=True)
+                    "--bin", "legalocr"], cwd=owner, env=env, check=True)
 
 
 if __name__ == "__main__":

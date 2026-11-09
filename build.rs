@@ -116,11 +116,11 @@ fn crate_inputs(root: &Path, name: &str) -> Vec<PathBuf> {
 }
 
 /// What reads a page's text: the OCR crate's manifest and its top-level sources, but not its
-/// re-exports (lib.rs), its raster measures (raster.rs, keyed on their own), its command-line tool
-/// (bin) or an experiment's modules set below a source (indra/attribution, a feature of its own).
+/// re-exports (lib.rs), its raster measures (raster.rs, keyed on their own) or its command-line tool
+/// (bin); and the page renderer it reads.
 fn recognition_sources(root: &Path) -> Vec<PathBuf> {
     let owner = root.join("legal-pdf-ocr");
-    let mut inputs = vec![owner.join("Cargo.toml")];
+    let mut inputs = vec![owner.join("Cargo.toml"), root.join("legal-pdf-core/src/render.rs")];
     for entry in fs::read_dir(owner.join("src")).unwrap().flatten() {
         let path = entry.path();
         let name = entry.file_name();
@@ -133,7 +133,7 @@ fn recognition_sources(root: &Path) -> Vec<PathBuf> {
 
 /// What measures a page's render beyond its text: the raster module and the shared render helpers.
 fn raster_sources(root: &Path) -> Vec<PathBuf> {
-    ["legal-pdf-ocr/Cargo.toml", "legal-pdf-ocr/src/raster.rs", "legal-pdf-ocr/src/ocr.rs", "legal-pdf-ocr/src/separator.rs", "legal-pdf-core/src/ocr_contract.rs"]
+    ["legal-pdf-ocr/Cargo.toml", "legal-pdf-ocr/src/raster.rs", "legal-pdf-ocr/src/ocr.rs", "legal-pdf-ocr/src/separator.rs", "legal-pdf-core/src/ocr_contract.rs", "legal-pdf-core/src/render.rs"]
         .iter()
         .map(|name| root.join(name))
         .collect()

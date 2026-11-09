@@ -10,7 +10,6 @@ lopdf = { version = "0.45.0", default-features = false }
 pdf-inspector = { workspace = true }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
-thiserror = "2.0"
 
 # Native builds read a PDF's objects in parallel; the browser engine has one thread.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

@@ -468,7 +468,7 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
     let recognizer = std::env::var_os("LEGALPDF_INDRA_MODEL_PACK").is_some() && std::env::var_os("LEGALPDF_ONNXRUNTIME").is_some();
     let options = ParseOptions {
         cache_dir: Some(cache_dir.to_owned()),
-        ocr: recognizer.then(|| OcrOptions::Indra(legal_pdf_ocr::IndraOptions::default())),
+        ocr: recognizer.then(OcrOptions::default),
         #[cfg(feature = "ppdoc")]
         // The product's layout model (OpenVINO), on the same pack and runtime: LEGALPDF_PPDOC_DEVICE its device.
         ppdoc: std::env::var_os("LEGALPDF_PPDOC_MODEL_PACK").map(|pack| PPDocOptions {
@@ -499,32 +499,6 @@ pub fn gold_inputs_identity() -> String {
     let identity = serialization_sha256(&("legalpdf.gold-inputs.v2", EXTRACTION_CACHE_SCHEMA, models)).unwrap_or_default();
     identity[..16.min(identity.len())].to_owned()
 }
-/// The structure gold's synthetic scan: `pdf`, an image-only copy of a typeset document, extracted
-/// and recognized by `options`' recognizer, every recognized line measured in its render, as the
-/// structure stage receives a scan. `runtime` keeps the recognizer across documents.
-#[cfg(feature = "ocr")]
-#[doc(hidden)]
-pub fn gold_synthetic_inputs(pdf: &[u8], options: &OcrOptions, runtime: &mut Option<OcrProvider>) -> Result<ExtractedPdf> {
-    let mut extracted = extract_pdf(pdf, None, None)?;
-    let prepared = if runtime.is_none() { Some(OcrProvider::prepare(options)?) } else { None };
-    let mut provider = DeferredOcrProvider {
-        options,
-        prepared,
-        runtime: runtime.take(),
-        cache_root: None,
-        cache_identity: "synthetic".to_owned(),
-        raster_identity: "synthetic".to_owned(),
-        region_render: None,
-        progress: None,
-        rasters: BTreeMap::new(),
-    };
-    let recognized = recognize_pdf(pdf, &mut extracted, Some(&mut provider as &mut dyn legal_pdf_core::PdfOcrProvider), None);
-    *runtime = provider.runtime.take();
-    recognized?;
-    finish_recognition(&mut extracted.pages, provider.rasters);
-    Ok(extracted)
-}
-
 /// The structure gold's replay: a recognized extraction through the structure stage, uncached;
 /// `pages`, where given, receives the pages as the structure stage left them.
 #[doc(hidden)]
@@ -637,7 +611,6 @@ pub(crate) fn parse_pdf(
     options: &ParseOptions,
     #[cfg_attr(not(feature = "ocr"), allow(unused_variables))] progress: RecognitionProgress<'_>,
 ) -> Result<Option<PdfDocument>> {
-    let _profile = profile::scope("parse_pdf");
     let source_hash = if let Some(bytes) = bytes {
         if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 || !bytes[..bytes.len().min(1024)].windows(5).any(|window| window == b"%PDF-") {
             return Err(Error::Message("PDF source bytes are invalid".to_owned()).failure(FailureKind::Corrupt));

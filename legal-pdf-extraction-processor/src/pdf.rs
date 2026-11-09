@@ -2,7 +2,7 @@
 //! line assembly, rules, source lines, pictures and recognition, each in its own module; the
 //! extracted document and its assembly are here.
 
-use crate::{Error, Result};
+use legal_pdf_core::{Error, FailureKind, Result};
 use legal_pdf_core::model::{
     Diagnostic, Line, Page, PdfExtractionMetadata, PdfOutlineEntry, Span, Word,
 };
@@ -49,9 +49,18 @@ pub struct ExtractedPdf {
 /// The document as pdf-inspector loads it (bytes before the header dropped, bare struct names
 /// mended, broken containers repaired, encryption opened), its vast null arrays pruned.
 pub fn load_extraction_document(bytes: &[u8]) -> Result<Document> {
-    let (mut document, _) = pdf_inspector::load_document_from_mem(bytes)?;
+    let (mut document, _) = pdf_inspector::load_document_from_mem(bytes).map_err(unreadable)?;
     document.objects.values_mut().for_each(prune_extraction_object);
     Ok(document)
+}
+
+/// A PDF pdf-inspector cannot read: password-protected, or else corrupt.
+pub(crate) fn unreadable(error: pdf_inspector::PdfError) -> Error {
+    let kind = match error {
+        pdf_inspector::PdfError::Encrypted => FailureKind::Encrypted,
+        _ => FailureKind::Corrupt,
+    };
+    Error::Message(format!("PDF extraction failed: {error}")).failure(kind)
 }
 
 pub fn page_geometries(document: &Document) -> PageGeometryMap {

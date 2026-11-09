@@ -1,84 +1,24 @@
-use crate::indra::{open_session, ort_error, IndraBackend, LineBox};
+use crate::indra::{open_session, ort_error, LineBox};
 use image::{imageops, GrayImage};
-use legal_pdf_core::{Error, Result};
+use legal_pdf_core::{Error, OrtBackend, Result};
 use ort::{
     session::{builder::PrepackedWeights, Session},
     value::TensorRef,
 };
 use std::path::Path;
 
-pub(crate) enum LineDetector {
-    Indra(IndraDetector),
+/// Indra's line detector: a page's lines, in reading order.
+pub(crate) struct LineDetector {
+    session: Session,
+    side: usize,
 }
 
 impl LineDetector {
-    pub fn indra(
-        path: &Path,
-        side: usize,
-        backend: IndraBackend,
-        device: &str,
-        independent_pool: bool,
-    ) -> Result<Self> {
-        Ok(Self::Indra(IndraDetector {
-            session: open_session(
-                path,
-                1,
-                backend,
-                device,
-                true,
-                &PrepackedWeights::new(),
-                independent_pool,
-            )?,
-            side,
-            #[cfg(feature = "attribution")]
-            core_boxes: Vec::new(),
-        }))
+    pub fn open(path: &Path, side: usize, backend: OrtBackend, device: &str, independent_pool: bool) -> Result<Self> {
+        Ok(Self { session: open_session(path, 1, backend, device, true, &PrepackedWeights::new(), independent_pool)?, side })
     }
 
     pub fn lines(&mut self, image: &GrayImage) -> Result<Vec<LineBox>> {
-        match self {
-            Self::Indra(detector) => detector.lines(image),
-        }
-    }
-
-    #[cfg(feature = "attribution")]
-    pub(crate) fn core_boxes(&self) -> &[LineBox] {
-        match self {
-            Self::Indra(detector) => &detector.core_boxes,
-        }
-    }
-
-    pub fn lines_rgba(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<Vec<LineBox>> {
-        match self {
-            Self::Indra(detector) => {
-                let gray = pixels
-                    .chunks_exact(4)
-                    .map(|p| {
-                        ((299 * u32::from(p[0])
-                            + 587 * u32::from(p[1])
-                            + 114 * u32::from(p[2])
-                            + 500)
-                            / 1000) as u8
-                    })
-                    .collect();
-                detector.lines(
-                    &GrayImage::from_raw(width, height, gray)
-                        .expect("page dimensions match RGBA pixels"),
-                )
-            }
-        }
-    }
-}
-
-pub(crate) struct IndraDetector {
-    session: Session,
-    side: usize,
-    #[cfg(feature = "attribution")]
-    core_boxes: Vec<LineBox>,
-}
-
-impl IndraDetector {
-    fn lines(&mut self, image: &GrayImage) -> Result<Vec<LineBox>> {
         let (width, height) = image.dimensions();
         let scale = self.side as f64 / f64::from(width.max(height));
         let resized_width = (f64::from(width) * scale).round().max(1.0) as usize;
@@ -125,17 +65,7 @@ impl IndraDetector {
             ),
         );
         xycut(&mut boxes);
-        #[cfg(feature = "attribution")]
-        {
-            self.core_boxes = boxes.clone();
-        }
-        let boxes = crate::uncovered::recover_uncovered_lines(
-            image.as_raw(),
-            width as usize,
-            height as usize,
-            1,
-            boxes,
-        );
+        let boxes = crate::uncovered::recover_uncovered_lines(image.as_raw(), width as usize, height as usize, boxes);
         Ok(
             order_footnotes(boxes, width as usize, height as usize)
                 .into_iter()

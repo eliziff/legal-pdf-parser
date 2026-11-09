@@ -6,16 +6,13 @@ license = "MIT"
 
 [features]
 default = []
-profiling = ["legal-pdf-core/profiling"]
-allocation-profiling = ["profiling", "legal-pdf-core/allocation-profiling"]
-ppdoc = ["dep:hayro", "dep:image", "dep:libloading"]
+ppdoc = ["dep:image", "dep:libloading", "legal-pdf-core/render"]
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
 legal-structure-model = { workspace = true }
 legal-locator = { workspace = true }
 pdf-inspector = { workspace = true }
-hayro = { version = "0.7.0", default-features = false, optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 libloading = { version = "0.8", optional = true }
 regex = "1.11"

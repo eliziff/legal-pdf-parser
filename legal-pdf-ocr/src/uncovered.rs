@@ -5,30 +5,15 @@
 use crate::indra::LineBox;
 
 /// The page's lines with the uncovered lines added, each placed before the line it stands beside
-/// or after the line above it.
-pub(crate) fn recover_uncovered_lines(
-    pixels: &[u8],
-    width: usize,
-    height: usize,
-    channels: usize,
-    mut boxes: Vec<LineBox>,
-) -> Vec<LineBox> {
+/// or after the line above it; `pixels` the page in grey.
+pub(crate) fn recover_uncovered_lines(pixels: &[u8], width: usize, height: usize, mut boxes: Vec<LineBox>) -> Vec<LineBox> {
     if boxes.len() < 3 || width == 0 || height == 0 {
         return boxes;
     }
     let mut heights = boxes.iter().map(|line| line.height()).collect::<Vec<_>>();
     heights.sort_unstable();
     let line_height = heights[heights.len() / 2].max(1);
-    let ink = |x: usize, y: usize| {
-        let at = (y * width + x) * channels;
-        let luminance = if channels >= 3 {
-            (u32::from(pixels[at]) * 3 + u32::from(pixels[at + 1]) * 6 + u32::from(pixels[at + 2]))
-                / 10
-        } else {
-            u32::from(pixels[at])
-        };
-        luminance < 128
-    };
+    let ink = |x: usize, y: usize| pixels[y * width + x] < 128;
     // Ink within a quarter line of a line is that line's.
     let margin = line_height / 4;
     let mut seen = vec![false; width * height];

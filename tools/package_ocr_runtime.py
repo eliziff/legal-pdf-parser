@@ -14,10 +14,10 @@ def command(owner, *args):
 
 
 def crate_notices(owner):
-    tree = command(owner, "cargo", "tree", "--offline", "-p", "legal-pdf-ocr", "--features", "indra",
+    tree = command(owner, "cargo", "tree", "--offline", "-p", "legal-pdf-ocr",
                    "--target", "x86_64-pc-windows-msvc", "--edges", "normal", "--prefix", "none", "--format", "{p}")
     used = {match.groups() for line in tree.splitlines() if (match := re.match(r"([\w-]+) v([\w.+-]+)", line))}
-    metadata = json.loads(command(owner, "cargo", "metadata", "--offline", "--format-version", "1", "--features", "legal-pdf-ocr/indra"))
+    metadata = json.loads(command(owner, "cargo", "metadata", "--offline", "--format-version", "1"))
     notices, first_party = [], []
     for package in metadata["packages"]:
         if (package["name"], package["version"]) not in used:

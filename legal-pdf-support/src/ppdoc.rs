@@ -442,23 +442,8 @@ impl PPDocLayout {
     }
 
     pub fn annotate_pdf(&mut self, bytes: &[u8], pages: &mut [Page]) -> Result<()> {
-        use hayro::hayro_interpret::InterpreterSettings;
-        use hayro::hayro_syntax::Pdf;
-        use hayro::vello_cpu::color::palette::css::WHITE;
-        use hayro::{render, RenderCache, RenderSettings};
-
-        let pdf = Pdf::new(bytes.to_vec()).map_err(|error| {
-            Error::Message(format!("PPdoc renderer could not open PDF: {error:?}"))
-        })?;
-        let cache = RenderCache::new();
-        let interpreter = InterpreterSettings::default();
-        let scale = f32::from(self.render_dpi) / 72.0;
-        let settings = RenderSettings {
-            x_scale: scale,
-            y_scale: scale,
-            bg_color: WHITE,
-            ..Default::default()
-        };
+        let pdf = legal_pdf_core::render::open_pdf(bytes)?;
+        let renderer = legal_pdf_core::render::PageRenderer::new(&pdf, f64::from(self.render_dpi));
         let mut regions_by_page = vec![Vec::<RegionDetection>::new(); pages.len()];
         for (page_position, page) in pages.iter().enumerate() {
             if !page
@@ -468,17 +453,10 @@ impl PPDocLayout {
             {
                 continue;
             }
-            let pdf_page = pdf.pages().iter().nth(page.index).ok_or_else(|| {
-                Error::Message(format!("PDF page index is out of range: {}", page.index))
-            })?;
-            let pixmap = render(pdf_page, &cache, &interpreter, &settings);
+            let Some(pixmap) = renderer.render(page.index) else {
+                return fail(format!("PPdoc renderer could not draw page {}", page.number));
+            };
             let (width, height) = (u32::from(pixmap.width()), u32::from(pixmap.height()));
-            if width == 0 || height == 0 {
-                return fail(format!(
-                    "PPdoc renderer produced an empty page image for page {}",
-                    page.number
-                ));
-            }
             let pixels = pixmap
                 .data_as_u8_slice()
                 .chunks_exact(4)

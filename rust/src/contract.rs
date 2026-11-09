@@ -1,6 +1,4 @@
 use crate::engine::{parse_pdf, ParseOptions};
-#[cfg(feature = "ocr")]
-use crate::IndraOptions;
 #[cfg(feature = "ppdoc")]
 use crate::PPDocOptions;
 use crate::{Error, Result};
@@ -58,7 +56,7 @@ enum OcrRequest {
     #[serde(rename = "indra")]
     Indra {
         #[serde(default)]
-        settings: IndraOptions,
+        settings: OcrOptions,
     },
     #[cfg(not(feature = "ocr"))]
     #[serde(rename = "indra")]
@@ -149,7 +147,7 @@ fn parse_options(request: &PdfRequest) -> Result<ParseOptions> {
     if let Some(request) = &request.ocr {
         options.ocr = match request {
             #[cfg(feature = "ocr")]
-            OcrRequest::Indra { settings } => Some(OcrOptions::Indra(settings.clone())),
+            OcrRequest::Indra { settings } => Some(settings.clone()),
             #[cfg(not(feature = "ocr"))]
             OcrRequest::Indra { .. } => {
                 return Err(Error::Message(

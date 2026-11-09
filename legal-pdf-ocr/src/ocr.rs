@@ -1,107 +1,12 @@
+//! The recognizer as the parser reads a PDF with it: its pages, the separators read from their
+//! images, and parts of a page read again from a render.
+use crate::indra::OcrProvider;
+use legal_pdf_core::render::{open_pdf, PageRenderer, Pixmap};
 use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, PdfOcrProvider, Result};
 
-#[derive(Debug, Clone)]
-pub enum OcrOptions {
-    #[cfg(feature = "ocr")]
-    Indra(crate::indra::IndraOptions),
-}
-
-#[cfg(feature = "ocr")]
-impl From<crate::indra::IndraOptions> for OcrOptions {
-    fn from(options: crate::indra::IndraOptions) -> Self {
-        Self::Indra(options)
-    }
-}
-
-pub enum OcrProvider {
-    #[cfg(feature = "ocr")]
-    Indra(crate::indra::IndraOcr),
-}
-
-pub struct PreparedOcrProvider {
-    provider: PreparedProvider,
-}
-
-enum PreparedProvider {
-    #[cfg(feature = "ocr")]
-    Indra(crate::indra::PreparedIndra),
-}
-
-impl OcrProvider {
-    pub fn new(options: &OcrOptions) -> Result<Self> {
-        Self::from_prepared(options, Self::prepare(options)?)
-    }
-
-    pub fn prepare(options: &OcrOptions) -> Result<PreparedOcrProvider> {
-        match options {
-            #[cfg(feature = "ocr")]
-            OcrOptions::Indra(options) => {
-                let provider = crate::indra::IndraOcr::prepare(options)?;
-                Ok(PreparedOcrProvider {
-                    provider: PreparedProvider::Indra(provider),
-                })
-            }
-        }
-    }
-
-    pub fn from_prepared(options: &OcrOptions, prepared: PreparedOcrProvider) -> Result<Self> {
-        match (options, prepared.provider) {
-            #[cfg(feature = "ocr")]
-            (OcrOptions::Indra(options), PreparedProvider::Indra(prepared)) => {
-                crate::indra::IndraOcr::from_prepared(options, prepared).map(Self::Indra)
-            }
-        }
-    }
-
-    pub fn identity(&self) -> &str {
-        match self {
-            #[cfg(feature = "ocr")]
-            Self::Indra(provider) => provider.identity(),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        match self {
-            #[cfg(feature = "ocr")]
-            Self::Indra(provider) => provider.name(),
-        }
-    }
-
-    fn extract_pages_inner(
-        &mut self,
-        pdf: &[u8],
-        requests: &[OcrPageRequest],
-    ) -> Result<Vec<OcrPageResult>> {
-        match self {
-            #[cfg(feature = "ocr")]
-            Self::Indra(provider) => provider.extract_pages(pdf, requests),
-        }
-    }
-}
-
-impl PreparedOcrProvider {
-    pub fn identity(&self) -> &str {
-        match &self.provider {
-            #[cfg(feature = "ocr")]
-            PreparedProvider::Indra(provider) => provider.identity(),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        match &self.provider {
-            #[cfg(feature = "ocr")]
-            PreparedProvider::Indra(provider) => provider.name(),
-        }
-    }
-}
-
 impl PdfOcrProvider for OcrProvider {
-    fn extract_pages(
-        &mut self,
-        pdf: &[u8],
-        requests: &[OcrPageRequest],
-    ) -> Result<Vec<OcrPageResult>> {
-        self.extract_pages_inner(pdf, requests)
+    fn extract_pages(&mut self, pdf: &[u8], requests: &[OcrPageRequest]) -> Result<Vec<OcrPageResult>> {
+        self.recognize_pdf(pdf, requests)
     }
 
     fn separators(&mut self, pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<Option<f64>> {
@@ -109,26 +14,16 @@ impl PdfOcrProvider for OcrProvider {
     }
 
     fn read_region(&mut self, pdf: &[u8], page_index: usize, region: [f64; 4], scale: f64) -> Result<Vec<OcrLine>> {
-        #[cfg(feature = "ocr")]
-        {
-            match render_gray_page(pdf, page_index, scale * 72.0) {
-                Some(render) => self.read_rendered_region(&render, region, scale),
-                None => Ok(Vec::new()),
-            }
-        }
-        #[cfg(not(feature = "ocr"))]
-        {
-            let _ = (pdf, page_index, region, scale);
-            Ok(Vec::new())
+        match render_gray_page(pdf, page_index, scale * 72.0) {
+            Some(render) => self.read_rendered_region(&render, region, scale),
+            None => Ok(Vec::new()),
         }
     }
 }
 
 /// A page rendered to 8-bit grey: (width, height, pixels).
-#[cfg(feature = "ocr")]
 pub type GrayRender = (usize, usize, Vec<u8>);
 
-#[cfg(feature = "ocr")]
 impl OcrProvider {
     /// `region` of a page already rendered at `scale` times its points, read: a caller reading
     /// several regions of one page renders it once.
@@ -148,9 +43,7 @@ impl OcrProvider {
         let Some(image) = image::GrayImage::from_raw((x1 - x0) as u32, (y1 - y0) as u32, crop) else {
             return Ok(Vec::new());
         };
-        let lines = match self {
-            Self::Indra(provider) => provider.recognize_gray_image(&image)?,
-        };
+        let lines = self.recognize_images(std::slice::from_ref(&image))?.pop().unwrap_or_default();
         Ok(lines
             .into_iter()
             .map(|mut line| {
@@ -168,82 +61,44 @@ impl OcrProvider {
 }
 
 /// The scale a page's head and foot are read again at: the recognizer's own (Indra reads at 144 dpi).
-#[cfg(feature = "ocr")]
 pub const REREAD_SCALE: f64 = 2.0;
 
-/// `indices`' heads and feet (`legal_pdf_pages::EDGE_BAND`) read by `ocr` from their images, sixteen pages rendered at a
-/// time.
-#[cfg(feature = "ocr")]
+/// `indices`' heads and feet (`legal_pdf_pages::EDGE_BAND`) read by `ocr` from their images, the
+/// document parsed once and each page rendered as it is read.
 pub fn read_bands(pdf: &[u8], indices: &[usize], ocr: &mut OcrProvider) -> Result<Vec<(usize, legal_pdf_pages::Bands)>> {
     use legal_pdf_pages::{Bands, EdgeLine, EDGE_BAND};
+    let Ok(document) = open_pdf(pdf) else { return Ok(Vec::new()) };
+    let pages = PageRenderer::new(&document, REREAD_SCALE * 72.0);
     let mut out = Vec::new();
-    for batch in indices.chunks(16) {
-        for (index, render) in batch.iter().copied().zip(render_gray_pages_of(pdf, batch, REREAD_SCALE * 72.0)) {
-            let Some(render) = render else { continue };
-            let (width, height) = (render.0 as f64 / REREAD_SCALE, render.1 as f64 / REREAD_SCALE);
-            let mut read = |band: [f64; 4]| -> Result<Vec<EdgeLine>> {
-                Ok(ocr.read_rendered_region(&render, band, REREAD_SCALE)?.into_iter().filter(|line| !line.text.trim().is_empty())
-                    .map(|line| EdgeLine { text: line.text, rect: line.bbox }).collect())
-            };
-            let head = read([0.0, 0.0, width, height * EDGE_BAND])?;
-            let foot = read([0.0, height * (1.0 - EDGE_BAND), width, height])?;
-            out.push((index, Bands { width, height, head, foot }));
-        }
+    for &index in indices {
+        let Some(render) = pages.render(index).map(|pixmap| gray_render(&pixmap)) else { continue };
+        let (width, height) = (render.0 as f64 / REREAD_SCALE, render.1 as f64 / REREAD_SCALE);
+        let mut read = |band: [f64; 4]| -> Result<Vec<EdgeLine>> {
+            Ok(ocr.read_rendered_region(&render, band, REREAD_SCALE)?.into_iter().filter(|line| !line.text.trim().is_empty())
+                .map(|line| EdgeLine { text: line.text, rect: line.bbox }).collect())
+        };
+        let head = read([0.0, 0.0, width, height * EDGE_BAND])?;
+        let foot = read([0.0, height * (1.0 - EDGE_BAND), width, height])?;
+        out.push((index, Bands { width, height, head, foot }));
     }
     Ok(out)
 }
 
 /// One page of `pdf` rendered to 8-bit grey at `dpi`.
-#[cfg(feature = "ocr")]
 pub fn render_gray_page(pdf: &[u8], page_index: usize, dpi: f64) -> Option<GrayRender> {
-    render_gray_pages_of(pdf, &[page_index], dpi).pop().flatten()
+    let document = open_pdf(pdf).ok()?;
+    PageRenderer::new(&document, dpi).render(page_index).map(|pixmap| gray_render(&pixmap))
 }
 
-/// The pages `indices` of `pdf` rendered to 8-bit grey at `dpi`, the document parsed once; none for a page it has not.
-#[cfg(feature = "ocr")]
-pub fn render_gray_pages_of(pdf: &[u8], indices: &[usize], dpi: f64) -> Vec<Option<GrayRender>> {
-    use hayro::hayro_interpret::InterpreterSettings;
-    use hayro::hayro_syntax::Pdf;
-    use hayro::vello_cpu::color::palette::css::WHITE;
-    use hayro::{render, RenderCache, RenderSettings};
-
-    let Ok(document) = Pdf::new(pdf.to_vec()) else { return vec![None; indices.len()] };
-    let cache = RenderCache::new();
-    let interpreter = InterpreterSettings::default();
-    let scale = (dpi / 72.0) as f32;
-    let settings = RenderSettings { x_scale: scale, y_scale: scale, bg_color: WHITE, ..Default::default() };
-    let pages = document.pages();
-    indices.iter().map(|&index| {
-        let page = pages.iter().nth(index)?;
-        let pixmap = render(page, &cache, &interpreter, &settings);
-        (pixmap.width() > 0 && pixmap.height() > 0).then(|| (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(&pixmap)))
-    }).collect()
+fn gray_render(pixmap: &Pixmap) -> GrayRender {
+    (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(pixmap))
 }
 
-#[cfg(feature = "ocr")]
-pub(crate) fn gray_of(pixmap: &hayro::vello_cpu::Pixmap) -> Vec<u8> {
+/// A render's pixels in 8-bit grey: what every reader of a page's image reads.
+pub(crate) fn gray_of(pixmap: &Pixmap) -> Vec<u8> {
     pixmap
         .data_as_u8_slice()
         .chunks_exact(4)
         .map(|pixel| ((u32::from(pixel[0]) * 77 + u32::from(pixel[1]) * 150 + u32::from(pixel[2]) * 29) / 256) as u8)
         .collect()
-}
-
-#[cfg(feature = "ocr")]
-pub(crate) fn raster_separator_y(pixmap: &hayro::vello_cpu::Pixmap, page_height: f64) -> Option<f64> {
-    let gray = gray_of(pixmap);
-    raster_separator_gray(&gray, usize::from(pixmap.width()), usize::from(pixmap.height()), page_height)
-}
-
-#[cfg(feature = "ocr")]
-pub(crate) fn raster_separator_gray(gray: &[u8], width: usize, height: usize, page_height: f64) -> Option<f64> {
-    let record = crate::separator::scan_gray_page(gray, width, height);
-    if !matches!(record.separator_status, Some("found" | "found_two_column")) {
-        return None;
-    }
-    record.separators.and_then(|separators| {
-        separators
-            .first()
-            .map(|rule| rule.y_center_ratio * page_height)
-    })
 }

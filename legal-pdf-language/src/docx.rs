@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use legal_pdf_core::{Error, Result};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
@@ -30,6 +30,16 @@ fn replace_file(files: &mut Vec<(String, Vec<u8>)>, name: &str, bytes: Vec<u8>) 
 /// What failed, with the error that failed it.
 fn failed(what: &str, error: impl std::fmt::Display) -> Error {
     Error::Message(format!("{what}: {error}"))
+}
+
+/// A package that cannot be read as a ZIP archive.
+fn corrupted(error: zip::result::ZipError) -> Error {
+    failed("DOCX is corrupted or truncated", error)
+}
+
+/// A package that could not be written.
+fn unwritten(error: zip::result::ZipError) -> Error {
+    failed("DOCX could not be written", error)
 }
 
 /// A regular expression written out in this file.
@@ -93,7 +103,7 @@ fn parse_xml(raw: &[u8]) -> Result<XmlDocument> {
     reader.config_mut().trim_text(false);
     let (mut buffer, mut roots, mut stack) = (Vec::new(), Vec::new(), Vec::<XmlElement>::new());
     loop {
-        let node = match reader.read_event_into(&mut buffer)? {
+        let node = match reader.read_event_into(&mut buffer).map_err(|error| failed("XML error", error))? {
             Event::Start(start) => {
                 let namespace = namespace_value(reader.resolver().resolve_element(start.name()).0);
                 stack.push(parse_element(&reader, &start, namespace, false)?);
@@ -392,12 +402,12 @@ fn read_docx_files(bytes: &[u8], wanted: Option<&[&str]>) -> Result<Vec<(String,
     if bytes.is_empty() || bytes.len() > MAX_DOCX_SUPRA_BYTES {
         return Err(refused("DOCX is empty or exceeds the read limit"));
     }
-    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(corrupted)?;
     let mut files = Vec::with_capacity(wanted.map_or(archive.len(), |names| names.len()));
     let mut seen = HashSet::with_capacity(archive.len());
     let (mut expanded, mut xml_expanded, mut declared_expanded, mut declared_xml_expanded, mut file_count) = (0_u64, 0_u64, 0_u64, 0_u64, 0);
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
+        let mut entry = archive.by_index(index).map_err(corrupted)?;
         let name = entry.name().replace('\\', "/");
         if name.contains('\0') || name.starts_with('/') || name.as_bytes().get(1) == Some(&b':') || name.split('/').any(|component| component == "..") {
             return Err(refused("DOCX contains an unsafe package path"));
@@ -448,13 +458,13 @@ fn write_docx_files(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     for (name, value) in files {
         if name.ends_with('/') {
-            archive.add_directory(name, options)?;
+            archive.add_directory(name, options).map_err(unwritten)?;
         } else {
-            archive.start_file(name, options)?;
+            archive.start_file(name, options).map_err(unwritten)?;
             archive.write_all(value).map_err(|error| Error::io("DOCX output", error))?;
         }
     }
-    Ok(archive.finish()?.into_inner())
+    Ok(archive.finish().map_err(unwritten)?.into_inner())
 }
 
 fn docx_part(files: &[(String, Vec<u8>)], name: &str) -> Option<String> {
@@ -999,7 +1009,7 @@ fn split_drafting_image_runs(xml: &str) -> Result<String> {
     let mut writer = quick_xml::Writer::new(Vec::new());
     let mut changed = false;
     loop {
-        let event = reader.read_event()?.into_owned();
+        let event = reader.read_event().map_err(|error| failed("XML error", error))?.into_owned();
         let is_run = matches!(&event, Event::Start(start) if start.local_name().as_ref() == b"r" && word(&reader, start));
         if matches!(event, Event::Eof) {
             break;
@@ -1011,7 +1021,7 @@ fn split_drafting_image_runs(xml: &str) -> Result<String> {
         let start = event;
         let (mut children, mut depth, mut has_image, mut has_text) = (Vec::<(bool, Vec<Event<'static>>)>::new(), 0, false, false);
         let end = loop {
-            let event = reader.read_event()?.into_owned();
+            let event = reader.read_event().map_err(|error| failed("XML error", error))?.into_owned();
             if matches!(event, Event::Eof) {
                 return Err(Error::Message("DOCX has an unclosed run".to_owned()));
             }
@@ -1146,7 +1156,7 @@ fn docx_document_xml(bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.is_empty() || bytes.len() > MAX_DOCX_BYTES {
         return Err(refused("DOCX is empty or exceeds the read limit"));
     }
-    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(corrupted)?;
     if archive.len() > 10_000 {
         return Err(refused("DOCX has too many package entries"));
     }
@@ -1282,7 +1292,6 @@ fn drafting_docx_text(bytes: &[u8]) -> Result<String> {
         return Err(Error::Message("Precedent DOCX exceeds the drafting read limit".to_owned()));
     }
     let input = drafting_docx_input(bytes).map_err(|error| match error {
-        Error::Zip(_) => Error::Message("Precedent DOCX is corrupted or truncated".to_owned()),
         Error::Message(message) if message.contains("XML part exceeds") => Error::Message("Precedent DOCX contains an oversized XML part".to_owned()),
         Error::Message(message) => Error::Message(message.strip_prefix("DOCX ").map_or(message.clone(), |detail| format!("Precedent DOCX {detail}"))),
         error => error,

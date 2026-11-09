@@ -9,6 +9,8 @@ mod ocr_markers;
 mod ort_backend;
 #[cfg(feature = "ort-runtime")]
 mod ort_runtime;
+#[cfg(feature = "render")]
+pub mod render;
 mod storage;
 pub use analysis::{install_layout_analysis, layout_analysis};
 #[cfg(feature = "structure-analysis")]

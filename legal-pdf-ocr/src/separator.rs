@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+//! A page render's horizontal rules, and of them the rule printed above the page's notes.
 use std::collections::BTreeMap;
 
 const OTSU_MIN_THRESHOLD: usize = 64;
@@ -11,8 +11,6 @@ const MAX_ROW_TRANSITIONS: usize = 40;
 const INK_GUARD_RATIO: f64 = 0.002;
 const INK_WINDOW_RATIO: f64 = 0.006;
 const BLOCK_INK_WINDOW_RATIO: f64 = 0.18;
-const MAX_RECORDED_RULES: usize = 40;
-const MAX_RECORDED_VERTICAL_RULES: usize = 20;
 
 const SEPARATOR_MIN_Y_RATIO: f64 = 0.30;
 const SEPARATOR_MAX_Y_RATIO: f64 = 0.97;
@@ -26,66 +24,99 @@ const SEPARATOR_MAX_THICKNESS_RATIO: f64 = 0.006;
 const SEPARATOR_MAX_ABOVE_INK: f64 = 0.05;
 const SEPARATOR_MAX_BELOW_INK: f64 = 0.15;
 const SEPARATOR_MIN_BLOCK_INK: f64 = 0.015;
-const FULL_RULE_MIN_WIDTH_RATIO: f64 = 0.6;
 const STACK_NEIGHBOR_Y_RATIO: f64 = 0.035;
 const STACK_OVERLAP_SHARE: f64 = 0.5;
 const TWO_COLUMN_Y_DELTA_RATIO: f64 = 0.012;
 const VERTICAL_CROSS_X_PAD_RATIO: f64 = 0.01;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct RuleRecord {
-    pub y0_ratio: f64,
-    pub y1_ratio: f64,
-    pub y_center_ratio: f64,
-    pub x0_ratio: f64,
-    pub x1_ratio: f64,
-    pub width_ratio: f64,
-    pub thickness_px: usize,
-    pub thickness_ratio: f64,
-    pub darkness: f64,
-    pub above_ink: f64,
-    pub below_ink: f64,
-    pub above_block_ink: f64,
-    pub below_block_ink: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+/// Horizontal rules, as `(x0, x1, top, bottom)` pixels, all inclusive: runs of dark pixels (gaps of
+/// two bridged) at least `min_length` long, with light rows three pixels above and below across
+/// most of the run, a run in the row just under one already read joining it as the same rule,
+/// thicker; at most `max_rows` rows thick.
+pub(crate) fn horizontal_rules(
+    dark: impl Fn(usize, usize) -> bool,
+    width: usize,
+    height: usize,
+    min_length: usize,
+    max_rows: usize,
+) -> Vec<(usize, usize, usize, usize)> {
+    let light_share = |y: usize, a: usize, b: usize| (a..b).filter(|&x| !dark(x, y)).count() * 10 >= (b - a) * 7;
+    let mut rules: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for y in 3..height.saturating_sub(3) {
+        let mut x = 0;
+        while x < width {
+            if !dark(x, y) {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            let mut gap = 0;
+            let mut end = x;
+            while x < width && gap <= 2 {
+                if dark(x, y) {
+                    end = x;
+                    gap = 0
+                } else {
+                    gap += 1
+                }
+                x += 1;
+            }
+            if end + 1 - start >= min_length && light_share(y - 3, start, end + 1) && light_share(y + 3, start, end + 1) {
+                if let Some(last) = rules.iter_mut().rev().take(64).find(|s| s.3 + 1 == y && s.0 < end && start < s.1) {
+                    last.0 = last.0.min(start);
+                    last.1 = last.1.max(end);
+                    last.3 = y;
+                } else {
+                    rules.push((start, end, y, y));
+                }
+            }
+        }
+    }
+    rules.retain(|rule| rule.3 - rule.2 < max_rows);
+    rules
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct VerticalRuleRecord {
-    pub x_center_ratio: f64,
-    pub y0_ratio: f64,
-    pub y1_ratio: f64,
-    pub length_ratio: f64,
-    pub thickness_px: usize,
+/// Where the rule above a page's notes runs, in the units of `page_height`, read from its grey
+/// render: one rule, or two side by side over two columns of notes (the left one's).
+pub(crate) fn separator_y(gray: &[u8], width: usize, height: usize, page_height: f64) -> Option<f64> {
+    if width < 64 || height < 64 || gray.len() != width * height {
+        return None;
+    }
+    let threshold = otsu_threshold(gray).clamp(OTSU_MIN_THRESHOLD, OTSU_MAX_THRESHOLD);
+    let dark = gray.iter().map(|value| usize::from(*value) < threshold).collect::<Vec<_>>();
+    if dark.iter().filter(|value| **value).count() as f64 / dark.len() as f64 > DARK_PAGE_SHARE {
+        return None;
+    }
+    let rules = rule_records(&dark, width, height);
+    let verticals = vertical_rules(&dark, width, height);
+    separator(&rules, &verticals).map(|ratio| ratio * page_height)
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct ScanRecord {
-    pub status: &'static str,
-    pub page_size: Option<[usize; 2]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub threshold: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dark_share: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rule_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vertical_rule_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rules: Option<Vec<RuleRecord>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vertical_rules: Option<Vec<VerticalRuleRecord>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub separators: Option<Vec<RuleRecord>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub separator_status: Option<&'static str>,
+/// A horizontal rule, its place and size as shares of the page's, its darkness and the ink just
+/// above and below it and in the blocks of text beyond.
+struct Rule {
+    y: f64,
+    x0: f64,
+    x1: f64,
+    thickness: f64,
+    darkness: f64,
+    above_ink: f64,
+    below_ink: f64,
+    above_block_ink: f64,
+    below_block_ink: f64,
 }
 
-fn round4(value: f64) -> f64 {
-    (value * 10_000.0).round_ties_even() / 10_000.0
+impl Rule {
+    fn width(&self) -> f64 {
+        self.x1 - self.x0
+    }
+}
+
+/// A vertical rule's middle and its top and bottom, as shares of the page's width and height.
+struct VerticalRule {
+    x: f64,
+    y0: f64,
+    y1: f64,
 }
 
 fn otsu_threshold(gray: &[u8]) -> usize {
@@ -99,22 +130,14 @@ fn otsu_threshold(gray: &[u8]) -> usize {
     }
     let mut omega = 0.0;
     let mut mu = 0.0;
-    let total_mu = histogram
-        .iter()
-        .enumerate()
-        .map(|(value, count)| value as f64 * count)
-        .sum::<f64>();
+    let total_mu = histogram.iter().enumerate().map(|(value, count)| value as f64 * count).sum::<f64>();
     let mut best_index = 0;
     let mut best_sigma = 0.0;
     for (value, count) in histogram.iter().enumerate() {
         omega += count;
         mu += value as f64 * count;
         let denominator = omega * (total - omega);
-        let sigma = if denominator > 0.0 {
-            (total_mu * omega - mu * total).powi(2) / denominator
-        } else {
-            0.0
-        };
+        let sigma = if denominator > 0.0 { (total_mu * omega - mu * total).powi(2) / denominator } else { 0.0 };
         if sigma > best_sigma {
             best_sigma = sigma;
             best_index = value;
@@ -123,71 +146,12 @@ fn otsu_threshold(gray: &[u8]) -> usize {
     best_index
 }
 
-fn index(width: usize, x: usize, y: usize) -> usize {
-    y * width + x
-}
-
-fn horizontal_dilation(dark: &[bool], width: usize, height: usize) -> Vec<bool> {
-    let mut result = dark.to_vec();
-    for y in 0..height {
-        for x in 0..width {
-            result[index(width, x, y)] = dark[index(width, x, y)]
-                || (y > 0 && dark[index(width, x, y - 1)])
-                || (y + 1 < height && dark[index(width, x, y + 1)]);
-        }
-    }
-    result
-}
-
-fn candidate_rows(mask: &[bool], width: usize, height: usize, minimum: usize) -> Vec<usize> {
-    (0..height)
-        .filter(|&y| {
-            let mut ink = 0;
-            let mut transitions = 0;
-            for x in 0..width {
-                let value = mask[index(width, x, y)];
-                ink += usize::from(value);
-                if x > 0 && value != mask[index(width, x - 1, y)] {
-                    transitions += 1;
-                }
-            }
-            ink >= minimum && transitions <= MAX_ROW_TRANSITIONS
-        })
-        .collect()
-}
-
-fn longest_row_run(mask: &[bool], width: usize, y: usize) -> (usize, usize, usize) {
-    let mut best_length = 0;
-    let mut best_start = 0;
-    let mut run_length = 0;
-    let mut run_start = 0;
-    for x in 0..width {
-        if mask[index(width, x, y)] {
-            if run_length == 0 {
-                run_start = x;
-            }
-            run_length += 1;
-            if run_length > best_length {
-                best_length = run_length;
-                best_start = run_start;
-            }
-        } else {
-            run_length = 0;
-        }
-    }
-    (best_length, best_start, best_start + best_length)
-}
-
 fn groups(indices: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
     let mut result: Vec<(usize, usize)> = Vec::new();
     for value in indices {
-        if result
-            .last()
-            .is_some_and(|(_, end)| value == end.saturating_add(1))
-        {
-            result.last_mut().expect("group").1 = value;
-        } else {
-            result.push((value, value));
+        match result.last_mut() {
+            Some(last) if value == last.1 + 1 => last.1 = value,
+            _ => result.push((value, value)),
         }
     }
     result
@@ -204,124 +168,51 @@ fn median_usize(values: impl IntoIterator<Item = usize>) -> usize {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ink_share(
-    dark: &[bool],
-    width: usize,
-    height: usize,
-    y0: isize,
-    y1: isize,
-    x0: usize,
-    x1: usize,
-    empty: f64,
-) -> f64 {
+/// The dark share of rows `y0..y1` (clipped to the page) between `x0` and `x1`; `empty` where no
+/// row is left.
+fn ink_share(dark: &[bool], width: usize, height: usize, (y0, y1): (isize, isize), (x0, x1): (usize, usize), empty: f64) -> f64 {
     let y0 = y0.max(0) as usize;
     let y1 = y1.min(height as isize).max(0) as usize;
     if y1 <= y0 || x1 <= x0 {
         return empty;
     }
-    let mut count = 0;
-    let mut total = 0;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            count += usize::from(dark[index(width, x, y)]);
-            total += 1;
-        }
-    }
-    count as f64 / total as f64
+    let count = (y0..y1).map(|y| dark[y * width + x0..y * width + x1].iter().filter(|value| **value).count()).sum::<usize>();
+    count as f64 / ((y1 - y0) * (x1 - x0)) as f64
 }
 
-fn horizontal_rule_records(dark: &[bool], width: usize, height: usize) -> Vec<RuleRecord> {
-    let dilated = horizontal_dilation(dark, width, height);
+fn rule_records(dark: &[bool], width: usize, height: usize) -> Vec<Rule> {
     let minimum = 8.max((width as f64 * MIN_RULE_WIDTH_RATIO) as usize);
-    let mut metrics = BTreeMap::new();
-    for row in candidate_rows(&dilated, width, height, minimum) {
-        let run = longest_row_run(&dilated, width, row);
-        if run.0 >= minimum {
-            metrics.insert(row, run);
-        }
-    }
     let maximum_thickness = 4.max((height as f64 * MAX_RULE_THICKNESS_RATIO) as usize);
-    let guard = 2.max((height as f64 * INK_GUARD_RATIO) as usize);
-    let ink_window = 4.max((height as f64 * INK_WINDOW_RATIO) as usize);
-    let block_window = (ink_window * 2).max((height as f64 * BLOCK_INK_WINDOW_RATIO) as usize);
-    let mut records = Vec::new();
-    for (band_y0, band_y1) in groups(metrics.keys().copied()) {
-        let thickness = band_y1 - band_y0 + 1;
-        if thickness > maximum_thickness + 2 {
-            continue;
-        }
-        let x0 = median_usize((band_y0..=band_y1).map(|row| metrics[&row].1));
-        let x1 = median_usize((band_y0..=band_y1).map(|row| metrics[&row].2));
-        if x1 <= x0 {
-            continue;
-        }
-        let darkness = (band_y0..=band_y1)
-            .map(|y| {
-                (x0..x1).filter(|&x| dark[index(width, x, y)]).count() as f64 / (x1 - x0) as f64
-            })
-            .fold(0.0, f64::max);
-        let above_end = band_y0 as isize - guard as isize;
-        let below_start = band_y1 + 1 + guard;
-        let real_thickness = thickness.saturating_sub(2).max(1);
-        records.push(RuleRecord {
-            y0_ratio: round4(band_y0 as f64 / height as f64),
-            y1_ratio: round4((band_y1 + 1) as f64 / height as f64),
-            y_center_ratio: round4((band_y0 + band_y1 + 1) as f64 / 2.0 / height as f64),
-            x0_ratio: round4(x0 as f64 / width as f64),
-            x1_ratio: round4(x1 as f64 / width as f64),
-            width_ratio: round4((x1 - x0) as f64 / width as f64),
-            thickness_px: real_thickness,
-            thickness_ratio: round4(real_thickness as f64 / height as f64),
-            darkness: round4(darkness),
-            above_ink: round4(ink_share(
-                dark,
-                width,
-                height,
-                above_end - ink_window as isize,
-                above_end,
-                x0,
-                x1,
-                1.0,
-            )),
-            below_ink: round4(ink_share(
-                dark,
-                width,
-                height,
-                below_start as isize,
-                (below_start + ink_window) as isize,
-                x0,
-                x1,
-                1.0,
-            )),
-            above_block_ink: round4(ink_share(
-                dark,
-                width,
-                height,
-                above_end - block_window as isize,
-                above_end,
-                x0,
-                x1,
-                0.0,
-            )),
-            below_block_ink: round4(ink_share(
-                dark,
-                width,
-                height,
-                below_start as isize,
-                (below_start + block_window) as isize,
-                x0,
-                x1,
-                0.0,
-            )),
-            kind: None,
-        });
-    }
-    records.sort_by(|left, right| right.width_ratio.total_cmp(&left.width_ratio));
-    records
+    let guard = 2.max((height as f64 * INK_GUARD_RATIO) as usize) as isize;
+    let ink_window = 4.max((height as f64 * INK_WINDOW_RATIO) as usize) as isize;
+    let block_window = (ink_window * 2).max((height as f64 * BLOCK_INK_WINDOW_RATIO) as isize);
+    let (w, h) = (width as f64, height as f64);
+    horizontal_rules(|x, y| dark[y * width + x], width, height, minimum, maximum_thickness)
+        .into_iter()
+        .map(|(x0, end, top, bottom)| {
+            let x1 = end + 1;
+            let darkness = (top..=bottom)
+                .map(|y| dark[y * width + x0..y * width + x1].iter().filter(|value| **value).count() as f64 / (x1 - x0) as f64)
+                .fold(0.0, f64::max);
+            let above = top as isize - guard;
+            let below = (bottom + 1) as isize + guard;
+            let share = |rows, empty| ink_share(dark, width, height, rows, (x0, x1), empty);
+            Rule {
+                y: (top + bottom + 1) as f64 / 2.0 / h,
+                x0: x0 as f64 / w,
+                x1: x1 as f64 / w,
+                thickness: (bottom + 1 - top) as f64 / h,
+                darkness,
+                above_ink: share((above - ink_window, above), 1.0),
+                below_ink: share((below, below + ink_window), 1.0),
+                above_block_ink: share((above - block_window, above), 0.0),
+                below_block_ink: share((below, below + block_window), 0.0),
+            }
+        })
+        .collect()
 }
 
-fn vertical_rule_records(dark: &[bool], width: usize, height: usize) -> Vec<VerticalRuleRecord> {
+fn vertical_rules(dark: &[bool], width: usize, height: usize) -> Vec<VerticalRule> {
     let minimum = 12.max((height as f64 * MIN_VERTICAL_RULE_LENGTH_RATIO) as usize);
     let mut metrics = BTreeMap::new();
     for x in 0..width {
@@ -333,9 +224,7 @@ fn vertical_rule_records(dark: &[bool], width: usize, height: usize) -> Vec<Vert
         let mut run_start = 0;
         let mut prior = false;
         for y in 0..height {
-            let value = dark[index(width, x, y)]
-                || (x > 0 && dark[index(width, x - 1, y)])
-                || (x + 1 < width && dark[index(width, x + 1, y)]);
+            let value = dark[y * width + x] || (x > 0 && dark[y * width + x - 1]) || (x + 1 < width && dark[y * width + x + 1]);
             ink += usize::from(value);
             if y > 0 && value != prior {
                 transitions += 1;
@@ -355,164 +244,71 @@ fn vertical_rule_records(dark: &[bool], width: usize, height: usize) -> Vec<Vert
             prior = value;
         }
         if ink >= minimum && transitions <= MAX_ROW_TRANSITIONS && best_length >= minimum {
-            metrics.insert(x, (best_length, best_start, best_start + best_length));
+            metrics.insert(x, (best_start, best_start + best_length));
         }
     }
     let maximum_thickness = 4.max((width as f64 * MAX_RULE_THICKNESS_RATIO) as usize);
-    let mut records = Vec::new();
-    for (band_x0, band_x1) in groups(metrics.keys().copied()) {
-        let thickness = band_x1 - band_x0 + 1;
-        if thickness > maximum_thickness + 2 {
-            continue;
-        }
-        let y0 = median_usize((band_x0..=band_x1).map(|column| metrics[&column].1));
-        let y1 = median_usize((band_x0..=band_x1).map(|column| metrics[&column].2));
-        if y1 <= y0 {
-            continue;
-        }
-        records.push(VerticalRuleRecord {
-            x_center_ratio: round4((band_x0 + band_x1 + 1) as f64 / 2.0 / width as f64),
-            y0_ratio: round4(y0 as f64 / height as f64),
-            y1_ratio: round4(y1 as f64 / height as f64),
-            length_ratio: round4((y1 - y0) as f64 / height as f64),
-            thickness_px: thickness.saturating_sub(2).max(1),
-        });
-    }
-    records.sort_by(|left, right| right.length_ratio.total_cmp(&left.length_ratio));
-    records
+    groups(metrics.keys().copied())
+        .into_iter()
+        .filter(|(x0, x1)| x1 - x0 < maximum_thickness + 2)
+        .filter_map(|(band_x0, band_x1)| {
+            let y0 = median_usize((band_x0..=band_x1).map(|column| metrics[&column].0));
+            let y1 = median_usize((band_x0..=band_x1).map(|column| metrics[&column].1));
+            (y1 > y0).then(|| VerticalRule {
+                x: (band_x0 + band_x1 + 1) as f64 / 2.0 / width as f64,
+                y0: y0 as f64 / height as f64,
+                y1: y1 as f64 / height as f64,
+            })
+        })
+        .collect()
 }
 
-fn overlap_share(left: &RuleRecord, right: &RuleRecord) -> f64 {
-    let overlap = left.x1_ratio.min(right.x1_ratio) - left.x0_ratio.max(right.x0_ratio);
-    if overlap <= 0.0 {
-        return 0.0;
-    }
-    let narrower = left.width_ratio.min(right.width_ratio);
-    if narrower > 0.0 {
+/// How much of the narrower of two rules the other spans.
+fn overlap_share(left: &Rule, right: &Rule) -> f64 {
+    let overlap = left.x1.min(right.x1) - left.x0.max(right.x0);
+    let narrower = left.width().min(right.width());
+    if overlap > 0.0 && narrower > 0.0 {
         overlap / narrower
     } else {
         0.0
     }
 }
 
-pub(crate) fn classify_separator(
-    rules: &[RuleRecord],
-    verticals: &[VerticalRuleRecord],
-    minimum_y: f64,
-) -> (Vec<RuleRecord>, &'static str) {
-    let mut candidates = Vec::new();
-    for (index, rule) in rules.iter().enumerate() {
-        if !(minimum_y..=SEPARATOR_MAX_Y_RATIO).contains(&rule.y_center_ratio)
-            || !(SEPARATOR_MIN_X0_RATIO..=SEPARATOR_MAX_X0_RATIO).contains(&rule.x0_ratio)
-            || rule.x1_ratio > SEPARATOR_MAX_X1_RATIO
-            || !(SEPARATOR_MIN_WIDTH_RATIO..=SEPARATOR_MAX_WIDTH_RATIO).contains(&rule.width_ratio)
-            || rule.darkness < SEPARATOR_MIN_DARKNESS
-            || rule.thickness_ratio > SEPARATOR_MAX_THICKNESS_RATIO
-            || rule.above_ink > SEPARATOR_MAX_ABOVE_INK
-            || rule.below_ink > SEPARATOR_MAX_BELOW_INK
-            || rule.above_block_ink < SEPARATOR_MIN_BLOCK_INK
-            || rule.below_block_ink < SEPARATOR_MIN_BLOCK_INK
-        {
-            continue;
-        }
-        if rules.iter().enumerate().any(|(other_index, other)| {
-            other_index != index
-                && (other.y_center_ratio - rule.y_center_ratio).abs() <= STACK_NEIGHBOR_Y_RATIO
-                && overlap_share(rule, other) >= STACK_OVERLAP_SHARE
-        }) {
-            continue;
-        }
-        if verticals.iter().any(|vertical| {
-            (rule.x0_ratio - VERTICAL_CROSS_X_PAD_RATIO
-                ..=rule.x1_ratio + VERTICAL_CROSS_X_PAD_RATIO)
-                .contains(&vertical.x_center_ratio)
-                && (vertical.y0_ratio..=vertical.y1_ratio).contains(&rule.y_center_ratio)
-        }) {
-            continue;
-        }
-        let mut candidate = rule.clone();
-        candidate.kind = Some(
-            if candidate.width_ratio >= FULL_RULE_MIN_WIDTH_RATIO {
-                "full_rule"
-            } else {
-                "short_rule"
-            }
-            .to_owned(),
-        );
-        candidates.push(candidate);
-    }
-    match candidates.len() {
-        0 => (Vec::new(), "none"),
-        1 => (candidates, "found"),
-        2 => {
-            candidates.sort_by(|left, right| left.x0_ratio.total_cmp(&right.x0_ratio));
-            let left = &candidates[0];
-            let right = &candidates[1];
-            if (left.y_center_ratio - right.y_center_ratio).abs() <= TWO_COLUMN_Y_DELTA_RATIO
-                && left.x1_ratio <= right.x0_ratio
-            {
-                (candidates, "found_two_column")
-            } else {
-                (Vec::new(), "ambiguous")
-            }
-        }
-        _ => (Vec::new(), "ambiguous"),
-    }
-}
-
-pub(crate) fn scan_gray_page(gray: &[u8], width: usize, height: usize) -> ScanRecord {
-    if width < 64 || height < 64 || gray.len() != width.saturating_mul(height) {
-        return ScanRecord {
-            status: "unusable_image",
-            page_size: (gray.len() == width.saturating_mul(height)).then_some([width, height]),
-            threshold: None,
-            dark_share: None,
-            rule_count: None,
-            vertical_rule_count: None,
-            rules: None,
-            vertical_rules: None,
-            separators: None,
-            separator_status: None,
-        };
-    }
-    let threshold = otsu_threshold(gray).clamp(OTSU_MIN_THRESHOLD, OTSU_MAX_THRESHOLD);
-    let dark = gray
+/// The note separator's height as a share of the page's: a rule in the page's lower part, from
+/// near its left margin, dark, thin, clear of ink just above and below, between blocks of text,
+/// with no rule stacked on it and none crossing it; one such rule, or two at one height over two
+/// columns (the left one's).
+fn separator(rules: &[Rule], verticals: &[VerticalRule]) -> Option<f64> {
+    let candidates = rules
         .iter()
-        .map(|value| usize::from(*value) < threshold)
+        .enumerate()
+        .filter(|(index, rule)| {
+            (SEPARATOR_MIN_Y_RATIO..=SEPARATOR_MAX_Y_RATIO).contains(&rule.y)
+                && (SEPARATOR_MIN_X0_RATIO..=SEPARATOR_MAX_X0_RATIO).contains(&rule.x0)
+                && rule.x1 <= SEPARATOR_MAX_X1_RATIO
+                && (SEPARATOR_MIN_WIDTH_RATIO..=SEPARATOR_MAX_WIDTH_RATIO).contains(&rule.width())
+                && rule.darkness >= SEPARATOR_MIN_DARKNESS
+                && rule.thickness <= SEPARATOR_MAX_THICKNESS_RATIO
+                && rule.above_ink <= SEPARATOR_MAX_ABOVE_INK
+                && rule.below_ink <= SEPARATOR_MAX_BELOW_INK
+                && rule.above_block_ink >= SEPARATOR_MIN_BLOCK_INK
+                && rule.below_block_ink >= SEPARATOR_MIN_BLOCK_INK
+                && !rules.iter().enumerate().any(|(other_index, other)| {
+                    other_index != *index && (other.y - rule.y).abs() <= STACK_NEIGHBOR_Y_RATIO && overlap_share(rule, other) >= STACK_OVERLAP_SHARE
+                })
+                && !verticals.iter().any(|vertical| {
+                    (rule.x0 - VERTICAL_CROSS_X_PAD_RATIO..=rule.x1 + VERTICAL_CROSS_X_PAD_RATIO).contains(&vertical.x)
+                        && (vertical.y0..=vertical.y1).contains(&rule.y)
+                })
+        })
+        .map(|(_, rule)| rule)
         .collect::<Vec<_>>();
-    let dark_share = dark.iter().filter(|value| **value).count() as f64 / dark.len() as f64;
-    if dark_share > DARK_PAGE_SHARE {
-        return ScanRecord {
-            status: "dark_page",
-            page_size: Some([width, height]),
-            threshold: Some(threshold),
-            dark_share: Some(round4(dark_share)),
-            rule_count: Some(0),
-            vertical_rule_count: Some(0),
-            rules: Some(Vec::new()),
-            vertical_rules: Some(Vec::new()),
-            separators: Some(Vec::new()),
-            separator_status: Some("none"),
-        };
-    }
-    let rules = horizontal_rule_records(&dark, width, height);
-    let verticals = vertical_rule_records(&dark, width, height);
-    let (separators, status) = classify_separator(&rules, &verticals, SEPARATOR_MIN_Y_RATIO);
-    ScanRecord {
-        status: "ok",
-        page_size: Some([width, height]),
-        threshold: Some(threshold),
-        dark_share: Some(round4(dark_share)),
-        rule_count: Some(rules.len()),
-        vertical_rule_count: Some(verticals.len()),
-        rules: Some(rules.into_iter().take(MAX_RECORDED_RULES).collect()),
-        vertical_rules: Some(
-            verticals
-                .into_iter()
-                .take(MAX_RECORDED_VERTICAL_RULES)
-                .collect(),
-        ),
-        separators: Some(separators),
-        separator_status: Some(status),
+    match candidates.as_slice() {
+        [rule] => Some(rule.y),
+        [first, second] => {
+            let (left, right) = if first.x0 <= second.x0 { (first, second) } else { (second, first) };
+            ((left.y - right.y).abs() <= TWO_COLUMN_Y_DELTA_RATIO && left.x1 <= right.x0).then_some(left.y)
+        }
+        _ => None,
     }
 }

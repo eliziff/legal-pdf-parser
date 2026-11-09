@@ -25,11 +25,9 @@ pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 default = []
 pdf = ["dep:legal-pdf-pages", "dep:legal-pdf-core", "dep:legal-pdf-extraction-processor", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:serde", "dep:serde_json", "dep:sha2"]
 language = ["dep:legal-pdf-core", "dep:legal-pdf-language"]
-ocr = ["pdf", "dep:legal-pdf-ocr", "legal-pdf-ocr/ocr"]
+ocr = ["pdf", "dep:legal-pdf-ocr"]
 indra = ["ocr"]
 fast-allocator = ["dep:mimalloc"]
-profiling = ["pdf", "legal-pdf-support/profiling"]
-allocation-profiling = ["profiling", "legal-pdf-support/allocation-profiling"]
 ppdoc = ["pdf", "legal-pdf-support/ppdoc"]
 # DOC, the structure stage's tier 1: its ONNX heads over tier 0's reading.
 doc = ["pdf", "legal-pdf-core/ort-runtime", "legal-pdf-structure/encoder"]

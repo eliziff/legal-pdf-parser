@@ -3,7 +3,7 @@
 //! A page photocopied or printed sideways or upside down is turned upright, recognized, and its
 //! lines are placed back on the page as it is drawn, so highlights and pinpoints land on the print.
 
-use image::{imageops, RgbaImage};
+use image::{imageops, GrayImage, RgbaImage};
 use legal_pdf_core::{Error, OcrLine, Result};
 use ort::{session::Session, value::TensorRef};
 use std::path::Path;
@@ -82,7 +82,7 @@ impl Orientation {
 }
 
 /// The page turned `turns` quarter turns counter-clockwise.
-pub(crate) fn turn(page: &RgbaImage, turns: u8) -> RgbaImage {
+pub(crate) fn turn(page: &GrayImage, turns: u8) -> GrayImage {
     match turns % 4 {
         1 => imageops::rotate270(page),
         2 => imageops::rotate180(page),

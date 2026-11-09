@@ -1,4 +1,5 @@
-use crate::indra::{canonical_file, IndraBackend, IndraTier};
+use crate::indra::{canonical_file, IndraTier};
+use legal_pdf_core::OrtBackend;
 use legal_pdf_core::{provider_asset_sha256, Error, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -44,7 +45,7 @@ pub(crate) struct ModelPack {
 }
 
 impl ModelPack {
-    pub fn open(root: &Path, tier: IndraTier, backend: IndraBackend) -> Result<Self> {
+    pub fn open(root: &Path, tier: IndraTier, backend: OrtBackend) -> Result<Self> {
         let root = fs::canonicalize(root).map_err(|source| Error::io(root, source))?;
         let path = root.join("manifest.json");
         if fs::metadata(&path)
@@ -78,7 +79,7 @@ impl ModelPack {
         })?;
         let accelerated = matches!(
             backend,
-            IndraBackend::Cuda | IndraBackend::TensorRt | IndraBackend::DirectMl
+            OrtBackend::Cuda | OrtBackend::TensorRt | OrtBackend::DirectMl
         );
         Ok(Self {
             model: checked_asset(&root, if accelerated { &model.gpu } else { &model.cpu })?,

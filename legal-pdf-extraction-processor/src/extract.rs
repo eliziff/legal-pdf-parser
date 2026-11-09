@@ -2,14 +2,14 @@
 //! and tagged structure roles, assembled with any recognition into the extracted document.
 
 use crate as processor;
-use crate::{ExtractedPdf, Result};
-use legal_pdf_core::{profile, PdfOcrProvider};
+use crate::ExtractedPdf;
+use legal_pdf_core::{profile, PdfOcrProvider, Result};
 use std::collections::HashMap;
 
 pub fn extract_pdf(bytes: &[u8], ocr: Option<&mut dyn PdfOcrProvider>, ocr_pages: Option<&[usize]>) -> Result<ExtractedPdf> {
     let document = profile::measure("extract.load_document", || processor::load_extraction_document(bytes))?;
     let page_geometries = profile::measure("extract.page_geometry", || processor::page_geometries(&document));
-    let ((items, rects, lines, painted_rules), detection) = profile::measure("extract.fidelity", || pdf_inspector::extract_fidelity_from_doc(&document))?;
+    let ((items, rects, lines, painted_rules), detection) = profile::measure("extract.fidelity", || pdf_inspector::extract_fidelity_from_doc(&document)).map_err(processor::pdf::unreadable)?;
     let embedded_page_labels = processor::embedded_page_labels(&document, page_geometries.len());
     let outline = processor::embedded_outline(&document);
     // Keep direct inline roles and enclosing heading/list-item roles as separate evidence.

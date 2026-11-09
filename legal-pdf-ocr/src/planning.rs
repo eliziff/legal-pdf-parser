@@ -1,4 +1,5 @@
-use crate::indra::{IndraBackend, IndraOcr, IndraOptions, PreparedIndra};
+use crate::indra::{OcrOptions, OcrProvider, PreparedOcrProvider};
+use legal_pdf_core::OrtBackend;
 use legal_pdf_core::{provider_asset_sha256, Error, Result};
 use ort::execution_providers::{
     CUDAExecutionProvider, DirectMLExecutionProvider, ExecutionProvider,
@@ -10,7 +11,7 @@ use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimePlan {
-    pub backend: IndraBackend,
+    pub backend: OrtBackend,
     pub device: String,
     pub workers: usize,
     pub threads: usize,
@@ -20,14 +21,14 @@ pub struct RuntimePlan {
 }
 
 pub(crate) fn prepare(
-    options: &IndraOptions,
+    options: &OcrOptions,
     root: &Path,
     runtime: &Path,
-) -> Result<PreparedIndra> {
+) -> Result<PreparedOcrProvider> {
     static PLANS: OnceLock<Mutex<HashMap<String, RuntimePlan>>> = OnceLock::new();
     let budget = cpu_budget(std::thread::available_parallelism().map_or(1, |n| n.get()));
     if let Some(backend) = options.backend {
-        return IndraOcr::prepare_plan(
+        return OcrProvider::prepare_plan(
             options,
             root,
             runtime.to_path_buf(),
@@ -46,15 +47,15 @@ pub(crate) fn prepare(
         .lock()
         .map_err(|_| Error::Message("Indra selection lock poisoned".into()))?;
     if let Some(plan) = cache.get(&key) {
-        return IndraOcr::prepare_plan(options, root, runtime.to_path_buf(), plan.clone());
+        return OcrProvider::prepare_plan(options, root, runtime.to_path_buf(), plan.clone());
     }
     let (backend, device) = preferred_backend(options);
     let mut selected = plan(options, backend, device.as_deref(), budget)?;
     let mut prepared =
-        IndraOcr::prepare_plan(options, root, runtime.to_path_buf(), selected.clone())?;
-    if backend != IndraBackend::Cpu {
+        OcrProvider::prepare_plan(options, root, runtime.to_path_buf(), selected.clone())?;
+    if backend != OrtBackend::Cpu {
         // Verify the provider once and keep its sessions. Startup never runs a synthetic OCR sweep.
-        match IndraOcr::open_prepared(&selection_options, &prepared) {
+        match OcrProvider::open_prepared(&selection_options, &prepared) {
             Ok(engine) => {
                 prepared.ready = Some(Box::new(engine));
             }
@@ -62,9 +63,9 @@ pub(crate) fn prepare(
                 if options.device.is_some() {
                     return Err(error);
                 }
-                selected = plan(options, IndraBackend::Cpu, None, budget)?;
+                selected = plan(options, OrtBackend::Cpu, None, budget)?;
                 prepared =
-                    IndraOcr::prepare_plan(options, root, runtime.to_path_buf(), selected.clone())?;
+                    OcrProvider::prepare_plan(options, root, runtime.to_path_buf(), selected.clone())?;
             }
         }
     }
@@ -80,14 +81,14 @@ fn cpu_budget(available: usize) -> usize {
 }
 
 fn plan(
-    options: &IndraOptions,
-    backend: IndraBackend,
+    options: &OcrOptions,
+    backend: OrtBackend,
     device: Option<&str>,
     budget: usize,
 ) -> Result<RuntimePlan> {
     let gpu = matches!(
         backend,
-        IndraBackend::Cuda | IndraBackend::TensorRt | IndraBackend::DirectMl
+        OrtBackend::Cuda | OrtBackend::TensorRt | OrtBackend::DirectMl
     );
     let threads = options.threads.max(1);
     let workers = if options.workers > 0 {
@@ -136,27 +137,27 @@ fn plan(
     })
 }
 
-fn preferred_backend(options: &IndraOptions) -> (IndraBackend, Option<String>) {
+fn preferred_backend(options: &OcrOptions) -> (OrtBackend, Option<String>) {
     if options.cpu_arena {
         if CUDAExecutionProvider::default()
             .is_available()
             .unwrap_or(false)
         {
-            return (IndraBackend::Cuda, options.device.clone());
+            return (OrtBackend::Cuda, options.device.clone());
         }
         if DirectMLExecutionProvider::default()
             .is_available()
             .unwrap_or(false)
         {
             if let Some(device) = &options.device {
-                return (IndraBackend::DirectMl, Some(device.clone()));
+                return (OrtBackend::DirectMl, Some(device.clone()));
             }
             if let Some(device) = preferred_dml_adapter() {
-                return (IndraBackend::DirectMl, Some(device.to_string()));
+                return (OrtBackend::DirectMl, Some(device.to_string()));
             }
         }
     }
-    (IndraBackend::Cpu, options.device.clone())
+    (OrtBackend::Cpu, options.device.clone())
 }
 
 #[cfg(target_os = "windows")]

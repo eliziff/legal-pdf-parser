@@ -6,36 +6,20 @@ use ort::execution_providers::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Named as `name` writes it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OrtBackend {
     #[default]
-    #[serde(rename = "cpu")]
     Cpu,
-    #[serde(rename = "cuda")]
     Cuda,
-    #[serde(rename = "tensorrt")]
     TensorRt,
-    #[serde(rename = "directml")]
     DirectMl,
-    #[serde(rename = "openvino")]
     OpenVino,
-    #[serde(rename = "onednn")]
     OneDnn,
 }
 
 impl OrtBackend {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "cpu" => Some(Self::Cpu),
-            "cuda" => Some(Self::Cuda),
-            "tensorrt" => Some(Self::TensorRt),
-            "directml" => Some(Self::DirectMl),
-            "openvino" => Some(Self::OpenVino),
-            "onednn" => Some(Self::OneDnn),
-            _ => None,
-        }
-    }
-
     pub fn name(self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
