@@ -94,7 +94,13 @@ fn gray_render(pixmap: &Pixmap) -> GrayRender {
     (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(pixmap))
 }
 
-/// A render's pixels in 8-bit grey: what every reader of a page's image reads.
+/// A render's pixels in the recognizer's grey, the mean of red, green and blue, as its lines were
+/// read in training.
+pub(crate) fn ink_of(pixmap: &Pixmap) -> Vec<u8> {
+    pixmap.data_as_u8_slice().chunks_exact(4).map(|pixel| ((u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2]) + 1) / 3) as u8).collect()
+}
+
+/// A render's pixels in 8-bit grey: what the line detector, the separator and the raster measures read.
 pub(crate) fn gray_of(pixmap: &Pixmap) -> Vec<u8> {
     pixmap
         .data_as_u8_slice()

@@ -1,6 +1,6 @@
-//! Indra, the recognizer: a PDF's pages or grey images read into lines and words. Pages are drawn,
-//! stood upright and turned grey once; the line detector, line preparation, the separator and the
-//! region checks all read that grey image.
+//! Indra, the recognizer: a PDF's pages or grey images read into lines and words. Pages are drawn
+//! once and stood upright; the line detector, the separator and the region checks read the page in
+//! luma grey, and lines are cut for reading from it in the recognizer's own grey (`ink_of`).
 use crate::line_detector::LineDetector;
 use crate::model_pack::ModelPack;
 use crate::orientation::{place_back, turn, Orientation};
@@ -341,7 +341,7 @@ impl OcrProvider {
             let (sender, receiver) = sync_channel(1);
             scope.spawn(move || {
                 for window in images.chunks(window_size) {
-                    let value = prepare_window(layouts, window);
+                    let value = prepare_window(layouts, window, window);
                     let failed = value.is_err();
                     if sender.send(value).is_err() || failed {
                         break;
@@ -417,9 +417,14 @@ impl OcrProvider {
             });
             scope.spawn(move || {
                 for window in render_receiver {
-                    let value = window.and_then(|pages: Vec<(Placement, GrayImage)>| {
-                        let (placements, images): (Vec<_>, Vec<_>) = pages.into_iter().unzip();
-                        let mut prepared = prepare_window(layouts, &images)?;
+                    let value = window.and_then(|pages: Vec<(Placement, GrayImage, GrayImage)>| {
+                        let (mut placements, mut seen, mut ink) = (Vec::new(), Vec::new(), Vec::new());
+                        for (placement, page, read) in pages {
+                            placements.push(placement);
+                            seen.push(page);
+                            ink.push(read);
+                        }
+                        let mut prepared = prepare_window(layouts, &seen, &ink)?;
                         for (placement, lines) in placements.iter().zip(&mut prepared) {
                             if confidence_pages.contains(&placement.page_index) {
                                 lines.iter_mut().for_each(|line| line.confidence_required = true);
@@ -466,10 +471,11 @@ fn place_pages(
     Ok(())
 }
 
-/// A window's images' lines found and prepared for reading.
-fn prepare_window(layouts: &mut [LineDetector], images: &[GrayImage]) -> Result<Vec<Vec<PreparedLine>>> {
-    let boxes = measure("ocr.layout", || layout_boxes(layouts, images))?;
-    measure("ocr.prepare_lines", || prepare_pages(images, &boxes))
+/// A window's images' lines found on `seen` and cut for reading from `ink`, the same page in the
+/// recognizer's own grey.
+fn prepare_window(layouts: &mut [LineDetector], seen: &[GrayImage], ink: &[GrayImage]) -> Result<Vec<Vec<PreparedLine>>> {
+    let boxes = measure("ocr.layout", || layout_boxes(layouts, seen))?;
+    measure("ocr.prepare_lines", || prepare_pages(ink, &boxes))
 }
 
 /// Pages' prepared lines read, each kept where it reads as text: a line the page analysis left
@@ -720,7 +726,7 @@ fn render_pdf_pages(
     pages: &PageRenderer,
     requests: &[OcrPageRequest],
     orientation: Option<&Mutex<&mut Orientation>>,
-) -> Result<Vec<(Placement, GrayImage)>> {
+) -> Result<Vec<(Placement, GrayImage, GrayImage)>> {
     // White margin around a part of a page, so the layout reads its first and last lines whole.
     const MARGIN: usize = 16;
     let mut rendered = Vec::new();
@@ -731,6 +737,8 @@ fn render_pdf_pages(
         let (width, height) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
         let scale = [request.width / width as f64, request.height / height as f64];
         let gray = GrayImage::from_raw(width as u32, height as u32, crate::ocr::gray_of(&pixmap))
+            .expect("renderer dimensions match its pixel buffer");
+        let ink = GrayImage::from_raw(width as u32, height as u32, crate::ocr::ink_of(&pixmap))
             .expect("renderer dimensions match its pixel buffer");
         if request.regions.is_empty() {
             let turns = match orientation {
@@ -743,9 +751,9 @@ fn render_pdf_pages(
             };
             // A turned page's rule runs across its print, not across the page as drawn.
             let separator = (turns == 0).then(|| crate::separator::separator_y(gray.as_raw(), width, height, request.height)).flatten();
-            let image = if turns == 0 { gray } else { turn(&gray, turns) };
+            let (image, ink) = if turns == 0 { (gray, ink) } else { (turn(&gray, turns), turn(&ink, turns)) };
             let drawn = [width as f64, height as f64];
-            rendered.push((Placement { page_index: request.page_index, separator, scale, origin: [0.0, 0.0], turns, drawn }, image));
+            rendered.push((Placement { page_index: request.page_index, separator, scale, origin: [0.0, 0.0], turns, drawn }, image, ink));
             continue;
         }
         // Each part of the page is recognized on its own, at the page's resolution.
@@ -757,11 +765,14 @@ fn render_pdf_pages(
             if x1 <= x0 || y1 <= y0 || !dark_print_on_light_ground(&gray, [x0, y0, x1, y1]) {
                 continue;
             }
-            let mut crop = GrayImage::from_pixel((x1 - x0 + 2 * MARGIN) as u32, (y1 - y0 + 2 * MARGIN) as u32, Luma([255]));
-            let part = imageops::crop_imm(&gray, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32).to_image();
-            imageops::replace(&mut crop, &part, MARGIN as i64, MARGIN as i64);
+            let framed = |image: &GrayImage| {
+                let mut crop = GrayImage::from_pixel((x1 - x0 + 2 * MARGIN) as u32, (y1 - y0 + 2 * MARGIN) as u32, Luma([255]));
+                let part = imageops::crop_imm(image, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32).to_image();
+                imageops::replace(&mut crop, &part, MARGIN as i64, MARGIN as i64);
+                crop
+            };
             let origin = [(x0 as f64 - MARGIN as f64) * scale[0], (y0 as f64 - MARGIN as f64) * scale[1]];
-            rendered.push((Placement { page_index: request.page_index, separator: None, scale, origin, turns: 0, drawn: [0.0, 0.0] }, crop));
+            rendered.push((Placement { page_index: request.page_index, separator: None, scale, origin, turns: 0, drawn: [0.0, 0.0] }, framed(&gray), framed(&ink)));
         }
     }
     Ok(rendered)

@@ -30,9 +30,9 @@ const TWO_COLUMN_Y_DELTA_RATIO: f64 = 0.012;
 const VERTICAL_CROSS_X_PAD_RATIO: f64 = 0.01;
 
 /// Horizontal rules, as `(x0, x1, top, bottom)` pixels, all inclusive: runs of dark pixels (gaps of
-/// two bridged) at least `min_length` long, with light rows three pixels above and below across
-/// most of the run, a run in the row just under one already read joining it as the same rule,
-/// thicker; at most `max_rows` rows thick.
+/// two bridged) at least `min_length` long, a run in the row just under one already read joining it
+/// as the same rule, thicker; at most `max_rows` rows thick, with light rows three pixels above its
+/// top and below its bottom across most of it.
 pub(crate) fn horizontal_rules(
     dark: impl Fn(usize, usize) -> bool,
     width: usize,
@@ -42,7 +42,10 @@ pub(crate) fn horizontal_rules(
 ) -> Vec<(usize, usize, usize, usize)> {
     let light_share = |y: usize, a: usize, b: usize| (a..b).filter(|&x| !dark(x, y)).count() * 10 >= (b - a) * 7;
     let mut rules: Vec<(usize, usize, usize, usize)> = Vec::new();
-    for y in 3..height.saturating_sub(3) {
+    // The rules reaching the row above, which a run in this row may carry on.
+    let mut open: Vec<usize> = Vec::new();
+    for y in 0..height {
+        let mut reaching = Vec::new();
         let mut x = 0;
         while x < width {
             if !dark(x, y) {
@@ -61,18 +64,28 @@ pub(crate) fn horizontal_rules(
                 }
                 x += 1;
             }
-            if end + 1 - start >= min_length && light_share(y - 3, start, end + 1) && light_share(y + 3, start, end + 1) {
-                if let Some(last) = rules.iter_mut().rev().take(64).find(|s| s.3 + 1 == y && s.0 < end && start < s.1) {
-                    last.0 = last.0.min(start);
-                    last.1 = last.1.max(end);
-                    last.3 = y;
-                } else {
+            if end + 1 - start >= min_length {
+                let carried = open.iter().copied().find(|&at| rules[at].0 < end && start < rules[at].1);
+                let at = carried.unwrap_or_else(|| {
                     rules.push((start, end, y, y));
+                    rules.len() - 1
+                });
+                let rule = &mut rules[at];
+                (rule.0, rule.1, rule.3) = (rule.0.min(start), rule.1.max(end), y);
+                if !reaching.contains(&at) {
+                    reaching.push(at);
                 }
             }
         }
+        open = reaching;
     }
-    rules.retain(|rule| rule.3 - rule.2 < max_rows);
+    rules.retain(|rule| {
+        rule.3 - rule.2 < max_rows
+            && rule.2 >= 3
+            && rule.3 + 3 < height
+            && light_share(rule.2 - 3, rule.0, rule.1 + 1)
+            && light_share(rule.3 + 3, rule.0, rule.1 + 1)
+    });
     rules
 }
 
