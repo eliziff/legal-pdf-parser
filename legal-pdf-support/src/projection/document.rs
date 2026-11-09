@@ -24,11 +24,20 @@ pub struct PdfSummary {
     /// How far each page's text is to be trusted, from 0 to 1, by page index.
     #[serde(default)]
     pub page_text_quality: Vec<f64>,
-    pub status: String,
+    pub status: PdfStatus,
     pub pages_needing_ocr: Vec<usize>,
     pub ocr_routed_pages: Vec<usize>,
     #[serde(default)]
     pub scanned_pages: Vec<usize>,
+}
+
+/// Whether the parse read the document whole: degraded where it diagnosed anything, a page needing recognition among
+/// them (which pages, `PdfSummary::pages_needing_ocr`).
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PdfStatus {
+    Ready,
+    Degraded,
 }
 
 /// A page node's page (`PdfDocument::page_nodes`): its index.
@@ -58,47 +67,31 @@ pub(crate) fn lookup_payload_sha256(lookup: &PdfStructureLookup) -> String {
     format!("{:x}", writer.0.finalize())
 }
 
-pub(crate) fn summary(
-    sha256: &str,
-    cache_key: &str,
-    page_text_quality: Vec<f64>,
-    status: String,
-    pdf_metadata: PdfExtractionMetadata,
-) -> PdfSummary {
-    PdfSummary {
-        embedded_page_labels: pdf_metadata.embedded_page_labels,
-        sha256: sha256.to_owned(),
-        parser_version: PARSER_VERSION.to_owned(),
-        cache_key: cache_key.to_owned(),
-        page_count: page_text_quality.len(),
-        page_text_quality,
-        status,
-        pages_needing_ocr: pdf_metadata.pages_needing_ocr,
-        ocr_routed_pages: pdf_metadata.ocr_routed_pages,
-        scanned_pages: pdf_metadata.scanned_pages,
-    }
-}
-
 impl PdfDocument {
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         source_sha256: &str,
         cache_key: &str,
-        status: String,
+        status: PdfStatus,
         metadata: PdfExtractionMetadata,
         page_text_quality: Vec<f64>,
         evidence: Arc<Vec<Page>>,
         authority_text_units: Vec<legal_pdf_core::AuthorityTextUnit>,
         structure: DocumentStructure,
     ) -> Self {
-        let summary = summary(source_sha256, cache_key, page_text_quality, status, metadata);
-        Self {
-            evidence,
-            printed: OnceLock::new(),
-            structure,
-            authority_text_units,
-            summary,
-        }
+        let summary = PdfSummary {
+            embedded_page_labels: metadata.embedded_page_labels,
+            sha256: source_sha256.to_owned(),
+            parser_version: PARSER_VERSION.to_owned(),
+            cache_key: cache_key.to_owned(),
+            page_count: page_text_quality.len(),
+            page_text_quality,
+            status,
+            pages_needing_ocr: metadata.pages_needing_ocr,
+            ocr_routed_pages: metadata.ocr_routed_pages,
+            scanned_pages: metadata.scanned_pages,
+        };
+        Self { evidence, printed: OnceLock::new(), structure, authority_text_units, summary }
     }
 
     /// Capture extraction witnesses before structural derivation rewrites lines.

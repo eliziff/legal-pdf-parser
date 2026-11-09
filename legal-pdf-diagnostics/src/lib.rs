@@ -1,8 +1,7 @@
-//! Diagnostics of a parse: text-flow faults, its status, and the checks every page and component
-//! passes.
+//! Diagnostics of a parse: text-flow faults and the checks every page and component passes.
 
 use legal_pdf_constituents as constituents;
-use legal_pdf_core::model::{Diagnostic, Line, Page};
+use legal_pdf_core::model::{Line, Page};
 use legal_pdf_core::{Error, Result};
 use legal_pdf_furniture::printed_label;
 use legal_pdf_structure_model::TRANSITION_ORIGIN;
@@ -19,19 +18,6 @@ pub fn line_family(line: &Line) -> &'static str {
         "heading" => "heading",
         _ => "body",
     }
-}
-
-pub fn status(diagnostics: &[Diagnostic], pages: &[Page]) -> String {
-    let ocr = |diagnostic: &&Diagnostic| diagnostic.code == "OCR_REQUIRED";
-    let ocr_pages: HashSet<Option<usize>> = diagnostics.iter().filter(ocr).map(|diagnostic| diagnostic.page_index).collect();
-    if !pages.is_empty() && ocr_pages.len() == pages.len() {
-        "ocr_required"
-    } else if !diagnostics.is_empty() {
-        "degraded"
-    } else {
-        "ready"
-    }
-    .to_owned()
 }
 
 pub fn validate_page_records(pages: &[Page]) -> Result<HashSet<&str>> {

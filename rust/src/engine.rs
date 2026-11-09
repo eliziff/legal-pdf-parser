@@ -3,9 +3,9 @@ use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, FailureKind, Result
 use legal_pdf_extraction_processor::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
-use legal_pdf_diagnostics::{status, validate_pdf_components};
+use legal_pdf_diagnostics::validate_pdf_components;
 use legal_pdf_structure::{StructureIdentity, StructureOutput};
-use legal_pdf_support::{profile, PdfDocument};
+use legal_pdf_support::{profile, PdfDocument, PdfStatus};
 #[cfg(feature = "ppdoc")]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
 use legal_structure_model::{DetectionProfile, DocumentStructure, ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
@@ -446,7 +446,7 @@ fn derive_document(
     profile::measure("build.validate_document", || {
         validate_pdf_components(&extracted.pages, &derived.structure_graph)
     })?;
-    let document_status = status(&extracted.diagnostics, &extracted.pages);
+    let document_status = if extracted.diagnostics.is_empty() { PdfStatus::Ready } else { PdfStatus::Degraded };
     if let Some(pages) = pages {
         pages.clone_from(&extracted.pages);
     }
