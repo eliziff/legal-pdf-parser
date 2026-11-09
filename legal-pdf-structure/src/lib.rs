@@ -1,6 +1,6 @@
 //! The structure stage's orchestrator: a PDF's extracted pages and lines in, its paragraphs, notes, headings and
 //! structure graph out. Each stage is a crate of its own over the contract (`legal_pdf_structure_model`); this calls
-//! them in order and caches what the first three read:
+//! them in order:
 //!
 //! 0. The pages normalized (`legal_pdf_evidence::normalize`): a transcript's line numbers parted from the lines
 //!    they were read into, a table's rulings cleared from under its words, each line given its slot.
@@ -11,8 +11,6 @@
 //!    the constituent documents (`legal_pdf_constituents`), the reading order, quotations and reading contexts, and each
 //!    line's continuation of the one before.
 //! 3. Numbered (`Runs`): each reading context's numbering runs, read and resolved by the engine.
-//!
-//!    What these stages read is cached by the input pages (`derive`).
 //! 4. Notes (`Notes`): each document's note band and the lanes that take more lines for notes (`legal_pdf_notes`).
 //! 5. Decided (`transition::tier0`): every rule heard on every line (`Decision::hear`), one decision on each line in
 //!    reading order (`settle`), the headings' levels (`Decision::finish`). Paragraph numbers are fixed input.
@@ -30,11 +28,11 @@ use legal_pdf_evidence::{normalize, Evidence};
 use legal_pdf_fences::{decided, Fences};
 use legal_pdf_structure_model::{Runs, Slots};
 pub(crate) use decide::*;
-use legal_pdf_graph::graph;
+use legal_pdf_graph as graph;
 pub use graph::PdfTextIndex;
 use legal_pdf_notes::note_context;
 use note_context::*;
-/// The transition parser's walk over tier 0's reading, and its fitted readers (DOC with `encoder`).
+/// Tier 1 over tier 0's reading: DOC (with `encoder`).
 use legal_pdf_transition as transition;
 use legal_pdf_tier0 as tier0;
 use legal_pdf_emit::Settled;
@@ -46,7 +44,6 @@ use legal_pdf_core::model::{Diagnostic, LineZone, Page, PdfOutlineEntry};
 use legal_structure_model::StructureNode;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::DocumentStructure;
-use std::collections::HashSet;
 
 pub struct StructureOutput {
     /// The authority units, read off the rendered text (`emit`).
@@ -75,7 +72,6 @@ pub fn derive(pages: &mut [Page],
     separators: &[Option<f64>],
     outline: &[PdfOutlineEntry],
     identity: StructureIdentity,
-    cache: Option<&std::path::Path>,
     trace: Option<&std::path::Path>,
 ) -> Result<StructureOutput> {
     use legal_pdf_core::profile::measure;
@@ -87,44 +83,20 @@ pub fn derive(pages: &mut [Page],
     // The document's type, where known (the caller's profile): an instrument numbers its provisions.
     let instrument = identity.profile == Some(legal_structure_model::DetectionProfile::Instrument);
     let (mut slots, normalized) = measure("derive.normalize", || normalize(pages));
-    let cached = cache
-        .and_then(|path| legal_pdf_core::read_gzip_json::<Measured>(path).ok())
-        .filter(|measured| measured.evidence.size.len() == slots.len());
     // Each page's measures and columns, read once for every stage that reads the pages before they are written.
     let geometry = decide::Geometry::of(pages);
-    let Measured { evidence, fences, runs } = match cached {
-        Some(mut measured) => {
-            for (slot, text, words) in &measured.runs.edits {
-                let line = slots.line_mut(pages, *slot);
-                line.text.clone_from(text);
-                line.words.clone_from(words);
-            }
-            measured.evidence.items = normalized.items;
-            measured
-        }
-        None => {
-            let mut evidence = measure("derive.measure", || {
-                legal_pdf_evidence::measure(pages, &slots, normalized, separators, outline, instrument)
-            });
-            let mut fences = measure("derive.fences", || Fences::read(pages, &slots, &evidence, outline, &identity.page_labels));
-            let runs = measure("derive.runs", || legal_pdf_runs::read(pages, &slots, &mut evidence, &mut fences, &geometry))?;
-            let measured = Measured { evidence, fences, runs };
-            if let Some(path) = cache {
-                let _ = legal_pdf_core::write_gzip_json(path, &measured);
-            }
-            measured
-        }
-    };
-    // The output is tier 0's; the transition walk over its reading (the DOC tier where it is given, the scorer's fitting)
-    // runs inside it, once (`tier0::output`).
+    let mut evidence = measure("derive.measure", || {
+        legal_pdf_evidence::measure(pages, &slots, normalized, separators, outline, instrument)
+    });
+    let mut fences = measure("derive.fences", || Fences::read(pages, &slots, &evidence, outline, &identity.page_labels));
+    let runs = measure("derive.runs", || legal_pdf_runs::read(pages, &slots, &mut evidence, &mut fences, &geometry))?;
     measure("derive.machine", || output(pages, &mut slots, &evidence, fences, &runs, &geometry, outline, &identity, trace))
 }
 
-/// The document's structure as the machine reads it, what `derive` gives where the request names `Reader::Machine`.
+/// Tier 0's reading of the document written: its decision (`tier0::decide`), DOC's moves over it where DOC is given
+/// (`transition::over_tier0`), the lines written, the notes paired, the moves made (`tier0::moves_of`, DOC's in their
+/// place where it read them) and emitted as the structure graph (`legal_pdf_emit`).
 #[allow(clippy::too_many_arguments)]
-/// Tier 0's reading of the document written: its decision (`tier0::decide`), the walk over it where DOC or the scorer's
-/// fitting asks (`transition::over_tier0`), the lines written, the notes paired, the moves made (`tier0::moves_of`, DOC's
-/// in their place where it is given) and emitted as the structure graph (`legal_pdf_emit`).
 fn output(pages: &mut [Page],
     slots: &mut Slots,
     evidence: &Evidence,
@@ -140,12 +112,11 @@ fn output(pages: &mut [Page],
     // One line table for both tiers: tier 0 reads it, and the walk measures it for DOC.
     let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, transition::confusions());
     let (mut notes, decision) = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &table, trace.is_some());
-    // The walk over this reading where it is asked for (the DOC tier's, the scorer's fitting), read off the pages as they
-    // came, before this reading writes and orders them.
+    // DOC's reading where it is given, read off the pages as they came, before this reading writes and orders them.
     let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, outline, &identity.source_sha256, &notes, &decision, &table);
     diagnostics.append(&mut notes.diagnostics);
     if let Some(folder) = trace {
-        write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision);
+        write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision, &table.readings, &table.references);
     }
     write_lines(pages, slots, &fences, &decision);
     let blocks = blocks(pages, slots, evidence, &fences, &decision);
@@ -170,6 +141,6 @@ fn output(pages: &mut [Page],
     // as a note keeps this reading's move). DOC reads the same table, so its reading of a marker names one of this
     // reading's.
     let settled = Settled { index: &index, notes, runs };
-    let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &decided, &table, &moves, doc, identity, settled)?;
+    let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &decided, &views, &moves, doc, identity, settled)?;
     Ok(StructureOutput { authority_text_units, diagnostics, structure_graph })
 }

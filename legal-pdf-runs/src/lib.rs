@@ -345,7 +345,7 @@ impl Lines<'_> {
             // a report's paragraph number, never a section's (`Fences::read_margin_numbers`).
             (CandidateObservationV2::ComposedParagraph, fences.margin_number[at].is_some()),
             (CandidateObservationV2::TableOrForm, fences.cell[at] != 0 || matches!(evidence.tag[at], SourceTag::Table | SourceTag::Visual)),
-            (CandidateObservationV2::Quotation, fences.context(slot).quotation != 0),
+            (CandidateObservationV2::Quotation, fences.at(slot.index()).quotation != 0),
             (CandidateObservationV2::ComposedListItem, item),
         ];
         let observations = observations.into_iter().filter(|(_, holds)| *holds).map(|(observation, _)| observation).collect();
@@ -401,7 +401,6 @@ pub fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: 
             evidence.beside[at] = Some(*row);
         }
     }
-    let edits = repaired.iter().map(|(slot, _)| (*slot, slots.line(pages, *slot).text.clone(), slots.line(pages, *slot).words.clone())).collect();
     let evidence: &Evidence = evidence;
     // Each context's lines in reading order, its fenced lines left out.
     let mut by_context: Vec<Vec<Slot>> = vec![Vec::new(); fences.contexts.len()];
@@ -550,6 +549,6 @@ pub fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: 
         }
         fences.confirm_section_heads(pages, slots, evidence, |page, number| spine[page].contains(&number));
     }
-    Ok(Runs { runs, edits, before: repaired })
+    Ok(Runs { runs, before: repaired })
 }
 

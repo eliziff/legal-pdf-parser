@@ -370,14 +370,6 @@ pub fn recognize_pdf(
         reindex_source_lines(pages);
         legal_pdf_core::associate_ocr_markers(pages);
     }
-    // A number standing on a line of its own, read or typeset, joins its paragraph's first line.
-    // Off unless LEGALPDF_MARKER_JOIN=on: the join removes a source line, and the gold's lines are
-    // the extraction's lines, so joined documents lose their gold alignment. The association the
-    // structure stage reads is the lasting form of this.
-    if std::env::var("LEGALPDF_MARKER_JOIN").is_ok_and(|v| v == "on") && legal_pdf_core::merge_marker_lines(pages) > 0 {
-        reindex_source_lines(pages);
-        legal_pdf_core::associate_ocr_markers(pages);
-    }
     let unresolved_pages: Vec<_> = weak_pages.into_iter().collect();
     for &page_index in &unresolved_pages {
         diagnostics.push(Diagnostic::new("OCR_REQUIRED", Some(page_index)));

@@ -20,8 +20,8 @@ fn line_ranges(index: &PdfTextIndex, line_ids: &[String]) -> Vec<ScalarRange> {
 pub fn quotation_nodes(index: &PdfTextIndex, decided: &Decided, origin: &'static str) -> Result<Vec<StructureNode>> {
     let mut quoted = BTreeMap::<&str, Vec<String>>::new();
     for line in &index.lines {
-        if let Some(id) = decided.quotation(&line.line_id) {
-            quoted.entry(id).or_default().push(line.line_id.clone());
+        if let Some(id) = decided.quotation(&line.id) {
+            quoted.entry(id).or_default().push(line.id.clone());
         }
     }
     quoted

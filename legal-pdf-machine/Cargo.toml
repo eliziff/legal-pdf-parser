@@ -8,20 +8,8 @@ description = "The transition machine's types every tier reads: line views, move
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
 legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
-legal-pdf-text = { path = "../legal-pdf-text" }
-legal-pdf-layout = { path = "../legal-pdf-layout" }
-legal-pdf-headings = { path = "../legal-pdf-headings" }
-legal-pdf-tables = { path = "../legal-pdf-tables" }
 legal-structure-model = { workspace = true }
-pdf-inspector = { workspace = true }
 regex = "1.11"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-legal-pdf-notes = { path = "../legal-pdf-notes" }
-legal-pdf-furniture = { path = "../legal-pdf-furniture" }
-legal-pdf-constituents = { path = "../legal-pdf-constituents" }
-legal-pdf-graph = { path = "../legal-pdf-graph" }
-sha2 = "0.10"
 legal-pdf-decide = { path = "../legal-pdf-decide" }
 legal-pdf-evidence = { path = "../legal-pdf-evidence" }
 legal-pdf-fences = { path = "../legal-pdf-fences" }

@@ -6,8 +6,8 @@
 //! on the scale its anchored headings show, then its look's rank among the context's headings.
 
 use super::*;
-use legal_pdf_headings::headings::rules::{ladder_levels, ATTACHMENTS};
-use legal_pdf_headings::headings::bookmarks::{
+use legal_pdf_headings::rules::{ladder_levels, ATTACHMENTS};
+use legal_pdf_headings::bookmarks::{
     classify, generic_title, normalize_title, restack, same_title, validate, Entry, Tier, BACKFILL_MAX_TITLE, MAX_TITLE_LINES,
 };
 

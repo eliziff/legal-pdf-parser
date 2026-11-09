@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 /// A line's place among the document's lines: pages in order, each page's lines in page order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct Slot(pub u32);
 
 impl Slot {

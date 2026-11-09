@@ -46,7 +46,7 @@ impl Fences {
                     if !word_apart {
                         continue;
                     }
-                    let language = self.context(pieces[0]).translation;
+                    let language = self.at(pieces[0].index()).translation;
                     for slot in pieces {
                         self.recontext(slot, |context| context.translation = language);
                     }

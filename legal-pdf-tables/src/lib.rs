@@ -34,7 +34,7 @@ const TOLERANCE: f64 = 2.0;
 
 /// A line of a cell, or the part of it that stands in the cell when the line runs on
 /// across a column into the next cell.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CellPart {
     pub line_id: String,
     /// The part's UTF-16 offsets within its line's text.
@@ -43,7 +43,7 @@ pub struct CellPart {
     bbox: [f64; 4],
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TableCell {
     pub column: usize,
     pub row_span: usize,
@@ -68,14 +68,14 @@ impl TableCell {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TableRow {
     pub header: bool,
     /// The cells whose top-left corner is in this row, by column.
     pub cells: Vec<TableCell>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PdfTable {
     pub rows: Vec<TableRow>,
     page_index: usize,

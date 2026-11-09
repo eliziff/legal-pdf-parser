@@ -9,11 +9,9 @@ description = "The PDF structure stage's orchestrator: each stage's crate called
 legal-pdf-core = { path = "../legal-pdf-core" }
 legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
 legal-pdf-layout = { path = "../legal-pdf-layout" }
-legal-pdf-text = { path = "../legal-pdf-text" }
 legal-pdf-headings = { path = "../legal-pdf-headings" }
 legal-pdf-notes = { path = "../legal-pdf-notes" }
 legal-pdf-graph = { path = "../legal-pdf-graph" }
-legal-pdf-diagnostics = { path = "../legal-pdf-diagnostics" }
 legal-pdf-decide = { path = "../legal-pdf-decide" }
 legal-pdf-evidence = { path = "../legal-pdf-evidence" }
 legal-pdf-fences = { path = "../legal-pdf-fences" }
@@ -23,8 +21,6 @@ legal-pdf-emit = { path = "../legal-pdf-emit" }
 legal-pdf-tier0 = { path = "../legal-pdf-tier0" }
 legal-pdf-transition = { path = "../legal-pdf-transition" }
 legal-structure-model = { workspace = true }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 
 [features]
 # Tier 1's and tier 2's document encoder, and Detect-Order-Construct's stages, run in the engine (legal-pdf-transition).

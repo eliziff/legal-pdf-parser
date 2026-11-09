@@ -27,7 +27,7 @@ pub mod tables;
 use legal_pdf_structure_model::Decided;
 
 /// Why a line goes on with the one before it in reading order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Continuation {
     /// A word hyphenated across, an unfinished sentence going on in lower case, or a bracket closed
     /// (`body_flow_edge`).
@@ -42,7 +42,7 @@ pub enum Continuation {
 }
 
 /// The fences, contexts and reading order, by slot.
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct Fences {
     pub role: Vec<Role>,
     pub rule: Vec<Rule>,
@@ -108,7 +108,7 @@ pub struct Fences {
 impl Fences {
     /// Puts the line in the context `change` makes of its own, the document's contexts holding each once.
     fn recontext(&mut self, slot: Slot, change: impl FnOnce(&mut Context)) {
-        let mut context = self.context(slot);
+        let mut context = self.at(slot.index());
         change(&mut context);
         let known = self.contexts.iter().position(|other| *other == context).unwrap_or_else(|| {
             self.contexts.push(context);
@@ -204,11 +204,6 @@ impl Fences {
         if self.read_quotations(pages, slots) {
             self.read_continuations(pages, slots, evidence);
         }
-    }
-
-    /// The slot's reading context.
-    pub fn context(&self, slot: Slot) -> Context {
-        self.contexts[usize::from(self.ctx[slot.index()])]
     }
 }
 

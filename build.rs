@@ -17,49 +17,33 @@ fn files(path: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// legal-layout's sources are keyed by the names they had as a sibling checkout ("../legal-structure/layout/…"), so the
-/// stage hashes stay what the caches were keyed by; they are read from wherever Cargo has the crate, which
-/// legal-structure-model says through its `links` metadata.
-const LAYOUT_KEY: &str = "../legal-structure/layout";
-const LAYOUT_SOURCES: &str = "DEP_LEGAL_STRUCTURE_MODEL_LAYOUT";
-
+/// legal-layout's sources, wherever Cargo has the crate (legal-structure-model says through its `links` metadata).
 fn layout_sources() -> PathBuf {
-    PathBuf::from(env::var_os(LAYOUT_SOURCES).expect("legal-structure-model publishes legal-layout's sources"))
+    PathBuf::from(env::var_os("DEP_LEGAL_STRUCTURE_MODEL_LAYOUT").expect("legal-structure-model publishes legal-layout's sources"))
 }
 
-/// The file an input names, and back: the key a file is hashed under.
-fn source_of(root: &Path, input: &Path) -> PathBuf {
-    match input.strip_prefix(root.join(LAYOUT_KEY)) {
-        Ok(rest) => layout_sources().join(rest),
-        Err(_) => input.to_owned(),
-    }
-}
-
-fn key_of(root: &Path, file: &Path) -> PathBuf {
-    match env::var_os(LAYOUT_SOURCES).map(PathBuf::from) {
-        Some(layout) => file.strip_prefix(&layout).map_or_else(|_| file.to_owned(), |rest| root.join(LAYOUT_KEY).join(rest)),
-        None => file.to_owned(),
-    }
+/// The name a file is hashed under: its path in this checkout, or in legal-layout's under `legal-layout/`.
+fn key_of(root: &Path, layout: &Path, file: &Path) -> String {
+    let key = match file.strip_prefix(layout) {
+        Ok(rest) => Path::new("legal-layout").join(rest),
+        Err(_) => file.strip_prefix(root).unwrap_or(file).to_owned(),
+    };
+    key.to_string_lossy().replace('\\', "/")
 }
 
 fn fingerprint(root: &Path, inputs: &[PathBuf], features: &[String]) -> String {
+    let layout = layout_sources();
     let mut paths = Vec::new();
     for input in inputs {
-        let source = source_of(root, input);
-        println!("cargo:rerun-if-changed={}", source.display());
+        println!("cargo:rerun-if-changed={}", input.display());
         let mut found = Vec::new();
-        files(&source, &mut found);
-        paths.extend(found.into_iter().map(|file| (key_of(root, &file), file)));
+        files(input, &mut found);
+        paths.extend(found.into_iter().map(|file| (key_of(root, &layout, &file), file)));
     }
     paths.sort();
     paths.dedup();
     let mut digest = Sha256::new();
-    for (key, path) in paths {
-        let relative = key
-            .strip_prefix(root)
-            .unwrap_or(&key)
-            .to_string_lossy()
-            .replace('\\', "/");
+    for (relative, path) in paths {
         digest.update(relative.as_bytes());
         digest.update([0]);
         // A file's line endings are the checkout's, not the code's: a working tree with CRLF and a
@@ -102,7 +86,7 @@ const NOT_EXTRACTION: &[&str] = &["markdown", "tables", "vision", "python.rs"];
 /// The structure stage's crates: its orchestrator and every crate it reads with, so an edit to any of them is a
 /// new structure (and a new reader and document key).
 const STRUCTURE_STAGE: &[&str] = &[
-    "structure", "structure-model", "constituents", "decide", "diagnostics", "emit", "evidence", "fences", "furniture", "graph",
+    "structure", "structure-model", "constituents", "decide", "emit", "evidence", "fences", "furniture", "graph",
     "headings", "layout", "machine", "notes", "runs", "tables", "text", "tier0", "transition",
 ];
 
@@ -148,11 +132,10 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
         "legal-pdf-core/src/lib.rs",
         "legal-pdf-core/src/model.rs",
         "legal-pdf-core/src/ocr_contract.rs",
-        // The pages' types and the measures extraction takes, not the readers' own measures.
-        "../legal-structure/layout/Cargo.toml",
-        "../legal-structure/layout/src/lib.rs",
-        "../legal-structure/layout/src/stats.rs",
     ]);
+    // The pages' types and the measures extraction takes, not the readers' own measures.
+    let layout = layout_sources();
+    extraction.extend(["Cargo.toml", "src/lib.rs", "src/stats.rs"].map(|name| layout.join(name)));
     extraction.extend(inspector_inputs(root, NOT_EXTRACTION));
     extraction.extend(crate_inputs(root, "extraction-processor"));
     let mut recognition = paths(&[
@@ -204,38 +187,6 @@ fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let enabled = |feature: &str| env::var_os(format!("CARGO_FEATURE_{feature}")).is_some();
     let pdf = enabled("PDF");
-    // Fingerprint library build inputs, not CLI tools, documentation or generated outputs.
-    let mut inputs = vec![
-        root.join("Cargo.toml"),
-        root.join("build.rs"),
-        root.join("rust/src/lib.rs"),
-    ];
-    if pdf {
-        inputs.extend(inspector_inputs(&root, &[]));
-        for module in ["contract", "engine", "supplied_ocr"] {
-            inputs.push(root.join(format!("rust/src/{module}.rs")));
-        }
-    }
-    if enabled("INDRA") {
-        inputs.push(root.join("rust/native/gpu_adapter.cpp"));
-    }
-    for (active, name) in [
-        (pdf || enabled("LANGUAGE"), "core"),
-        (pdf, "extraction-processor"),
-        (enabled("LANGUAGE"), "language"),
-        (enabled("OCR"), "ocr"),
-        (pdf, "support"),
-    ] {
-        if !active {
-            continue;
-        }
-        inputs.extend(crate_inputs(&root, name));
-    }
-    if pdf {
-        for name in STRUCTURE_STAGE {
-            inputs.extend(crate_inputs(&root, name));
-        }
-    }
     let mut features: Vec<_> = env::vars_os()
         .filter_map(|(name, _)| {
             name.to_str()?
@@ -244,10 +195,6 @@ fn main() {
         })
         .collect();
     features.sort();
-    println!(
-        "cargo:rustc-env=LEGAL_PDF_ENGINE_SHA256={}",
-        fingerprint(&root, &inputs, &features)
-    );
     if pdf {
         for ((name, active, stage_features), inputs) in [
             ("EXTRACTION", true, vec![]),
@@ -278,18 +225,5 @@ fn main() {
         }
         let raster = if enabled("OCR") { raster_sources(&root) } else { Vec::new() };
         println!("cargo:rustc-env=LEGAL_PDF_RASTER_SHA256={}", fingerprint(&root, &raster, &[]));
-        // Reader implementation inputs; derive_extracted also keys their shared engine service.
-        let mut reader = vec![
-            root.join("legal-pdf-core/src/model.rs"),
-            root.join("legal-pdf-core/src/lib.rs"),
-        ];
-        for name in STRUCTURE_STAGE.iter().chain(&["support"]) {
-            reader.extend(crate_inputs(&root, name));
-        }
-        reader.extend(inspector_inputs(&root, &[]));
-        println!(
-            "cargo:rustc-env=LEGAL_PDF_READER_SHA256={}",
-            fingerprint(&root, &reader, &[])
-        );
     }
 }

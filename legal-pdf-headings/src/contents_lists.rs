@@ -11,7 +11,7 @@
 //! contents throughout. Measured on the structure gold (batches 5-7): contents lines 0.89 / 0.96 /
 //! 0.91 F1, the gold's contents found 97% of the time.
 
-use crate::headings::bookmarks::normalize_title;
+use crate::bookmarks::normalize_title;
 use legal_pdf_structure_model::{PageView, Role, Slot, SourceTag};
 use legal_pdf_core::Line;
 use legal_pdf_core::regex;
@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 /// A locator alone, its value and its place as printed ("12", "xiv", a range "18-43"): "12", "xiv",
 /// "p. 3", "[18] - [43]", "1 to 27".
 fn locator(text: &str) -> Option<(u32, String)> {
-    regex!(r"(?i)^\s*(?:p(?:age|p?\.|ara\.?)?\s*)?\[?(\d{1,4}|[ivxlc]{1,7})\]?(?:\s*(?:[-–]|to)\s*\[?(\d{1,4})\]?)?\s*$")
+    regex!(r"(?i)^\s*(?:p(?:age|p?\.|ara\.?)?\s*)?\[?(\d{1,4}|[ivxlc]{1,7})\]?(?:\s*(?:[-â€“]|to)\s*\[?(\d{1,4})\]?)?\s*$")
         .captures(text)
         .map(|found| (value(&found[1]), place(&found)))
 }
@@ -28,7 +28,7 @@ fn locator(text: &str) -> Option<(u32, String)> {
 /// A locator after a leader at a title's end ("Overview ........ 3"), or after a tab or a wide
 /// space the title is typeset with ("Introduction\u{2003}3"): where the title ends, and the locator.
 fn leader_locator(text: &str) -> Option<(usize, u32, String)> {
-    regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|[\t\u{2002}\u{2003}\u{2007}])\s*(?:p(?:age|p?\.)?\s*)?\[?(\d{1,4}|[ivxlc]{1,6})\]?(?:\s*(?:[-–]|to)\s*\[?(\d{1,4})\]?)?\s*$")
+    regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|[\t\u{2002}\u{2003}\u{2007}])\s*(?:p(?:age|p?\.)?\s*)?\[?(\d{1,4}|[ivxlc]{1,6})\]?(?:\s*(?:[-â€“]|to)\s*\[?(\d{1,4})\]?)?\s*$")
         .captures(text)
         .map(|found| (found.get(0).map_or(text.len(), |all| all.start()), value(&found[1]), place(&found)))
 }
@@ -41,7 +41,7 @@ fn place(found: &regex::Captures) -> String {
 /// A paragraph range alone on its row ("[18] - [43]"): the locator of the title on the row above,
 /// wherever it is set.
 fn paragraph_range(text: &str) -> bool {
-    regex!(r"^\s*\[\d{1,4}\]\s*(?:[-–]|to)\s*\[\d{1,4}\]\s*$").is_match(text)
+    regex!(r"^\s*\[\d{1,4}\]\s*(?:[-â€“]|to)\s*\[\d{1,4}\]\s*$").is_match(text)
 }
 
 /// A page's or a list's own title: the parser's contents titles ("TABLE OF CONTENTS", "TABLE OF
@@ -49,7 +49,7 @@ fn paragraph_range(text: &str) -> bool {
 /// OF EXHIBITS", "I N D E X", "SOMMAIRE").
 pub fn contents_title(text: &str) -> bool {
     legal_pdf_text::text::contents_heading(text)
-        || regex!(r"(?i)^\s*(?:(?:table\s+of\s+)?contents|table\s+des\s+mati[eè]res|index(?:\s+of\s+\w+)?|sommaire|i\s*n\s*d\s*e\s*x)\b").is_match(text)
+        || regex!(r"(?i)^\s*(?:(?:table\s+of\s+)?contents|table\s+des\s+mati[eÃ¨]res|index(?:\s+of\s+\w+)?|sommaire|i\s*n\s*d\s*e\s*x)\b").is_match(text)
 }
 
 /// A word index's letter: "< A >", "- B -"; a heading over its entries, not an entry.
@@ -63,7 +63,7 @@ fn value(token: &str) -> u32 {
 
 /// Mostly a citation, its leader and locator aside: an authority's entry.
 fn citation(text: &str) -> bool {
-    let title = regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})[\s\d,\[\]–-]*$").replace(text.trim(), "");
+    let title = regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})[\s\d,\[\]â€“-]*$").replace(text.trim(), "");
     let citations = legal_structure_model::structure_analysis().citations(&title);
     let cited: usize = citations.iter().map(|found| found.range.len()).sum();
     !citations.is_empty() && cited * 3 >= title.trim().len()
@@ -281,7 +281,7 @@ fn echoed(titles: &[&str], list_slot: usize, recurrences: &HashMap<String, Vec<(
 
 /// One entry of a contents list as the heading outline reads it: its title (the rows it wraps over
 /// joined), the locator it prints, where it starts, and the page it is on.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Entry {
     pub title: String,
     pub locator: Option<String>,
@@ -424,7 +424,7 @@ pub fn read(views: &[PageView], input: &ListInput) -> Lists {
                 let mut since = listed[0];
                 for &r in &listed {
                     let between: Vec<&Row> = rows[since..r].iter().filter(|row| row.locator.is_none() && !row.title.is_empty()).collect();
-                    let wraps = if super::headings::rules::numbered(&rows[r].title) { 0 } else { between.len().min(3) };
+                    let wraps = if crate::rules::numbered(&rows[r].title) { 0 } else { between.len().min(3) };
                     let (apart, wrapped) = between.split_at(between.len() - wraps);
                     for row in apart {
                         lists.entries.push(Entry { title: row.title.clone(), locator: None, left: row.lines[0].bbox[0], page_index: page.index });

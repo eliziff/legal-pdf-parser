@@ -47,20 +47,14 @@ pub const VETO_WORDS: u16 = 1 << 5;
 /// capitals, or not larger with more space under it than over it.
 pub const VETO_TAGGED: u16 = 1 << 6;
 
-/// A line as a decoder fitted on the trace reads it: its text; its opening marker's readings by the
-/// numbering grammar (family, value and dotted prefix), read alone and, where a letter is also a
-/// roman numeral, as the letter after the one before it, and a division word's number ("PART II")
-/// under the word; and its reference marks' values (0 for a note symbol), raised or detached.
+/// A line as a decoder fitted on the trace reads it: its text; its opening marker's readings as the parse reads them
+/// (family, value and dotted prefix: `LineTable::readings`); and its reference marks' values (0 for a note symbol:
+/// `LineTable::references`).
 #[derive(serde::Serialize)]
 struct LineTrace<'a> {
     text: &'a str,
     readings: Vec<(String, u32, Vec<u32>)>,
     references: Vec<u32>,
-}
-
-/// The readings of a line's opening token, and of the number after any word (`marker_readings`).
-fn readings(text: &str) -> Vec<(String, u32, Vec<u32>)> {
-    marker_readings(text, true).into_iter().map(|r| (r.family, r.value, r.prefix)).collect()
 }
 
 #[derive(serde::Serialize)]
@@ -77,8 +71,9 @@ struct Trace<'a> {
     residual: &'a [ResidualRecord],
 }
 
-/// Writes the document's trace into `folder`; a trace that cannot be written is reported on stderr
-/// and the parse goes on.
+/// Writes the document's trace into `folder`, each line's marker readings and reference marks those the parse read
+/// (`readings`, `references`: by place in reading order); a trace that cannot be written is reported on stderr and the
+/// parse goes on.
 #[allow(clippy::too_many_arguments)]
 pub fn write_trace(
     folder: &std::path::Path,
@@ -90,6 +85,8 @@ pub fn write_trace(
     runs: &Runs,
     notes: &Notes,
     decision: &Decision,
+    readings: &[Vec<MarkerReading>],
+    references: &[Vec<(u32, u32, u32)>],
 ) {
     let all = (0..slots.len()).map(|at| Slot(at as u32));
     let trace = Trace {
@@ -98,11 +95,11 @@ pub fn write_trace(
         pages: all.clone().map(|slot| slots.page(slot) as u32).collect(),
         lines: all
             .map(|slot| {
-                let line = slots.line(pages, slot);
+                let place = fences.place[slot.index()] as usize;
                 LineTrace {
-                    text: &line.text,
-                    readings: readings(&line.text),
-                    references: reference_values(line, evidence.size[slot.index()]),
+                    text: &slots.line(pages, slot).text,
+                    readings: readings[place].iter().map(|r| (r.family.clone(), r.value, r.prefix.clone())).collect(),
+                    references: references[place].iter().map(|&(value, ..)| value).collect(),
                 }
             })
             .collect(),

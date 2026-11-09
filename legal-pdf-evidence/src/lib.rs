@@ -9,9 +9,9 @@
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median};
 use legal_pdf_furniture::compact_note_line;
-use legal_pdf_headings::headings::native::{bold_char_share, date_line};
-use legal_pdf_headings::{captions, contents_lists, headings};
-use legal_pdf_notes::notes::{endnote_heading, label_is_raised, label_spans, reference_wrapped_onto, structural_reset_heading};
+use legal_pdf_headings::native::{bold_char_share, date_line};
+use legal_pdf_headings::{self as headings, captions, contents_lists};
+use legal_pdf_notes::{endnote_heading, label_is_raised, label_spans, reference_wrapped_onto, structural_reset_heading};
 use legal_pdf_text::text::{all_caps, party_label, sentence_ended};
 use legal_structure_model::text::{is_note_symbol, label_prefix, normalize_label};
 use regex::Regex;
@@ -213,16 +213,6 @@ pub fn reference_marks(line: &Line, size: f64) -> impl Iterator<Item = (&str, u8
     })
 }
 
-/// The values of a line's reference marks (`reference_marks`, and its detached references), 0 for
-/// a note symbol.
-pub fn reference_values(line: &Line, size: f64) -> Vec<u32> {
-    let value = |text: &str| text.trim().parse().unwrap_or(0);
-    reference_marks(line, size)
-        .map(|(text, _)| value(text))
-        .chain(line.detached_references.iter().map(|reference| value(&reference.selected_text)))
-        .collect()
-}
-
 /// A line's reference marks (`reference_marks`) with where each stands in the line's text: its value
 /// (0 for a note symbol) and its first and past-last UTF-16 code unit. A mark is found by its span's text,
 /// spans read in order along the line; one whose text the line does not hold there is left out. A
@@ -241,7 +231,7 @@ pub fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
         let Some(at) = (cursor..=chars.len().saturating_sub(text.len())).find(|&at| chars[at..at + text.len()] == text[..]) else { continue };
         cursor = at + text.len();
         let trimmed = span.text.trim();
-        if marks.contains(&trimmed) && (span.superscript || reference_marks(line, size).any(|(t, _)| t == trimmed)) {
+        if marks.contains(&trimmed) {
             // A mark set over two spans ("2" then "3" of "23") is one mark.
             match found.last_mut() {
                 Some(last) if last.2 == at as u32 && trimmed.chars().all(|c| c.is_ascii_digit()) && chars[last.1 as usize..last.2 as usize].iter().all(char::is_ascii_digit) => {

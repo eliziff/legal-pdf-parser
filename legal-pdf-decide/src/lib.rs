@@ -12,10 +12,10 @@
 
 use legal_pdf_structure_model::{Member, PageView, Role, Rule, Run, Runs, Slot, Slots};
 use legal_pdf_core::model::{Diagnostic, Line, Page, PdfOutlineEntry};
-use legal_pdf_headings::headings::native::date_line;
-use legal_pdf_headings::headings;
+use legal_pdf_headings::native::date_line;
+use legal_pdf_headings as headings;
 use legal_pdf_layout::layout_labelled;
-use legal_pdf_notes::notes::{
+use legal_pdf_notes::{
     endnote_heading, read_band, separator_tolerance, verified_endnotes, BandLines, BandPage, NoteKind, BAND_CELL, BAND_EXCLUDED, BAND_FURNITURE, BAND_HEADED,
     BAND_LAYOUT, BAND_NOTED, BAND_PARAGRAPH,
 };

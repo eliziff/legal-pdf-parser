@@ -1,18 +1,11 @@
-//! The document's stylesheet, read whole before the parse and again after a first reading: a legal
-//! document is set from a handful of templates (a look, where the line stands, the numbering it
-//! opens on), and what one line of a template is, the template's other lines mostly are. Each template
-//! is measured over all its lines: how many and over how many pages, how far the local scores hold its
-//! lines headings, whether its markers count on, how many of its lines the document's own outline names
-//! (its bookmarks and its printed contents list, each entry found as a line of the page it names,
-//! `levels::anchors`) and at what level, how far it repeats at the pages' edges, how far it stands beside
-//! another line on its row (a marginal note's lane). Templates that may be
-//! headings are ordered among themselves (one above another where its occurrences restart the other's
-//! count and enclose its occurrences, by its look's weight where neither tells), the outline's levels
-//! fixing the templates it names; each line reads its template's level. After a first reading, each
-//! template also carries how its lines were read (`Stylesheet::read_back`): the share made headings and
-//! the level they mostly took, so the second reading decides each line with the document's view of its
-//! template. The regime (paragraph-numbered, sectioned, transcribed) is measured with it, over each
-//! constituent document the first reading opened.
+//! The document's stylesheet, as DOC reads it: a legal document is set from a handful of templates (a look, where the
+//! line stands, the numbering it opens on), and what one line of a template is, the template's other lines mostly are.
+//! Each template is measured over all its lines: how many and over how many pages, whether its markers count on, how
+//! many of its lines the document's bookmarks name (each entry found as a line of the page it names, `anchors`) and at
+//! what level, how far it repeats at the pages' edges, how far it stands beside another line on its row (a marginal
+//! note's lane). The templates the bookmarks name are ordered among themselves (one above another where its occurrences
+//! restart the other's count and enclose its occurrences, by its look's weight where neither tells), the bookmarks'
+//! levels fixing the templates they name.
 
 use super::*;
 
@@ -22,17 +15,24 @@ pub struct Stylesheet {
     pub templates: Vec<TemplateView>,
     /// Each line the outline names: its level there (0 for none).
     pub anchor: Vec<u16>,
-    /// Each line opening a row that reads as a contents list's (a title and the locator it prints, the
-    /// row the lines on one baseline): the title, normalized as titles are matched. A contents list
-    /// holds the lines that have one.
-    pub contents_titles: Vec<Option<String>>,
-    /// Each line's regime: the shares of its document's lines opening on a bracketed number, on a
-    /// section's number, on a transcript's line number, on a speaker's label; its document the whole
-    /// source before a first reading, the constituent that reading opened after it.
-    pub regime: Vec<[f32; 4]>,
-    /// Each line's own four openings.
-    opens: Vec<[bool; 4]>,
 }
+
+/// What the stylesheet measures of a template.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TemplateView {
+    pub lines: f32,
+    pub pages: f32,
+    pub monotone: f32,
+    pub anchored: f32,
+    pub anchor_level: f32,
+    pub level: f32,
+    pub edge: f32,
+    /// The share of its lines set beside another line on their row (a marginal note's lane).
+    pub beside: f32,
+}
+
+/// A template row's width (`Stylesheet::rows`), as DOC's stylesheet stage reads it.
+pub const ROW: usize = 20;
 
 /// A line feature's place among `LINE_FEATURES`.
 pub(crate) fn feature(name: &str) -> usize {
@@ -47,7 +47,7 @@ fn commonest<K: Copy + Ord + Into<f32>>(counts: &HashMap<K, u32>) -> f32 {
 /// Each line's template, numbered from 0 in order of first appearance: its look, where it stands (at
 /// the margin, indented a little or more, centred, set right) and the numbering family its marker
 /// counts in.
-pub fn template_ids(table: &LineTable, measures: &Measures) -> Vec<u32> {
+fn template_ids(table: &LineTable, measures: &Measures) -> Vec<u32> {
     let (indent, centre, width, right) = (feature("indent"), feature("centre"), feature("width"), feature("right_gap"));
     let counts: Vec<usize> = ["count_1", "count_1.1", "count_1.1.1", "count_1.1.1.1", "count_a", "count_A", "count_i", "count_I", "count_bullet"]
         .iter().map(|name| feature(name)).collect();
@@ -62,42 +62,15 @@ pub fn template_ids(table: &LineTable, measures: &Measures) -> Vec<u32> {
     }).collect()
 }
 
-/// Each line opening a row read as a contents list's (`contents_lists::row_of` over the lines one baseline
-/// band holds on its page, in reading order): its title normalized as titles are matched
-/// (`bookmarks::normalize_title`), three characters or more.
-pub fn contents_rows(pages: &[Page], slots: &Slots, fences: &Fences) -> Vec<Option<String>> {
-    use legal_pdf_headings::contents_lists::{row_bands, row_of};
-    let n = fences.order.len();
-    let line = |at: usize| slots.line(pages, fences.order[at]);
-    let mut titles = vec![None; n];
-    let mut k = 0;
-    while k < n {
-        let page = slots.page(fences.order[k]);
-        let end = (k..n).find(|&e| slots.page(fences.order[e]) != page).unwrap_or(n);
-        for band in row_bands(&(k..end).collect::<Vec<usize>>(), |at| line(at).bbox) {
-            let row = row_of(band.iter().map(|&at| line(at)).collect());
-            let title = row.locator.is_some().then(|| legal_pdf_headings::headings::bookmarks::normalize_title(&row.title));
-            if let Some(title) = title.filter(|title| title.chars().count() >= 3) { titles[band[0]] = Some(title); }
-        }
-        k = end;
-    }
-    titles
-}
-
-/// Whether a line may open a unit as the encoder's attention reads the document: it opens on a marker,
-/// or it is short (sixty characters or fewer).
-pub fn opener(table: &LineTable, measures: &Measures, k: usize) -> bool {
-    !table.readings[k].is_empty() || measures.row(k)[feature("length")] <= 0.8222
-}
-
 impl Stylesheet {
-    /// The stylesheet of the lines `table` reads, each line's template `template` (`template_ids`).
-    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &legal_pdf_decide::Geometry, outline: &[PdfOutlineEntry], table: &LineTable, measures: &Measures, template: Vec<u32>, locals: &[Local]) -> Self {
+    /// The stylesheet of the lines `table` reads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &legal_pdf_decide::Geometry, outline: &[PdfOutlineEntry], table: &LineTable, measures: &Measures) -> Self {
+        let template = template_ids(table, measures);
         let n = table.readings.len();
         let (size, bold, upper, edge, beside) = (feature("size"), feature("bold"), feature("upper"), feature("edge_repeated"), feature("beside"));
         let count = template.iter().map(|&t| t as usize + 1).max().unwrap_or(0);
-        // The outline's anchors: the bookmarks and the confirmed contents entries, as lines.
-        // The document's bookmarks alone: its printed contents the parser links itself (`State::answering`).
+        // The document's bookmarks, as lines: its printed contents the decision links itself.
         let anchoring = legal_pdf_decide::anchors(pages, slots, evidence, fences, geometry, &fences.role, outline, &[]);
         let mut anchor = vec![0u16; n];
         for found in &anchoring.anchors {
@@ -105,10 +78,6 @@ impl Stylesheet {
                 anchor[fences.place[slot.index()] as usize] = found.level.max(1);
             }
         }
-        // A line on a row that reads as a contents list's: a title and the locator it prints.
-        let contents_titles = contents_rows(pages, slots, fences);
-        // Each template's measures.
-        let heading_class = usize::from(HEADING) * 2 + 1;
         let mut views = vec![TemplateView::default(); count];
         let mut page_sets: Vec<HashSet<usize>> = vec![HashSet::new(); count];
         let mut anchor_levels: Vec<HashMap<u16, u32>> = vec![HashMap::new(); count];
@@ -120,7 +89,6 @@ impl Stylesheet {
             let row = measures.row(k);
             let view = &mut views[t];
             view.lines += 1.0;
-            view.heading += locals[k].probabilities[heading_class] as f32;
             view.edge += row[edge];
             view.beside += row[beside];
             page_sets[t].insert(slots.page(fences.order[k]));
@@ -139,7 +107,6 @@ impl Stylesheet {
         }
         for (t, view) in views.iter_mut().enumerate() {
             let lines = view.lines.max(1.0);
-            view.heading /= lines;
             view.edge /= lines;
             view.beside /= lines;
             view.anchored /= lines;
@@ -154,71 +121,46 @@ impl Stylesheet {
             view.lines = (1.0 + view.lines).ln();
             view.pages = (1.0 + view.pages).ln();
         }
-        // The regime: what the lines open on.
-        let opens: Vec<[bool; 4]> = (0..n).map(|k| {
-            let at = fences.order[k].index();
-            let first = table.readings[k].first();
-            [
-                first.is_some_and(|r| r.family.contains("[]")),
-                first.is_some_and(|r| r.family.ends_with(":1") && !r.family.contains("[]")),
-                evidence.line_number[at],
-                evidence.words[at] & WORD_SPEAKER != 0,
-            ]
-        }).collect();
-        let mut sheet = Self { template, templates: views, anchor, contents_titles, regime: vec![[0.0; 4]; n], opens };
-        sheet.regimes(&[]);
-        sheet
+        Self { template, templates: views, anchor }
     }
 
-    /// Each line's regime over its document, the documents opening at `starts` (places in reading order).
-    fn regimes(&mut self, starts: &[usize]) {
-        let n = self.opens.len();
-        let mut bounds: Vec<usize> = std::iter::once(0).chain(starts.iter().copied().filter(|&k| k > 0 && k < n)).collect();
-        bounds.push(n);
-        for pair in bounds.windows(2) {
-            let (from, to) = (pair[0], pair[1]);
-            let lines = (to - from).max(1) as f32;
-            let mut shares = [0f32; 4];
-            (from..to).for_each(|k| shares.iter_mut().zip(self.opens[k]).for_each(|(share, open)| *share += f32::from(u8::from(open)) / lines));
-            self.regime[from..to].fill(shares);
-        }
-    }
-
-    /// Each template as a first reading read its lines: the share made headings and their commonest level;
-    /// and each line's regime over the constituent document that reading put it in.
-    pub fn read_back(&mut self, moves: &[Move]) {
-        let starts: Vec<usize> = moves.iter().enumerate().filter(|(_, m)| m.starts).map(|(k, _)| k).collect();
-        self.regimes(&starts);
+    /// Each template's row as DOC's stylesheet stage reads it: its measures, the mean of its lines' look and place, the
+    /// share of them opening on a marker, and where in the document it first stands. Three cells hold what the export
+    /// was fitted on and no reader now gives: the share of its lines the walker's local scores held headings, which
+    /// were uniform over the classes (summed as they were), and how the walker's first reading read it, none.
+    pub fn rows(&self, table: &LineTable, measures: &Measures) -> Vec<[f32; ROW]> {
         let count = self.templates.len();
-        let (mut headings, mut lines) = (vec![0f32; count], vec![0f32; count]);
-        let mut levels: Vec<HashMap<i8, u32>> = vec![HashMap::new(); count];
-        for (k, m) in moves.iter().enumerate() {
+        let at = ["size", "bold", "upper", "centre", "indent", "length", "width"].map(feature);
+        let n = table.readings.len();
+        let uniform = (1.0 / CLASSES as f64) as f32;
+        let (mut sums, mut lines, mut heading, mut first) = (vec![[0f32; 8]; count], vec![0f32; count], vec![0f32; count], vec![None; count]);
+        for k in 0..n {
             let t = self.template[k] as usize;
+            let row = measures.row(k);
+            sums[t].iter_mut().zip(&at).for_each(|(sum, &f)| *sum += row[f]);
+            sums[t][7] += f32::from(u8::from(!table.readings[k].is_empty()));
             lines[t] += 1.0;
-            if m.region == HEADING && m.opens {
-                headings[t] += 1.0;
-                *levels[t].entry(m.level).or_default() += 1;
-            }
+            heading[t] += uniform;
+            first[t].get_or_insert(k);
         }
-        for (t, view) in self.templates.iter_mut().enumerate() {
-            view.read_heading = headings[t] / lines[t].max(1.0);
-            view.read_level = commonest(&levels[t]);
-        }
-    }
-
-    pub fn of(&self, k: usize) -> &TemplateView {
-        &self.templates[self.template[k] as usize]
+        (0..count).map(|t| {
+            let v = &self.templates[t];
+            let mut r = [0f32; ROW];
+            r[..11].copy_from_slice(&[v.lines, v.pages, heading[t] / lines[t].max(1.0), v.monotone, v.anchored, v.anchor_level, v.level, v.edge, v.beside, 0.0, 0.0]);
+            r[11..19].iter_mut().zip(sums[t]).for_each(|(out, sum)| *out = sum / lines[t].max(1.0));
+            r[19] = first[t].map_or(1.0, |k| k as f32 / n.max(1) as f32);
+            r
+        }).collect()
     }
 }
 
-/// The heading levels the templates that may be headings take among themselves (0 for one that may
-/// not): template a stands above b where, after a's occurrences, b's count starts over at one more than
-/// the other way round, and where b's occurrences fall between a's more than a's between b's; where
-/// neither tells, the weightier look stands above. A template the outline names mostly at one level
-/// keeps it, the others ranked around the named ones.
+/// The heading levels the templates the bookmarks name take among themselves (0 for one they do not): template a
+/// stands above b where, after a's occurrences, b's count starts over at one more than the other way round, and where
+/// b's occurrences fall between a's more than a's between b's; where neither tells, the weightier look stands above. A
+/// template the bookmarks name mostly at one level keeps it.
 fn order_templates(template: &[u32], table: &LineTable, views: &[TemplateView], weight: &[f32]) -> Vec<f32> {
     let count = views.len();
-    let candidates: Vec<usize> = (0..count).filter(|&t| views[t].heading >= 0.25 || views[t].anchored >= 0.3).collect();
+    let candidates: Vec<usize> = (0..count).filter(|&t| views[t].anchored >= 0.3).collect();
     if candidates.is_empty() { return vec![0.0; count]; }
     let index: HashMap<usize, usize> = candidates.iter().enumerate().map(|(i, &t)| (t, i)).collect();
     let m = candidates.len();
@@ -264,7 +206,7 @@ fn order_templates(template: &[u32], table: &LineTable, views: &[TemplateView], 
         if score < previous { (level, previous) = (level + 1.0, score); }
         levels[candidates[a]] = level;
     }
-    // The outline's levels stand where it names a template.
-    candidates.iter().filter(|&&t| views[t].anchored >= 0.3 && views[t].anchor_level > 0.0).for_each(|&t| levels[t] = views[t].anchor_level);
+    // The bookmarks' levels stand where they name a template.
+    candidates.iter().filter(|&&t| views[t].anchor_level > 0.0).for_each(|&t| levels[t] = views[t].anchor_level);
     levels
 }

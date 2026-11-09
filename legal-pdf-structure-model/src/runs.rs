@@ -1,11 +1,10 @@
 //! The numbering runs: each reading context's runs of markers, each marker resolved to the unit it opens (`Runs`).
 
 use crate::Slot;
-use legal_pdf_core::model::Word;
 use legal_structure_model::{CandidateGrammar, CandidateObservationV2, ResolutionRuleV2, UnitRole};
 
 /// A place in a line's text: the line's slot and the UTF-16 code units before the place.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct Place {
     pub slot: Slot,
     pub offset: u32,
@@ -15,7 +14,7 @@ pub struct Place {
 /// contexts): its id, its grammar, whether it counts from its first value and without a gap, the
 /// family its first marker counts in (`numbering_marker`; empty where that reads none), and its
 /// members in text order.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Run {
     pub ctx: u16,
     pub id: String,
@@ -34,7 +33,7 @@ pub struct Run {
 /// where its text begins and where the grammar ends it; whether its number counts, the unit it
 /// opens and the rule that says so; what its lines show; whether its text is prose, whether that
 /// text is shaped as a title, and whether it has three words or more (eight letters or more).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Member {
     pub id: String,
     pub label: String,
@@ -61,12 +60,10 @@ pub struct Member {
     pub worded: bool,
 }
 
-/// The document's numbering runs, and the lines whose markers the repair rewrote, with their text and
-/// words as rewritten and their text before.
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+/// The document's numbering runs, and the lines whose markers the repair rewrote, with their text before.
+#[derive(Debug, Default, serde::Serialize)]
 pub struct Runs {
     pub runs: Vec<Run>,
-    pub edits: Vec<(Slot, String, Vec<Word>)>,
     pub before: Vec<(Slot, String)>,
 }
 

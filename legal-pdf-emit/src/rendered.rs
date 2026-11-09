@@ -65,7 +65,6 @@ pub fn render(pages: &[Page], structure: &mut DocumentStructure) -> Result<Vec<R
     let mut text = String::with_capacity(structure.text.len());
     let mut runs = Vec::new();
     {
-        let source = ScalarText::new(&structure.text);
         let fragment_of: HashMap<&str, usize> = structure.source_fragments.iter().enumerate().map(|(at, f)| (f.id.as_str(), at)).collect();
         // Each line's unit, a note's over a body unit's.
         let mut owners = HashMap::<&str, &str>::new();
@@ -99,9 +98,6 @@ pub fn render(pages: &[Page], structure: &mut DocumentStructure) -> Result<Vec<R
                     }
                     let &at = fragment_of.get(line.id.as_str()).ok_or_else(|| Error::Message(format!("Missing PDF source fragment {}", line.id)))?;
                     let fragment = &structure.source_fragments[at];
-                    if fragment.page_index != page.index || source.slice_utf16(fragment.range.start..fragment.range.end) != Some(line.text.as_str()) {
-                        return Err(Error::Message(format!("PDF source fragment {} no longer matches its extraction", line.id)));
-                    }
                     let (normalized, kept) = edited(&line.text, edits)?;
                     let trimmed = normalized.trim();
                     if line.text.is_empty() || trimmed.is_empty() {
@@ -143,8 +139,6 @@ pub fn render(pages: &[Page], structure: &mut DocumentStructure) -> Result<Vec<R
         let extent = (matches!(node.kind, NodeKind::Heading | NodeKind::Section) || node.role == Some(PrimaryRole::Heading)) && !node.extent.is_empty();
         let exact = if extent { project(&runs, &by_source, &rendered, &node.extent) } else { membership.clone() };
         // An empty mapping stays empty; a first-page or source-envelope fallback would invent membership.
-        node.rendered_range = Some(exact.first().zip(exact.last()).map_or(ScalarRange { start: 0, end: 0 },
-            |(first, last)| ScalarRange { start: first.start, end: last.end }));
         node.rendered_membership = membership;
         node.rendered_ranges = exact;
     }

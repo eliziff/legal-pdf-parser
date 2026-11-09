@@ -12,10 +12,10 @@ use legal_pdf_structure_model::{Held, PageView, Paragraphs, Role, Rows, Rule, Sl
 use legal_pdf_constituents as constituents;
 use legal_pdf_core::model::{Diagnostic, Line, Page, PdfOutlineEntry};
 use legal_pdf_furniture::{page_labels_among, Edge};
-use legal_pdf_headings::headings::native::{body_flow_edge, carries_a_sentence_onto, continues_prose_from};
+use legal_pdf_headings::native::{body_flow_edge, carries_a_sentence_onto, continues_prose_from};
 use legal_pdf_headings::contents_lists;
 use legal_pdf_layout::{columns_of, page_order, translation_lines, ColumnModel, Stream, TableReadings};
-use legal_pdf_notes::notes::{
+use legal_pdf_notes::{
     reference_wrapped_onto, separator_beside_tables, separator_tolerance,
 };
 use legal_pdf_text::text::sentence_ended;

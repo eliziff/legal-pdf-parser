@@ -19,7 +19,7 @@ pub use asset::provider_asset_sha256;
 pub use error::{Error, FailureKind, Result};
 pub use authority::{AuthoritySource, AuthorityTextUnit, SourceMapping};
 pub use model::*;
-pub use ocr_markers::{associate_ocr_markers, merge_marker_lines};
+pub use ocr_markers::associate_ocr_markers;
 pub use ocr_contract::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider, RasterReading};
 pub use ort_backend::OrtBackend;
 #[cfg(feature = "ort-runtime")]

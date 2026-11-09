@@ -20,9 +20,9 @@ use legal_pdf_core::model::{Line, LineZone, Page, PdfOutlineEntry};
 use legal_pdf_layout::opens_turn;
 use legal_pdf_decide::{Decision, Geometry, Heard, Notes};
 use legal_pdf_fences::Fences;
-use legal_pdf_graph::graph;
+use legal_pdf_graph as graph;
 use legal_pdf_machine::lines::LineTable;
-use legal_pdf_machine::machine::{LineView, Move, State, CANDIDATE};
+use legal_pdf_machine::machine::{LineView, Move, State};
 use legal_pdf_structure_model::regions::{region_of, CONTENTS, HEADING, MARGINAL_NOTE, NOTE, TEXT, TITLE};
 use legal_pdf_structure_model::{Evidence, Role, Rule, Runs, Slot, Slots};
 use std::collections::{HashMap, HashSet};
@@ -83,21 +83,27 @@ fn candidate(view: &LineView, runs: &Runs, role: Role, kind: Option<UnitRole>, r
     }
 }
 
-/// How far a candidate fits what is open: `State::features`, the features the fitted ranker reads, weighed here.
+/// How far a candidate fits what is open in its context: its marker against the open frame of its family, a note's
+/// number against the marks no note has answered and the last note.
 fn fit(state: &State, view: &LineView, chosen: &Move) -> f32 {
-    let features = state.features(view, chosen);
-    let said = |name: &str| CANDIDATE.iter().position(|known| *known == name).is_some_and(|at| features[at] > 0.0);
-    let step = CANDIDATE.iter().position(|known| *known == "step").map_or(0.0, |at| features[at]);
+    let open = state.open(view, chosen.starts);
     let mut score = 0.0;
-    if said("counts") {
-        score += match (said("found_open"), said("push_from_one")) {
-            (true, _) if step == 1.0 => COUNTS_ON,
-            (false, true) => OPENS_COUNT,
+    if let Some(reading) = view.reading(chosen.reading) {
+        let frames = open.map_or(&[][..], |open| open.frames());
+        score += match frames.iter().rposition(|frame| frame.family == reading.family) {
+            Some(depth) if reading.value == frames[depth].value + 1 => COUNTS_ON,
+            None if reading.value == 1 => OPENS_COUNT,
             _ => BREAKS_COUNT,
         };
     }
-    if said("note_counts") {
-        score += if said("note_answers") { ANSWERS } else if said("note_next") { NEXT_NOTE } else { STRAY_NOTE };
+    if let (true, NOTE, Some(value)) = (chosen.opens, chosen.region, chosen.note) {
+        score += if open.is_some_and(|open| open.unanswered.iter().any(|&(r, ..)| r == value)) {
+            ANSWERS
+        } else if open.and_then(|open| open.note).is_some_and(|last| value == last + 1) {
+            NEXT_NOTE
+        } else {
+            STRAY_NOTE
+        };
     }
     score
 }
@@ -162,7 +168,7 @@ fn settle(fences: &Fences, runs: &Runs, views: &[LineView], decision: &mut Decis
 /// other line stands alone; a body unit's depth is the walk's to read (`emit`). A unit's first line's move carries the
 /// run member the unit opens on, a marker the decision lets open its unit (`opens_units`), and the further markers the
 /// line opens on, a unit each.
-pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, views: &[LineView], decision: &Decision, regions: &[(&Page, &str, Vec<&Line>)], notes: &[StructureNode]) -> Vec<Move> {
+pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, views: &[LineView], decision: &Decision, regions: &[Vec<Slot>], notes: &[StructureNode]) -> Vec<Move> {
     let place = |id: &str| slots.of_id(id).map(|slot| fences.place[slot.index()] as usize);
     let mut moves: Vec<Option<Move>> = vec![None; views.len()];
     // A marker any run gives a unit opens it, where the decision read the line by no run of its own.
@@ -186,8 +192,8 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, views: &[LineView],
     }
     // Each reading context's numbered unit open at its last region's end.
     let mut numbered = HashMap::<u16, (usize, u8)>::new();
-    for (_, _, lines) in regions {
-        let mut places: Vec<usize> = lines.iter().filter_map(|line| place(&line.id)).filter(|&k| moves[k].is_none()).collect();
+    for lines in regions {
+        let mut places: Vec<usize> = lines.iter().map(|slot| fences.place[slot.index()] as usize).filter(|&k| moves[k].is_none()).collect();
         places.sort_unstable();
         let Some(&first) = places.first() else { continue };
         let listed = places.iter().filter(|&&k| {
@@ -246,7 +252,7 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, views: &[LineView],
 pub fn decide(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry, outline: &[PdfOutlineEntry], table: &LineTable, traced: bool) -> (Notes, Decision) {
     let notes = Notes::read(pages, slots, evidence, fences, runs);
     let mut decision = Decision::hear(pages, slots, evidence, fences, runs, &notes, outline, geometry, traced);
-    settle(fences, runs, &LineView::all(pages, slots, evidence, fences, table, None), &mut decision);
+    settle(fences, runs, &LineView::all(slots, evidence, fences, table), &mut decision);
     decision.finish(pages, slots, evidence, fences, runs, geometry);
     (notes, decision)
 }

@@ -11,7 +11,7 @@
 
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use legal_pdf_core::regex;
-use legal_pdf_headings::headings;
+use legal_pdf_headings as headings;
 use legal_pdf_structure_model::{PageView, Slot};
 use legal_pdf_text::text::{arabic_page_number, party_label};
 use legal_pdf_text::text_index::PdfTextIndex;
@@ -24,7 +24,7 @@ const ORIGIN: &str = "legalpdf.pdf-structure.v2";
 /// The grammar of a constituent's section; its kind follows ("constituent_exhibit").
 pub const GRAMMAR: &str = "constituent_";
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Start {
     pub line_id: String,
     kind: String,

@@ -19,7 +19,7 @@
 //! becomes the body's.
 
 use super::*;
-use legal_pdf_notes::notes::lanes::{note_promotions, LaneLines, LANE_BODY, LANE_FURNITURE, LANE_NOTE, LANE_PARAGRAPH};
+use legal_pdf_notes::lanes::{note_promotions, LaneLines, LANE_BODY, LANE_FURNITURE, LANE_NOTE, LANE_PARAGRAPH};
 
 /// A line saying a note runs on across the page: "(Footnote continued…)", "Notes continued".
 fn continued_note(text: &str) -> bool {

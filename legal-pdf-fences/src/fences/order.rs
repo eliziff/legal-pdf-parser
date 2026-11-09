@@ -183,7 +183,7 @@ impl Fences {
         for (&(_, margin, row, twin), _) in found.iter().zip(&kept).filter(|(_, kept)| **kept) {
             self.margin_number[margin.index()] = Some(row);
             self.margin_twin[margin.index()] = twin;
-            let own = self.context(row);
+            let own = self.at(row.index());
             self.recontext(margin, |context| (context.translation, context.document) = (own.translation, own.document));
         }
         if !kept.contains(&true) {

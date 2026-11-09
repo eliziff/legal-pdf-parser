@@ -236,27 +236,20 @@ fn resets(firsts: &[usize], starts: &[bool]) -> Vec<bool> {
 }
 
 /// The parser's stylesheet as the DOC reader reads it: each line's template and outline anchor, and each template's
-/// measured row (`width` a row), the first reading's own measures left out (the reader reads before any).
-pub struct Style {
-    pub templates: Vec<u32>,
-    pub anchors: Vec<u16>,
+/// measured row (`ROW` a row, `Stylesheet::rows`).
+#[cfg(feature = "encoder")]
+pub struct Style<'a> {
+    pub templates: &'a [u32],
+    pub anchors: &'a [u16],
     pub rows: Vec<f32>,
-    pub width: usize,
 }
 
-impl Style {
-    pub fn of(sheet: &Stylesheet, table: &LineTable, measures: &Measures) -> Self {
-        let rows = joint::template_rows(sheet, table, measures);
-        let width = rows.first().map_or(1, |r| r.len());
-        let rows = if rows.is_empty() { vec![0.0; width] } else {
-            rows.iter().flat_map(|r| {
-                let mut row = r.map(|v| if v.is_finite() { v.clamp(-8.0, 8.0) } else { 0.0 });
-                // How the walker's first reading read the template (`read_heading`, `read_level`).
-                (row[9], row[10]) = (0.0, 0.0);
-                row
-            }).collect()
-        };
-        Self { templates: sheet.template.clone(), anchors: sheet.anchor.clone(), rows, width }
+#[cfg(feature = "encoder")]
+impl<'a> Style<'a> {
+    pub fn of(sheet: &'a Stylesheet, table: &LineTable, measures: &Measures) -> Self {
+        let rows = sheet.rows(table, measures);
+        let rows = if rows.is_empty() { vec![0.0; ROW] } else { rows.iter().flatten().map(|&v| if v.is_finite() { v.clamp(-8.0, 8.0) } else { 0.0 }).collect() };
+        Self { templates: &sheet.template, anchors: &sheet.anchor, rows }
     }
 }
 
@@ -384,7 +377,7 @@ pub use model::Reader;
 #[cfg(feature = "encoder")]
 mod model {
     use super::*;
-    use crate::encoder::{session, softmax_rows};
+    use crate::onnx::{init_runtime, session, softmax_rows};
     use ort::session::Session;
     use std::sync::Mutex;
 
@@ -396,7 +389,7 @@ mod model {
         classes: usize,
         mean: Vec<f32>,
         std: Vec<f32>,
-        /// A template row's width (the stylesheet's measures, `joint::template_rows`).
+        /// A template row's width (`Stylesheet::rows`).
         row_width: usize,
         vocabulary: usize,
         unknown: Option<u32>,
@@ -473,7 +466,7 @@ mod model {
             if meta.width != ALL || meta.classes != CLASSES || meta.mean.len() != ALL || meta.std.len() != ALL {
                 return Err(format!("docparse.json reads {} features and {} classes; the parser has {ALL} and {CLASSES}", meta.width, meta.classes));
             }
-            crate::encoder::init_runtime("the DOC reader needs LEGALPDF_ONNX_RUNTIME")?;
+            init_runtime("the DOC reader needs LEGALPDF_ONNX_RUNTIME")?;
             let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
             let embeddings = f32s(&std::fs::read(dir.join("embeddings.f32")).map_err(|e| format!("embeddings.f32: {e}"))?);
             if embeddings.len() != meta.vocabulary * meta.text_dim {
@@ -547,12 +540,12 @@ mod model {
                     "anchors" => tensor!([l], &anchors[start..end]), "t0" => tensor!([l, T0], &t0[start * T0..end * T0])]).map_err(|e| format!("detect: {e}"))?;
                 states[start * d..end * d].copy_from_slice(output!(outputs, "states"));
             }
-            if style.width != m.row_width {
-                return Err(format!("the stylesheet's rows are {} wide; docparse.json says {}", style.width, m.row_width));
+            if ROW != m.row_width {
+                return Err(format!("the stylesheet's rows are {ROW} wide; docparse.json says {}", m.row_width));
             }
             let states = {
                 let outputs = sessions.stylesheet.run(ort::inputs!["states" => tensor!([n, d], &states[..]), "templates" => tensor!([n], &templates[..]),
-                    "rows" => tensor!([style.rows.len() / style.width.max(1), style.width], &style.rows[..])]).map_err(|e| format!("stylesheet: {e}"))?;
+                    "rows" => tensor!([style.rows.len() / ROW, ROW], &style.rows[..])]).map_err(|e| format!("stylesheet: {e}"))?;
                 output!(outputs, "styled").to_vec()
             };
             let mut lines = Lines { roles: vec![0; n], marked: vec![false; n], starts: vec![false; n], links: (0..n).collect() };

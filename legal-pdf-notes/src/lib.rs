@@ -10,4 +10,11 @@
 //! `lines` holds what they see of a single line: a notes heading, a label's typography, a reference wrapped onto the
 //! next line, a reference above a label. Each note's propositions and cross-references are `note_context`'s.
 
+use legal_pdf_text::text::sentence_ended;
+
+pub mod band;
+pub use band::*;
+pub mod lanes;
+pub mod lines;
+pub use lines::*;
 pub mod note_context;

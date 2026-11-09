@@ -1,22 +1,15 @@
 //! The parse's text index: every line's place in the document's text, and the ranges of text
 //! each set of lines covers, in UTF-16 code units.
 
-use crate::line_numbers::line_labels;
 use legal_pdf_core::model::{Line, Page};
-use legal_structure_model::{utf16_len, ScalarRange};
-use std::collections::{HashMap, HashSet};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexedPdfLine {
-    pub page_index: usize,
-    pub line_id: String,
-    pub range: ScalarRange,
-}
+use legal_structure_model::{utf16_len, ScalarRange, SourceFragment};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct PdfTextIndex {
     pub text: String,
-    pub lines: Vec<IndexedPdfLine>,
+    /// Each line's place in the text, in the text's order: the structure's source fragments.
+    pub lines: Vec<SourceFragment>,
     pub line_slots: HashMap<String, usize>,
     pub page_ranges: HashMap<usize, ScalarRange>,
 }
@@ -27,33 +20,20 @@ fn cover(range: ScalarRange, other: ScalarRange) -> ScalarRange {
 }
 
 impl PdfTextIndex {
-    pub fn from_pages(pages: &[Page]) -> Self {
-        let mut ordered_pages = pages.iter().collect::<Vec<_>>();
-        ordered_pages.sort_by_key(|page| page.index);
+    /// The index of pages as the structure stage leaves them: in order, each page's lines in reading order; a line
+    /// joins the one before it on its printed line where it stands `beside` it.
+    pub fn from_pages(pages: &[Page], beside: impl Fn(&Line, &Line) -> bool) -> Self {
         let mut index = Self { text: String::new(), lines: Vec::new(), line_slots: HashMap::new(), page_ranges: HashMap::new() };
         let mut cursor = 0;
-        for page in ordered_pages {
-            let mut ordered_lines = page.lines.iter().collect::<Vec<_>>();
-            ordered_lines.sort_by(|left, right| left.reading_order.cmp(&right.reading_order).then_with(|| left.id.cmp(&right.id)));
+        for page in pages {
             let (mut page_start, mut page_end) = (None, cursor);
             let mut previous: Option<&Line> = None;
-            let line_numbers = line_labels(page).map(|line| line.id.as_str()).collect::<HashSet<_>>();
-            for line in ordered_lines {
+            for line in &page.lines {
                 if !index.lines.is_empty() {
-                    // A number set on a line of its own with its paragraph beside it on the same row
-                    // ("1." then "In this decision ...", a hanging "[35]" read apart from its text) reads
-                    // as one printed line: the grammars see "1. In this decision ...", and the ranges
-                    // still fall on their own source lines. A transcript's line number stays apart.
-                    let beside = previous.is_some_and(|before| {
-                        let label = before.text.trim();
-                        !line_numbers.contains(before.id.as_str())
-                            && crate::paragraphs::same_row(before, line)
-                            && line.bbox[0] >= before.bbox[2] - 1.0
-                            && !label.is_empty()
-                            && (crate::paragraphs::marker_only_re().is_match(&before.text)
-                                || (label.chars().count() <= 7 && !label.contains(' ') && legal_pdf_core::layout_analysis().numbering_marker(label, None).is_some()))
-                    });
-                    index.text.push(if beside { ' ' } else { '\n' });
+                    // A number set on a line of its own with its paragraph beside it on the same row (`beside`: "1." then
+                    // "In this decision ...", a hanging "[35]" read apart from its text) reads as one printed line: the grammars
+                    // see "1. In this decision ...", and the ranges still fall on their own source lines.
+                    index.text.push(if previous.is_some_and(|before| beside(before, line)) { ' ' } else { '\n' });
                     cursor += 1;
                 }
                 previous = Some(line);
@@ -64,7 +44,7 @@ impl PdfTextIndex {
                 page_start.get_or_insert(start);
                 page_end = range.end;
                 index.line_slots.insert(line.id.clone(), index.lines.len());
-                index.lines.push(IndexedPdfLine { page_index: page.index, line_id: line.id.clone(), range });
+                index.lines.push(SourceFragment { id: line.id.clone(), page_index: page.index, range });
             }
             index.page_ranges.insert(page.index, ScalarRange { start: page_start.unwrap_or(cursor), end: page_end });
         }
@@ -75,16 +55,7 @@ impl PdfTextIndex {
         &self.text
     }
 
-    pub fn source_fragments(&self) -> Vec<legal_structure_model::SourceFragment> {
-        let fragment = |line: &IndexedPdfLine| legal_structure_model::SourceFragment {
-            id: line.line_id.clone(),
-            page_index: line.page_index,
-            range: line.range,
-        };
-        self.lines.iter().map(fragment).collect()
-    }
-
-    pub fn line(&self, line_id: &str) -> Option<&IndexedPdfLine> {
+    pub fn line(&self, line_id: &str) -> Option<&SourceFragment> {
         self.line_slots.get(line_id).and_then(|slot| self.lines.get(*slot))
     }
 
@@ -95,7 +66,7 @@ impl PdfTextIndex {
         start.min(end)..end
     }
 
-    pub fn overlapping_lines(&self, range: ScalarRange) -> &[IndexedPdfLine] {
+    pub fn overlapping_lines(&self, range: ScalarRange) -> &[SourceFragment] {
         &self.lines[self.overlapping(range)]
     }
 
@@ -109,7 +80,7 @@ impl PdfTextIndex {
     }
 
     pub fn line_ids(&self, range: ScalarRange) -> Vec<String> {
-        self.overlapping_lines(range).iter().map(|line| line.line_id.clone()).collect()
+        self.overlapping_lines(range).iter().map(|line| line.id.clone()).collect()
     }
 
     pub fn range_for_line_ids<'a>(&self, line_ids: impl IntoIterator<Item = &'a String>) -> Option<ScalarRange> {

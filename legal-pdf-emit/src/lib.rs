@@ -14,7 +14,6 @@ use legal_pdf_constituents as constituents;
 use legal_pdf_core::model::Page;
 use legal_pdf_core::{Error, Result};
 use legal_pdf_fences::Fences;
-use legal_pdf_machine::lines::LineTable;
 use legal_pdf_machine::machine::{stream_of, LineView, Move, Stands, State, Streams, MARGIN, OPENING, RANKED_BODY};
 use legal_pdf_text::joining::{seam, split_words, Join};
 use legal_pdf_structure_model::regions::{HEADING, LINE_LABEL, NOTE, NOTE_QUOTE, PAGE_LABEL, REGIONS, TABLE};
@@ -84,21 +83,19 @@ pub fn structure_graph(pages: &[Page],
     evidence: &Evidence,
     fences: &Fences,
     decided: &Decided,
-    table: &LineTable,
+    views: &[LineView],
     tier0: &[Move],
     doc: Option<Vec<Move>>,
     identity: &StructureIdentity,
     mut settled: Settled,
 ) -> Result<(DocumentStructure, Vec<legal_pdf_core::AuthorityTextUnit>)> {
     let index = settled.index;
-    let views = LineView::all(pages, slots, evidence, fences, table, None);
     let texts: Vec<String> = fences.order.iter().map(|&slot| slots.line(pages, slot).text.clone()).collect();
     let ids: Vec<String> = fences.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
     let text_of = |k: usize| texts[k].clone();
     let id_of = |k: usize| ids[k].clone();
     // Each line's source fragment (UTF-16) and page, what a seam is written in.
-    let source_fragments = index.source_fragments();
-    let fragment: HashMap<&str, (ScalarRange, usize)> = source_fragments.iter().map(|f| (f.id.as_str(), (f.range, f.page_index))).collect();
+    let fragment = |id: &str| index.line(id).map(|f| (f.range, f.page_index));
     let vocabulary = legal_pdf_text::joining::vocabulary(pages);
     let mut edits: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
     let mut joins: Vec<SourceJoin> = Vec::new();
@@ -179,7 +176,7 @@ pub fn structure_graph(pages: &[Page],
         units[u].lines.push(k);
         let written = texts[k].trim();
         if chosen.region != NOTE && !matches!(REGIONS[usize::from(chosen.region)], "furniture" | "page_label" | "line_label") && !written.is_empty() {
-            if let Some(&(range, page)) = fragment.get(ids[k].as_str()) {
+            if let Some((range, page)) = fragment(&ids[k]) {
                 let unit = &mut units[u];
                 if let Some(j) = unit.last {
                     let before = texts[j].trim();
@@ -194,7 +191,7 @@ pub fn structure_graph(pages: &[Page],
                         Join::Keep => " ",
                     };
                     if separator.is_empty() {
-                        joins.push(SourceJoin { from: fragment[ids[j].as_str()].0.start, to: range.start, separator: String::new() });
+                        joins.push(SourceJoin { from: fragment(&ids[j]).expect("a unit's last line is indexed").0.start, to: range.start, separator: String::new() });
                     }
                     if let Some((_, from)) = unit.page_start.filter(|&(held, _)| held != page) {
                         let kind = if unit.region == HEADING { ContinuationKind::Heading } else { ContinuationKind::Paragraph };
@@ -293,7 +290,7 @@ pub fn structure_graph(pages: &[Page],
             .map(|(start, end)| ScalarRange { start, end: end.max(start) })
             .or_else(|| match kind {
                 NodeKind::Footnote => None,
-                NodeKind::Heading => ranges.first().and_then(|first| legal_pdf_graph::graph::heading_marker(first.start, lines[0], lines.len())),
+                NodeKind::Heading => ranges.first().and_then(|first| legal_pdf_graph::heading_marker(first.start, lines[0], lines.len())),
                 _ => marker_range,
             });
         node.label = match (kind, member) {
@@ -378,7 +375,7 @@ pub fn structure_graph(pages: &[Page],
     for note in &settled.notes {
         let mut held: Option<(usize, usize)> = None;
         for id in &note.line_ids {
-            let Some(&(range, page)) = fragment.get(id.as_str()) else { continue };
+            let Some((range, page)) = fragment(id) else { continue };
             if let Some((_, from)) = held.filter(|&(on, _)| on != page) {
                 continuations.push(SourceContinuation { kind: ContinuationKind::Note, from, to: range.start, separator: Some(" ".to_owned()) });
             }
@@ -392,8 +389,8 @@ pub fn structure_graph(pages: &[Page],
         }
     }
     nodes.append(&mut settled.notes);
-    nodes.extend(legal_pdf_graph::graph::table_nodes(index, fences.tables.iter().enumerate(), ORIGIN)?);
-    nodes.extend(legal_pdf_graph::graph::quotation_nodes(index, decided, ORIGIN)?);
+    nodes.extend(legal_pdf_graph::table_nodes(index, fences.tables.iter().enumerate(), ORIGIN)?);
+    nodes.extend(legal_pdf_graph::quotation_nodes(index, decided, ORIGIN)?);
     // Text the parser read as no region's lies outside the body, as the gold leaves it: furniture.
     for (k, chosen) in moves.iter().enumerate() {
         if chosen.region != 0 || texts[k].trim().is_empty() {
@@ -420,8 +417,8 @@ pub fn structure_graph(pages: &[Page],
     structure.nodes = nodes;
     // The outline is tier 0's: each constituent document's and language's own stacks, a quotation within what quotes it.
     let levels: HashMap<&str, usize> = units.iter().filter(|unit| unit.level > 0).flat_map(|unit| unit.lines.iter().map(|&k| (ids[k].as_str(), unit.level))).collect();
-    let contexts = legal_pdf_graph::graph::outline_contexts(&mut structure.nodes, &structure.document_id.clone(), index, decided);
-    legal_pdf_graph::graph::assemble_outline(&mut structure.nodes, &contexts, index.text(), &|id| levels.get(id).copied());
+    let contexts = legal_pdf_graph::outline_contexts(&mut structure.nodes, &structure.document_id.clone(), index, decided);
+    legal_pdf_graph::assemble_outline(&mut structure.nodes, &contexts, index.text(), &|id| levels.get(id).copied());
     // A provision's path from the outermost provision it stands in ("12(1)(a)"), by the parents the outline kept, after
     // its printing's alias where it has one: each unit's printed label along the chain.
     let label_of: HashMap<&str, &str> = units.iter().enumerate().filter_map(|(u, unit)| Some((unit_ids[u].as_str(), unit.label.as_deref()?))).collect();
@@ -438,17 +435,13 @@ pub fn structure_graph(pages: &[Page],
             node.aliases.get_or_insert_with(Vec::new).push(path);
         }
     }
-    // A statute is addressed by its printed labels, each provision under the outermost its label's chain reaches.
-    if identity.profile == Some(legal_structure_model::DetectionProfile::Legislation) {
-        legal_structure_model::legislation_outline(&mut structure.nodes);
-    }
     legal_structure_model::assemble_in_place(&mut structure).map_err(Error::Message)?;
     // A judgment's numbered paragraphs are t0's (`read_judgment_paragraphs`): each of its numbers the unit carrying it,
     // with the extent the reading holds; a number no unit carries a node of its own; a number off its count none. The
     // reading is the fences', all `Decided` reads for it. On a line a model reads as a provision the number is the
     // provision's: a contract's clauses count as paragraphs do, and no paragraph stands over them. Tier 0's rules read
     // the same numbers, and nothing here overrules them.
-    structure.source_fragments = source_fragments;
+    structure.source_fragments = index.lines.clone();
     for (line, written) in edits {
         let held = structure.manuscript_edits.entry(line).or_default();
         for edit in written {
@@ -460,7 +453,7 @@ pub fn structure_graph(pages: &[Page],
     }
     structure.joins.extend(joins);
     structure.continuations = Some(continuations);
-    legal_pdf_graph::graph::read_judgment_paragraphs(&mut structure, pages, decided, &HashSet::new());
+    legal_pdf_graph::read_judgment_paragraphs(&mut structure, pages, decided, &HashSet::new());
     structure.profile = identity.profile;
     let runs = rendered::render(pages, &mut structure)?;
     let units = rendered::authority_units(&structure, &runs);

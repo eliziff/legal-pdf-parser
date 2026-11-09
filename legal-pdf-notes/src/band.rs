@@ -24,7 +24,7 @@
 use super::*;
 use legal_pdf_core::model::{Diagnostic, Line, Page};
 use legal_pdf_core::median;
-use legal_pdf_headings::headings::recognized_page;
+use legal_pdf_headings::recognized_page;
 use legal_pdf_layout::{ColumnKind, 
     aligned_note_body_among, band_geometry_top, columns_of, kept_items, line_center_x, line_width, margin_note_model,
     standalone_note_label, ColumnModel,
@@ -50,7 +50,7 @@ pub const BAND_HEADED: u8 = 1 << 5;
 pub const BAND_LAYOUT: u8 = 1 << 6;
 
 /// A note's kind: at its page's foot, or among the notes collected at a part's or the document's end.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum NoteKind {
     Footnote,
     Endnote,
