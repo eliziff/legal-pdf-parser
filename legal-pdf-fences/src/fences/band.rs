@@ -1,7 +1,36 @@
 //! The note band: under each page's separator, clear of its tables, and what shows a rule is no separator; the body's type.
 use super::*;
+use legal_pdf_notes::has_prior_reference;
+use legal_structure_model::text::{is_note_symbol, label_prefix};
 
 impl Fences {
+    /// A table cannot claim a referenced footer note: a symbol after the table, or the words
+    /// under a physical separator that opens on a referenced label. Free these before deciding
+    /// whether the table crosses the separator, otherwise its mistaken claim hides the band.
+    pub fn free_referenced_note_cells(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) -> bool {
+        let mut freed = Vec::new();
+        for (page_slot, page) in pages.iter().enumerate() {
+            let referenced = slots.on(page_slot).map(Slot).filter_map(|slot| {
+                let line = slots.line(pages, slot);
+                if line.bbox[1] < page.height * 0.48 || !evidence.label[slot.index()].is_some_and(|label| label.suppress == 0) {
+                    return None;
+                }
+                let prefix = label_prefix(&line.text)?;
+                has_prior_reference(&page.lines, &prefix.label, line.bbox[1])
+                    .then(|| (slot, prefix.label.chars().all(is_note_symbol)))
+            }).collect::<Vec<_>>();
+            let tolerance = separator_tolerance(page);
+            let cut = evidence.pages[page_slot].separator.filter(|cut| referenced.iter()
+                .any(|(slot, _)| slots.line(pages, *slot).bbox[1] >= cut - tolerance));
+            freed.extend(slots.on(page_slot).map(Slot).filter(|slot| self.role[slot.index()] == Role::Table
+                && (cut.is_some_and(|cut| slots.line(pages, *slot).bbox[1] >= cut - tolerance)
+                    || referenced.iter().any(|(note, symbol)| *symbol && note == slot)))
+                .map(Slot::index));
+        }
+        for &slot in &freed { self.free_cell(slot); }
+        !freed.is_empty()
+    }
+
     /// The note band: under the page's separator, clear of its tables.
     pub fn read_note_band(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
         for (page_slot, page) in pages.iter().enumerate() {

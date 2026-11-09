@@ -299,7 +299,10 @@ impl Decision {
                 if decision.reading[at].is_none() {
                     deferred.push((slot, Rule::TranscriptLine));
                 }
-            } else if front_matter(pages, slots, evidence, fences, slot) {
+            } else if !previous.is_some_and(|prior| evidence.beside[prior.index()] == Some(slot))
+                && front_matter(pages, slots, evidence, fences, slot) {
+                // A word such as "DEFENDANT" beside its detached "II." belongs to that numbered
+                // unit. It is not a free-standing party label; the residual reads the pair.
                 deferred.push((slot, Rule::FrontMatter));
             }
         }

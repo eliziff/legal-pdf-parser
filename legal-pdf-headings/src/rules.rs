@@ -90,7 +90,7 @@ pub fn numbered(text: &str) -> bool {
     let text = text.trim();
     legal_pdf_text::text::enumerated(text)
         || pattern(&RE, concat!(
-            r"^\s*(?:(?i:part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|partie|chapitre|annexe)\b",
+            r"^\s*(?:(?i:part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|count|partie|chapitre|annexe)\b",
             r"|\(\s*(?:\d{1,3}|[a-zA-Z]{1,2}|[ivxlc]{1,6})\s*\)(?:\s|$)|[IVXLC]{1,4}\s+[A-Z])"
         )).is_match(text)
 }
@@ -100,7 +100,7 @@ pub fn numbered(text: &str) -> bool {
 /// "ARTICLE 5"), the word standing for the punctuation so that each word counts its own family.
 pub fn enumerator(text: &str) -> Option<(String, String)> {
     let text = text.trim();
-    if let Some(found) = regex!(r"(?i)^(part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|partie|chapitre|annexe)\s+[\x22\u{201c}\u{2018}'(]?([IVXLCDM]{1,7}|\d{1,3}|[A-Z])\b").captures(text) {
+    if let Some(found) = regex!(r"(?i)^(part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|count|partie|chapitre|annexe)\s+[\x22\u{201c}\u{2018}'(]?([IVXLCDM]{1,7}|\d{1,3}|[A-Z])\b").captures(text) {
         return Some((found[2].to_owned(), found[1].to_lowercase()));
     }
     if let Some(capture) = legal_pdf_text::text::heading_inline_re().captures(text).or_else(|| legal_pdf_text::text::heading_standalone_re().captures(text)) {

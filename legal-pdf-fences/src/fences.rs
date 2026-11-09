@@ -174,10 +174,11 @@ impl Fences {
         let (tables, in_table, listed) = fences.find_tables(pages, slots, &items);
         let listed_contents = fences.read_contents(pages, slots, evidence, page_labels, &views, &in_table, &listed);
         fences.read_tables(slots, tables, &listed_contents);
+        let mut voided = fences.free_referenced_note_cells(pages, slots, evidence);
         fences.read_note_band(pages, slots, evidence);
         fences.read_body_type(pages, slots, evidence);
         fences.clear_false_bands(pages, slots, evidence);
-        let mut voided = fences.free_noted_cells(pages, slots, evidence);
+        voided |= fences.free_noted_cells(pages, slots, evidence);
         fences.read_documents(&views, outline);
         if !fences.starts.is_empty() {
             fences.read_document_furniture(pages, slots, evidence, &rows);
