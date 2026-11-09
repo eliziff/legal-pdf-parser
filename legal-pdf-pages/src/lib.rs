@@ -906,7 +906,10 @@ fn sequence(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], starts: &[u
         // no sequence forms (too few numbered pages): each folio as read stands
         None => match short_single_anchor(&candidates, total) {
             Some(shift) => (shift, 0..total),
-            None => return,
+            None => match cited_anchor(&candidates, total, starts) {
+                Some(found) => found,
+                None => return,
+            },
         },
     };
     unconfirmed(bindings, range.clone());
@@ -1481,6 +1484,28 @@ fn short_single_anchor(candidates: &[Vec<Candidate>], total: usize) -> Option<i6
     }
     let shift = top.number - (*at as i64 + 1);
     (1 + shift >= 1 && total as i64 + shift <= 99_999).then_some(shift)
+}
+
+/// Where too few pages print a number for a sequence to form, a citation's first page and one folio printed at its
+/// distance agree (the cited first page falls on one of the document's first three pages, at or before the folio): the
+/// document from that first page takes their numbering. Every folio that agrees with a start must give one numbering.
+fn cited_anchor(candidates: &[Vec<Candidate>], total: usize, starts: &[u32]) -> Option<(i64, std::ops::Range<usize>)> {
+    let mut found: Option<(i64, usize)> = None;
+    for (at, page) in candidates.iter().enumerate() {
+        for c in page.iter().filter(|c| c.kind != Kind::Run && sequence_anchor(c)) {
+            let shift = c.number - (at as i64 + 1);
+            for &start in starts {
+                let first = i64::from(start) - shift - 1;
+                if (0..3.min(total as i64)).contains(&first) && first <= at as i64 {
+                    if found.is_some_and(|(prior, _)| prior != shift) {
+                        return None;
+                    }
+                    found = Some((shift, first as usize));
+                }
+            }
+        }
+    }
+    found.map(|(shift, first)| (shift, first..total))
 }
 
 /// Rule 4's anchors: each page printing a citation's first page numbers its run, up to the next anchor, where most of
