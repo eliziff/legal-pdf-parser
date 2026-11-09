@@ -3,7 +3,7 @@ use crate::engine::{parse_pdf, ParseOptions};
 use crate::IndraOptions;
 #[cfg(feature = "ppdoc")]
 use crate::PPDocOptions;
-use crate::{Error, PdfLookupRequest, PdfStructureLookup, Result};
+use crate::{Error, Result};
 #[cfg(feature = "ocr")]
 use crate::OcrOptions;
 pub use legal_pdf_support::{PdfDocument, PdfSummary};
@@ -198,12 +198,8 @@ pub fn derive_pdf_document(bytes: &[u8], request: &PdfRequest) -> Result<PdfDocu
     finish_pdf_document(document, request, &options)
 }
 
-pub fn prepare_pdf_document(bytes: &[u8], request: &PdfRequest) -> Result<PdfSummary> {
-    prepare_pdf_document_reporting(bytes, request, None)
-}
-
-/// Prepares the PDF, reporting recognized pages of the pages to recognize as they finish.
-pub fn prepare_pdf_document_reporting(
+/// Prepares the PDF and caches its reading, reporting recognized pages of the pages to recognize as they finish.
+pub fn prepare_pdf_document(
     bytes: &[u8],
     request: &PdfRequest,
     progress: crate::engine::RecognitionProgress<'_>,
@@ -235,14 +231,4 @@ fn finish_pdf_document(
     }
     structure.url = request.url.clone();
     Ok(document)
-}
-
-pub fn query_pdf_document(document: &PdfDocument,
-    query: &PdfLookupRequest,
-) -> PdfStructureLookup {
-    document.lookup(query)
-}
-
-pub fn pdf_document_summary(document: &PdfDocument) -> &PdfSummary {
-    document.summary()
 }

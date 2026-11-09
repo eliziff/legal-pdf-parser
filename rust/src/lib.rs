@@ -10,9 +10,8 @@ compile_error!("profiling and fast-allocator cannot select two global allocators
 
 #[cfg(feature = "pdf")]
 pub use contract::{
-    derive_pdf_document, pdf_document_summary, prepare_pdf_document,
-    prepare_pdf_document_reporting, query_pdf_document, restore_pdf_document, PdfDocument,
-    PdfRequest, PdfSummary,
+    derive_pdf_document, prepare_pdf_document, restore_pdf_document, PdfDocument, PdfRequest,
+    PdfSummary,
 };
 #[cfg(feature = "pdf")]
 pub use engine::RecognitionProgress;

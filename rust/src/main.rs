@@ -3,7 +3,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use legalpdf::{
-    derive_pdf_document, query_pdf_document, Error, PdfLookupRequest, PdfRequest,
+    derive_pdf_document, Error, PdfLookupRequest, PdfRequest,
     PdfStructureLookup, Result,
 };
 use serde::{Deserialize, Serialize};
@@ -217,11 +217,7 @@ fn pdf_inspector_gate_command(arguments: &[String]) -> Result<i32> {
         }
         let mut pages = Vec::with_capacity(entry.pages);
         for page in 1..=entry.pages {
-            pages.push(query_pdf_document(
-                legal_pdf_core::CHECKOUT_ENGINE,
-                &document,
-                &PdfLookupRequest::new("page", page.to_string()),
-            ));
+            pages.push(document.lookup(&PdfLookupRequest::new("page", page.to_string())));
         }
         let product = PdfInspectorProduct {
             structure: document.structure(),
