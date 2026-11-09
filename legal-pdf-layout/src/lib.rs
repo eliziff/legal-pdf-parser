@@ -31,7 +31,7 @@ pub enum ColumnKind {
 }
 
 /// A page's columns: their kind, where they split, and the lines on either side.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct ColumnModel {
     pub kind: ColumnKind,
     pub split_x: f64,

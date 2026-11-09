@@ -8,7 +8,7 @@ use legal_pdf_tables::PageItems;
 /// A line opening with a note label (`label_prefix`): the label's value (0 for a symbol), where it
 /// ends in the line's text (in characters), its type size, whether it is raised or set smaller
 /// than its line (`label_is_raised`), and why a note band would read it as no label (`SUPPRESS_*`).
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct NoteLabel {
     pub value: u32,
     pub end: u16,
@@ -43,7 +43,7 @@ pub const SUPPRESS_WRAPPED: u8 = 8;
 /// of the page's typical step from row to row (frame rows: where a running head or foot sits
 /// outside the edge bands): its first or last row alone, or a stack of two in the page's fifth at
 /// that edge ("RSA 2000" over "Section 1 | OIL AND GAS CONSERVATION ACT | Chapter O-6").
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Rows {
     pub of: Vec<u32>,
     pub count: u32,
@@ -52,7 +52,7 @@ pub struct Rows {
 
 /// The source's own reading of a line, before anything else reads it: a tagged PDF's heading (its
 /// level, 0 for H) or list item, or a page layout model's label.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub enum SourceTag {
     #[default]
     None,
@@ -133,7 +133,7 @@ impl SourceTag {
 /// A line's opening marker as the numbering grammar reads it (`numbering_marker`): its family (an
 /// index into the families read), its value, the depth of its dotted prefix, where it ends in the
 /// line's text (in bytes), and whether it is all the line holds.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct Marker {
     pub family: u16,
     pub value: u32,
@@ -145,7 +145,7 @@ pub struct Marker {
 /// A citation on a line, as the citation grammar reads the window holding the line: its byte range
 /// in the line's text, and that of the citation itself without its signal and style; a span the
 /// grammar protects (`protected`) is its own citation.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct Cited {
     pub slot: Slot,
     pub range: (u32, u32),
@@ -154,14 +154,14 @@ pub struct Cited {
 }
 
 /// A page's measures: its rows, and the note separator rule the extraction found on it.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct PageEvidence {
     pub rows: Rows,
     pub separator: Option<f64>,
 }
 
 /// Each line's measures by slot, each page's by page slot, and the document's.
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct Evidence {
     pub pages: Vec<PageEvidence>,
     /// Each page's words as text items (`page_items`), a transcript's line numbers left out.
