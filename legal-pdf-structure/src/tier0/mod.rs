@@ -130,7 +130,7 @@ fn settle(fences: &Fences, runs: &Runs, views: &[LineView], decision: &mut Decis
     for view in views {
         let slot = view.slot();
         let at = slot.index();
-        let chosen = if fences.role[at] == Role::Open {
+        let chosen = if decision.free[at] {
             let context = usize::from(fences.ctx[at]);
             let readings: Vec<Heard> = heard[starts[at] as usize..starts[at + 1] as usize].iter().copied()
                 .filter(|reading| !(reading.rule == Rule::Residual && reading.joined && !weighed[context]))
@@ -250,9 +250,12 @@ pub(crate) fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, views: &[Lin
 
 /// The notes and the one decision on each line.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decide(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry, outline: &[PdfOutlineEntry], table: &LineTable, traced: bool) -> (Notes, Decision) {
+pub(crate) fn decide(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &mut Fences, runs: &Runs, geometry: &Geometry, outline: &[PdfOutlineEntry], table: &LineTable, traced: bool) -> (Notes, Decision) {
     let notes = Notes::read(pages, slots, evidence, fences, runs);
-    let mut decision = Decision::hear(pages, slots, evidence, fences, runs, &notes, outline, geometry, traced);
+    // The fences' roles are the decision's to fill from here: a fenced line keeps its own, every other is open to the rules.
+    let fenced = (std::mem::take(&mut fences.role), std::mem::take(&mut fences.rule));
+    let fences = &*fences;
+    let mut decision = Decision::hear(pages, slots, evidence, fences, runs, &notes, outline, geometry, traced, fenced);
     settle(fences, runs, &LineView::all(evidence, fences, table), &mut decision);
     decision.finish(pages, slots, evidence, fences, runs, geometry);
     (notes, decision)

@@ -15,7 +15,7 @@ use legal_pdf_core::model::{Diagnostic, Page, PdfOutlineEntry};
 use crate::constituents;
 use crate::headings::contents_lists;
 use crate::layout::ColumnModel;
-use crate::model::{Context, Decided, Edge, Evidence, PageView, Paragraphs, Role, Rows, Rule, Slot, Slots};
+use crate::model::{Context, Edge, Evidence, PageView, Paragraphs, Role, Rows, Rule, Slot, Slots};
 
 pub(crate) mod band;
 pub(crate) mod columns;
@@ -210,7 +210,4 @@ impl Fences {
     }
 }
 
-/// The decision as the derivation reads it, from the fences (`Decided`).
-pub(crate) fn decided<'a>(pages: &[Page], slots: &'a Slots, fences: &'a Fences) -> Decided<'a> {
-    Decided::of(pages, slots, &fences.order, &fences.ctx, &fences.contexts, &fences.paragraphs.held)
-}
+

@@ -172,7 +172,7 @@ fn insert(parent: &[f32], sibling: &[f32], gaps: &[usize], n: usize, resets: &[b
 pub(crate) fn note_number(line: &LineView, text: &str) -> Option<u32> {
     line.label()
         .or_else(|| line.readings().iter().find(|r| r.family.chars().all(|c| !c.is_alphabetic())).map(|r| r.value))
-        .or_else(|| super::emit::leading_figures(text).map(|(figures, _)| figures))
+        .or_else(|| crate::leading_figures(text).map(|(figures, _)| figures))
         .or_else(|| text.trim_start().starts_with(['*', '\u{2020}', '\u{2021}', '\u{a7}']).then_some(0))
 }
 
@@ -185,24 +185,20 @@ fn moves_of(lines: &Lines, regions: &Regions, units: &Units, views: &[LineView],
     // Each region's unit, its first line: a region going on in an earlier one's unit is in that unit.
     let mut unit: Vec<usize> = Vec::with_capacity(regions.read.len());
     regions.firsts.iter().enumerate().for_each(|(i, &first)| unit.push(units.before[i].filter(|&earlier| earlier < i).map_or(first, |earlier| unit[earlier])));
-    // The unit each stream last read a line of, and the open marker frames per context for disambiguating
-    // Roman vs. alphabetic readings (e.g. `(i)`, `(v)`, `(x)`).
-    let mut last_in_stream: HashMap<usize, usize> = HashMap::new();
+    // The open marker frames per context for disambiguating Roman vs. alphabetic readings (e.g. `(i)`, `(v)`, `(x)`).
     let mut doc_id = 0u16;
     let mut stacks: HashMap<u16, Open> = HashMap::new();
     for (k, &i) in regions.of_lines(lines.roles.len()).iter().enumerate() {
         doc_id = doc_id.saturating_add(u16::from(lines.starts[k]));
         if i == usize::MAX { continue; }
         let region = regions.role(i);
-        let stands = match (unit[i] == k, last_in_stream.insert(stream_of(region), unit[i])) {
-            (true, _) => Stands::Opens,
-            (false, Some(last)) if last == unit[i] => Stands::GoesOn(last),
-            _ => Stands::Resumes(unit[i]),
-        };
         let mv = &mut moves[k];
         mv.region = region;
-        if let Stands::Resumes(first) = stands { (mv.resume, mv.resumes) = (true, Some(first as u32)); }
-        if !matches!(stands, Stands::Opens) { continue; }
+        // A line of a unit opened before it is in that unit, by its first line.
+        if unit[i] != k {
+            mv.resumes = Some(unit[i] as u32);
+            continue;
+        }
         let open = stacks.entry(doc_id.saturating_mul(2) + u16::from(views[k].translation())).or_default();
         open.opens(region);
         // DOC's own pick among several readings: the one that goes on from an open frame (the next number of its family).

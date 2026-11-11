@@ -99,7 +99,7 @@ pub(crate) struct Decision {
     #[serde(skip)]
     pub(crate) hearing: bool,
     #[serde(skip)]
-    free: Vec<bool>,
+    pub(crate) free: Vec<bool>,
     #[serde(skip)]
     pub(crate) heard: Vec<Heard>,
 }
@@ -225,11 +225,13 @@ impl Decision {
         outline: &[PdfOutlineEntry],
         geometry: &Geometry,
         traced: bool,
+        (role, rule): (Vec<Role>, Vec<Rule>),
     ) -> Self {
         let count = slots.len();
+        let free = role.iter().map(|role| *role == Role::Open).collect();
         let mut decision = Self {
-            role: fences.role.clone(),
-            rule: fences.rule.clone(),
+            role,
+            rule,
             reading: readings(runs, count),
             unit: vec![None; count],
             joined: vec![false; count],
@@ -237,7 +239,7 @@ impl Decision {
             level: vec![0; count],
             anchor: vec![0; count],
             hearing: true,
-            free: fences.role.iter().map(|role| *role == Role::Open).collect(),
+            free,
             ..Self::default()
         };
         let text = |slot: Slot| slots.line(pages, slot).text.trim();

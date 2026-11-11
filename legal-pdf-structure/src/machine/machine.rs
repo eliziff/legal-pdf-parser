@@ -3,14 +3,13 @@
 //! (one of its grammar readings) or on a note label; a heading opens at a level. What is open is kept
 //! per reading context (the stack of numbered units, family, value and region: PART II > 12 > (2) >
 //! (a); the last note opened and the reference marks the body set that no note has answered, with the
-//! line that set each). Applying a move moves the state and says what the move made of the line: the reference it
-//! paired.
+//! line that set each). Applying a move moves the state.
 
 use std::collections::HashMap;
 use crate::fences::Fences;
 use crate::machine::lines::LineTable;
 use crate::model::{Evidence, MarkerReading, Slot};
-use crate::model::regions::{LINE_LABEL, NOTE, PAGE_LABEL, QUOTE, TEXT};
+use crate::model::regions::{NOTE, QUOTE, TEXT};
 
 /// Regions whose lines set reference marks notes answer: the body's, and headings' and titles'.
 pub(crate) const REFERRING: [u8; 8] = [1, 2, 3, 4, 8, 9, 14, 16];
@@ -31,12 +30,8 @@ pub(crate) struct Move {
     /// A body unit's depth in its document's body (0 for none): the move's own, not its numbering's,
     /// which is evidence for it.
     pub(crate) depth: u8,
-    /// Goes on with the unit open in its stream before another region's took the stream (a paragraph
-    /// picked up past a block quotation or a page's notes).
-    pub(crate) resume: bool,
-    /// Goes on with the unit whose first line is this place, whichever unit its stream holds open (two units
-    /// read in turn: a form's labels and their values): over `resume`, which goes on with the last unit of its
-    /// region in its stream.
+    /// The unit the line is in, by its first line's place, where the line does not open it: the unit open above it, one
+    /// picked up past a block quotation or a page's notes, or one of two read in turn (a form's labels and their values).
     pub(crate) resumes: Option<u32>,
     /// The line's place in the reading the parse makes, where it reads the page in another order than the
     /// parser's lines (two columns read one after the other, a form's labels with their values).
@@ -57,7 +52,7 @@ pub(crate) struct Move {
 impl Move {
     /// A move making nothing but its region and whether it opens.
     pub(crate) fn plain(region: u8, opens: bool) -> Self {
-        Self { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4], member: None, within: Vec::new() }
+        Self { region, opens, reading: None, note: None, level: 0, depth: 0, resumes: None, rank: None, starts: false, answers: [None; 4], member: None, within: Vec::new() }
     }
 }
 
@@ -126,54 +121,6 @@ pub(crate) struct LineView<'a> {
     pub(crate) evidence: &'a Evidence,
     pub(crate) fences: &'a Fences,
     pub(crate) table: &'a LineTable,
-}
-
-/// How a move stands to the units of its stream.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Stands {
-    /// Opens a unit at its line.
-    Opens,
-    /// Goes on with the unit open in its stream, whose first line this is.
-    GoesOn(usize),
-    /// Takes up another unit, whose first line this is.
-    Resumes(usize),
-}
-
-/// A document's units as the moves make them, each by its first line: the one open in each context's stream, the last
-/// of each region in each stream, which a line may resume, and each one's region.
-#[derive(Default)]
-pub(crate) struct Streams {
-    open: HashMap<(u16, usize), usize>,
-    last_of_region: HashMap<(u16, usize, u8), usize>,
-    regions: HashMap<usize, u8>,
-}
-
-impl Streams {
-    /// How `chosen` stands in the stream `key`. A transcript's line number and a page's label are a line each.
-    pub(crate) fn stands(&self, key: (u16, usize), chosen: &Move) -> Stands {
-        let single = matches!(chosen.region, LINE_LABEL | PAGE_LABEL);
-        match (chosen.resumes, self.open.get(&key)) {
-            (Some(first), _) => Stands::Resumes(first as usize),
-            (_, Some(&first)) if !single && !chosen.opens && self.regions.get(&first) == Some(&chosen.region) => Stands::GoesOn(first),
-            _ if !single && chosen.resume => self.last_of_region.get(&(key.0, key.1, chosen.region)).map_or(Stands::Opens, |&first| Stands::Resumes(first)),
-            _ => Stands::Opens,
-        }
-    }
-
-    /// The stream after the move at `line`.
-    pub(crate) fn step(&mut self, key: (u16, usize), region: u8, stands: Stands, line: usize) {
-        match stands {
-            Stands::Opens => {
-                self.open.insert(key, line);
-                self.last_of_region.insert((key.0, key.1, region), line);
-                self.regions.insert(line, region);
-            }
-            Stands::Resumes(first) => {
-                self.open.insert(key, first);
-            }
-            Stands::GoesOn(_) => {}
-        }
-    }
 }
 
 /// A move's `reading` that counts on the number the margin prints beside the line's row (`LineView::margin`),
@@ -258,14 +205,6 @@ impl<'a> LineView<'a> {
     }
 }
 
-/// What a move made of its line: the earlier line whose reference mark its note answered.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Made {
-    pub(crate) paired: Option<(u32, u32, u32)>,
-    /// The other marks of the note's number it answered too (a note several places in the text cite).
-    pub(crate) also: [Option<(u32, u32, u32)>; 3],
-}
-
 /// The stack after a reading counts: popped to the open frame of its family and replaced, else pushed.
 fn counted(stack: &[Frame], reading: &MarkerReading, region: u8) -> Vec<Frame> {
     let frame = Frame { family: reading.family.clone(), value: reading.value, region };
@@ -310,9 +249,8 @@ impl State {
         .max(1)
     }
 
-    /// The state after `line` makes `chosen`, and what the move made of the line.
-    pub(crate) fn apply(&mut self, line: &LineView, chosen: &Move) -> Made {
-        let mut made = Made::default();
+    /// The state after `line` makes `chosen`.
+    pub(crate) fn apply(&mut self, line: &LineView, chosen: &Move) {
         if chosen.starts {
             self.document += 1;
         }
@@ -329,26 +267,16 @@ impl State {
             stream.note = Some(value);
             if chosen.answers.iter().any(Option::is_some) {
                 // The marks the reading chose, exactly.
-                let mut found = Vec::new();
-                for &(place, start, end) in chosen.answers.iter().flatten().filter(|mark| mark.0 != u32::MAX) {
+                for &(place, start, _) in chosen.answers.iter().flatten().filter(|mark| mark.0 != u32::MAX) {
                     if let Some(at) = stream.unanswered.iter().position(|&(r, line, s, _)| r == value && line == place && s == start) {
                         stream.unanswered.remove(at);
                     }
-                    found.push((place, start, end));
                 }
-                let mut found = found.into_iter();
-                made.paired = found.next();
-                for slot in &mut made.also {
-                    *slot = found.next();
-                }
-            } else if let Some(at) = stream.unanswered.iter().rposition(|&(r, ..)| r == value) {
-                let (_, place, start, end) = stream.unanswered.remove(at);
-                made.paired = Some((place, start, end));
-                // The text's other marks of the number the note answers too, nearest first.
-                for slot in &mut made.also {
+            } else {
+                // The marks of its number the note answers: the nearest the text set, and up to three more.
+                for _ in 0..4 {
                     let Some(at) = stream.unanswered.iter().rposition(|&(r, ..)| r == value) else { break };
-                    let (_, place, start, end) = stream.unanswered.remove(at);
-                    *slot = Some((place, start, end));
+                    stream.unanswered.remove(at);
                 }
             }
         }
@@ -358,6 +286,5 @@ impl State {
             let excess = stream.unanswered.len().saturating_sub(30);
             stream.unanswered.drain(..excess);
         }
-        made
     }
 }

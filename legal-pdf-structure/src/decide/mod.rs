@@ -17,7 +17,6 @@ pub(crate) mod rules;
 pub(crate) use rules::*;
 pub(crate) mod residual;
 pub(crate) mod levels;
-pub(crate) use levels::*;
 pub(crate) mod write;
 pub(crate) use write::*;
 pub(crate) mod trace;

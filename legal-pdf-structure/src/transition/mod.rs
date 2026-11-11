@@ -21,7 +21,6 @@ use crate::fences::Fences;
 use crate::model::{Evidence, Slots};
 use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::OnceLock};
 
-use crate::emit;
 use crate::machine::{lines::*, machine::*};
 use crate::model::regions::*;
 mod stylesheet;
