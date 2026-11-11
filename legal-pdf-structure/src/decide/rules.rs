@@ -283,7 +283,7 @@ impl Decision {
             // An enactment's history after a dash heads its provision.
             let dashed = line.strip_prefix(['\u{2014}', '\u{2013}', '-']).map(str::trim_start);
             if dashed.is_some_and(|rest| {
-                legal_structure_model::structure_analysis().history_note(rest) || cited_share(evidence, slot, slots.line(pages, slot).text.len()) >= 0.8
+                legal_structure::statute::history_note(rest) || cited_share(evidence, slot, slots.line(pages, slot).text.len()) >= 0.8
             }) {
                 decision.fill(slot, Role::Heading, Rule::HistoryHeading);
                 continue;
@@ -601,7 +601,7 @@ impl Decision {
                 let upper = line.chars().filter(|c| c.is_uppercase()).count();
                 // (No reading on it yet, heard or not: a note's count is asked of the document's lines no rule took.)
                 self.role[slot.index()] == Role::Open
-                    && legal_structure_model::structure_analysis().marginal_note_shaped(line)
+                    && legal_structure::statute::marginal_note_shaped(line)
                     && upper * 5 < letters * 4
                     && evidence.words[slot.index()] & WORD_DIVISION == 0
                     && !fences.numbered_row[slot.index()]
@@ -697,7 +697,7 @@ impl Decision {
                 if fences.at(twin.index()).translation != fences.at(slot.index()).translation
                     && evidence.row(slots, twin) == row
                     && self.open(twin)
-                    && legal_structure_model::structure_analysis().marginal_note_shaped(text(twin))
+                    && legal_structure::statute::marginal_note_shaped(text(twin))
                 {
                     self.fill(twin, Role::MarginalNote, Rule::MarginalNote);
                 }
@@ -825,7 +825,7 @@ fn front_matter(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fen
                 .any(|next| evidence.words[next.index()] & (WORD_PARTY | WORD_FIELD | WORD_LABEL) != 0)
     };
     if words & (WORD_LABEL | WORD_PARTY | WORD_JURAT | WORD_DATE | WORD_SIGNATURE | WORD_AUTHOR) != 0
-        || text.strip_suffix(':').is_some_and(|name| legal_structure_model::structure_analysis().signature_line(name))
+        || text.strip_suffix(':').is_some_and(|name| legal_structure::judgment::signature_line(name))
         || joining_colon(text)
         || words & WORD_COURT != 0 && court()
     {

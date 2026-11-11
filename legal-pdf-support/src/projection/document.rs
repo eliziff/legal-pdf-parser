@@ -214,7 +214,7 @@ impl PdfDocument {
     /// Each paragraph number the structure labels, once, with every printing of it, as the structure engine reads
     /// them (`paragraph_printings`): the paragraph a pinpoint to that number addresses.
     fn read_printed_paragraphs(&self) -> Vec<PrintedParagraph> {
-        let mut paragraphs = legal_structure_model::structure_analysis().paragraph_printings(&self.structure);
+        let mut paragraphs = self.structure.paragraph_printings();
         // In the order the text opens them: by the envelope of their printings' text.
         paragraphs.sort_by_cached_key(|(_, printings)| {
             let ranges = printings.iter().flat_map(|&index| self.structure.query_ranges(&self.structure.nodes[index]).into_owned());

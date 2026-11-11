@@ -67,8 +67,7 @@ pub(crate) fn closing(text: &str) -> bool {
 }
 
 fn numbered_start(marker: &str) -> bool {
-    legal_structure_model::structure_analysis()
-        .numbering_marker(marker, None)
+    legal_structure::candidates::numbering_marker(marker, None)
         .is_some_and(|marker| marker.ordinal == 1)
 }
 

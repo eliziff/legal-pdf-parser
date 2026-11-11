@@ -15,7 +15,7 @@
 
 use legal_pdf_core::model::{Line, LineZone, NoteMode, Page};
 use crate::model::regions;
-use legal_pdf_core::{layout_analysis, Error, Result};
+use legal_pdf_core::{Error, Result};
 use crate::fences::{Continuation, Fences};
 use crate::layout::Geometry;
 use crate::model::{Evidence, Role, Slot, Slots, SourceTag};
@@ -56,7 +56,7 @@ fn repair_markers(pages: &mut [Page], fences: &Fences) -> Vec<(Slot, String)> {
             before.push((slot, line.text.clone()));
             view.push((line, zone));
         }
-        legal_structure_model::structure_analysis().repair_label_dropouts(&mut view);
+        legal_structure::numbering_repair::repair_numbering(&mut view);
         for ((line, _), (slot, text)) in view.into_iter().zip(before) {
             if line.text != text {
                 // (A rewritten line's type size is read again with its text.)
@@ -146,7 +146,7 @@ fn bytes_of(text: &str, start: u32, end: u32) -> (u32, u32) {
 /// The family a marker's label counts in and the value it counts, read on its last word
 /// (`numbering_marker`): "PART IV" counts 4.
 fn label_reading(label: &str) -> Option<(String, u32)> {
-    let reading = layout_analysis().numbering_marker(label.split_whitespace().next_back()?, None)?;
+    let reading = legal_structure::candidates::numbering_marker(label.split_whitespace().next_back()?, None)?;
     Some((reading.family, reading.ordinal))
 }
 
@@ -331,7 +331,7 @@ impl Lines<'_> {
         let opening = run.grammar == CandidateGrammar::Hierarchy && candidate.parent_candidate_id.is_none();
         let prose = run.grammar == CandidateGrammar::Enumerator
             && candidate.label.ends_with('.')
-            && (continued || candidate.label == "v." && legal_structure_model::structure_analysis().has_citation_signal(&line.text));
+            && (continued || candidate.label == "v." && legal_structure::analysis::has_citation_signal(&line.text));
         // A list's item as its line reads it: a marker of a list's family (`UnitRole::of_family`:
         // never "[12]", "(2)", "3." or "A.") that is a bullet, or whose text, after it or on the
         // line carrying it, opens in lower case.
@@ -414,7 +414,7 @@ pub(crate) fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, f
     let mut runs = Vec::new();
     for (ctx, lines) in by_context.iter().enumerate().filter(|(_, lines)| !lines.is_empty()) {
         let view = View::of(pages, slots, evidence, lines);
-        let found = legal_pdf_core::profile::measure("candidates.detect", || legal_structure_model::structure_analysis().detect_structure_candidate_runs(&view.text, true));
+        let found = legal_pdf_core::profile::measure("candidates.detect", || legal_structure::detect_structure_candidate_runs(&view.text, true));
         // A provision ladder under one worded top-level marker that goes on with the sentence
         // before it (a witness's "it's at" / "Exhibit F.") is a cross-reference's, no outline: the
         // question numbers under it are the count's, not its subsections. A list's items go on
@@ -462,7 +462,7 @@ pub(crate) fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, f
                 CandidateEvidenceV2 { candidate_id: candidate.id.clone(), page_indexes, line_ids, observations: reading.observations.clone() }
             })
             .collect();
-        let roles = legal_pdf_core::profile::measure("runs.resolve", || legal_structure_model::structure_analysis().resolve_candidates(&found, &candidate_evidence))
+        let roles = legal_pdf_core::profile::measure("runs.resolve", || legal_structure::candidates::resolve_candidates(&found, &candidate_evidence))
             .map_err(|error| Error::Message(error.to_string()))?;
         let role_of: HashMap<&str, &legal_structure_model::CandidateRoleV2> = roles.iter().map(|role| (role.candidate_id.as_str(), role)).collect();
         // A document read in more than one context names each context's candidates apart.

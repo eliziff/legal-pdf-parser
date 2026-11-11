@@ -7,7 +7,7 @@
 //! document's bookmarks, the page labels it declares and whether it is an instrument.
 
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
-use legal_pdf_core::{flag_share, layout_analysis, median};
+use legal_pdf_core::{flag_share, median};
 use crate::furniture::compact_note_line;
 use crate::headings::{self, bold_char_share, captions, contents_lists, date_line};
 use crate::model::{
@@ -200,20 +200,20 @@ fn lexicon(line: &Line) -> u32 {
         (WORD_FIELD, captions::field(&line.text).is_some()),
         (WORD_CLOSING, captions::closing(&line.text)),
         (WORD_REASONS, captions::reasons(line)),
-        (WORD_SIGNATURE, legal_structure_model::structure_analysis().signature_line(text)),
-        (WORD_AUTHOR, legal_structure_model::structure_analysis().author_line(text)),
+        (WORD_SIGNATURE, legal_structure::judgment::signature_line(text)),
+        (WORD_AUTHOR, legal_structure::judgment::author_line(text)),
         (WORD_WITNESS, headings::rules::witness(text)),
         (WORD_EXAMINATION, headings::rules::examination(text)),
         (WORD_TRANSCRIPT_PART, headings::rules::transcript_part(text)),
         (WORD_HEARING_PART, headings::rules::hearing_part(text)),
         (WORD_TURN, headings::rules::turn_or_event(text)),
         (WORD_INDEX_ENTRY, headings::rules::index_entry(text)),
-        (WORD_SPEAKER, legal_structure_model::structure_analysis().speaker_label(text).is_some()),
+        (WORD_SPEAKER, legal_structure::transcript::speaker_label(text).is_some()),
         (WORD_NOTES_HEADING, endnote_heading(text)),
         (WORD_RESET_HEADING, structural_reset_heading(text)),
         (WORD_CONTENTS_TITLE, contents_lists::contents_title(text)),
         (WORD_INDEX_LETTER, contents_lists::index_letter(text)),
-        (WORD_HISTORY, legal_structure_model::structure_analysis().history_note(text)),
+        (WORD_HISTORY, legal_structure::statute::history_note(text)),
         (WORD_DIVISION, division_word(text)),
         (WORD_COURT, court_name(text)),
     ])
@@ -318,18 +318,17 @@ fn closed_up(text: &str) -> std::borrow::Cow<'_, str> {
 /// letter is also a roman numeral, as the letter after the letter before it ("(i)" as 1 and after
 /// "(h)"); and, where `division` says the line opens on a division word, the number after the word.
 pub(crate) fn marker_readings(text: &str, division: bool) -> Vec<MarkerReading> {
-    let grammar = layout_analysis();
     let text = closed_up(text);
     let mut tokens = text.split_whitespace();
     let Some(first) = tokens.next().filter(|token| token.chars().count() <= 12) else { return Vec::new() };
     let read = |token: &str, word: Option<&str>| {
-        let alone = grammar.numbering_marker(token, None);
+        let alone = legal_structure::candidates::numbering_marker(token, None);
         let letter = alone.as_ref().filter(|m| m.family.ends_with(":i") || m.family.ends_with(":I")).and_then(|m| {
             let core = token.trim_matches(|c: char| !c.is_ascii_alphabetic());
             let c = core.chars().next().filter(|_| core.chars().count() == 1)?;
             let family = format!("{}{}", &m.family[..m.family.len() - 1], if c.is_ascii_uppercase() { 'A' } else { 'a' });
             let ordinal = u32::from(c.to_ascii_lowercase()) - u32::from('a');
-            grammar.numbering_marker(token, Some(&legal_structure_model::NumberingMarker { family, ordinal, prefix: Vec::new() }))
+            legal_structure::candidates::numbering_marker(token, Some(&legal_structure_model::NumberingMarker { family, ordinal, prefix: Vec::new() }))
         });
         alone
             .into_iter()
@@ -585,7 +584,7 @@ pub(crate) fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Sl
                     (from < to).then(|| (slot, byte as u32, (from - byte) as u32, (to - byte) as u32))
                 })
         };
-        for citation in legal_structure_model::structure_analysis().citations(&window) {
+        for citation in legal_structure::analysis::citation_spans(&window) {
             for (slot, byte, from, to) in on_lines(citation.range.start, citation.range.end) {
                 let core_from = (citation.core_range.start as u32).saturating_sub(byte).clamp(from, to);
                 let core_to = (citation.core_range.end as u32).saturating_sub(byte).clamp(core_from, to);
@@ -593,7 +592,7 @@ pub(crate) fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Sl
             }
         }
         // The protected spans, in UTF-16 code units: each read back to bytes on its lines.
-        for (start, end) in legal_structure_model::structure_analysis().protected_citation_spans(&window) {
+        for (start, end) in legal_structure::analysis::protected_citation_spans(&window) {
             let first = placed.partition_point(|&(_, _, unit)| unit <= start).saturating_sub(1);
             for at in (first..placed.len()).take_while(|&at| placed[at].2 < end) {
                 let (slot, _, unit) = placed[at];

@@ -207,7 +207,7 @@ fn output(pages: &mut [Page],
     let index = PdfTextIndex::from_pages(pages, |before, line| slots.of_id(&before.id).and_then(|at| evidence.beside[at.index()]).is_some_and(|beside| slots.of_id(&line.id) == Some(beside)));
     let citations = graph::citation_spans(pages, slots, evidence);
     let lines = note_lines(pages, slots, &fences, &notes, &decision, &zones, &blocks, &citations);
-    let pairing = legal_structure_model::structure_analysis().pair_footnotes(&lines, &|at, start, end| index.global_range(lines[at].id, start, end));
+    let pairing = legal_structure::note_pairing::pair_footnotes(&lines, false, &|at, start, end| index.global_range(lines[at].id, start, end));
     let notes = pairing.notes;
     diagnostics.extend(pairing.diagnostics);
     give_back(&mut zones, slots, &notes);

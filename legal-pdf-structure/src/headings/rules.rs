@@ -60,7 +60,7 @@ pub(crate) fn hearing_part(text: &str) -> bool {
 /// ("BY MR. PHILLIPS:"), a speaker's turn ("Q.", "THE WITNESS:"), a recess, an exhibit marked, a
 /// discussion off the record.
 pub(crate) fn turn_or_event(text: &str) -> bool {
-    legal_structure_model::structure_analysis().speaker_label(text).is_some()
+    legal_structure::transcript::speaker_label(text).is_some()
         || regex!(r"(?i)^(?:-{2,}|\(|\[)|^exhibit\s+no\b|off\s+the\s+record|^by\s+(?:mr|ms|mrs|miss|dr|me|madam)\.?\s").is_match(text)
 }
 

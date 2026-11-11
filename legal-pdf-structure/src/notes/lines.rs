@@ -35,7 +35,7 @@ pub(crate) fn structural_reset_heading(text: &str) -> bool {
 pub(crate) fn citation_shaped_candidate(page: &Page, candidate: &(usize, LabelPrefix, bool)) -> bool {
     let line = &page.lines[candidate.0];
     let tail = scalar_suffix(&line.text, candidate.1.end);
-    legal_structure_model::structure_analysis().is_citation_shaped_tail(tail)
+    legal_structure::analysis::is_citation_shaped_tail(tail)
 }
 
 pub(crate) fn longest_label_run(values: &[u32]) -> usize {

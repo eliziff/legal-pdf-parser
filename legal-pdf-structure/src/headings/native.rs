@@ -72,7 +72,7 @@ pub(crate) fn carries_a_sentence_onto(page: &Page, slot: usize, next: usize, bod
         && sentence_ended(following)
         && !following.ends_with('?')
         && runs_the_column(page, line, body)
-        && !legal_structure_model::structure_analysis().has_citation_signal(&format!("{text} {following}"))
+        && !legal_structure::analysis::has_citation_signal(&format!("{text} {following}"))
 }
 
 /// The share of a line's characters its face sets bold.

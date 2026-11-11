@@ -8,6 +8,7 @@ description = "The PDF structure stage: evidence, fences, runs, notes, tier 0's 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
 legal-structure-model = { workspace = true }
+legal-structure = { workspace = true, features = ["structure-inference"] }
 pdf-inspector = { workspace = true }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }

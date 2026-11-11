@@ -31,14 +31,14 @@ impl Fences {
             let stream = (self.at(at).document, self.at(at).translation);
             let text = slots.line(pages, slot).text.as_str();
             if let Some(quotation) = quotations.open_in(stream) {
-                if self.continues[at].is_some() || legal_structure_model::structure_analysis().editorial_line(text) {
+                if self.continues[at].is_some() || legal_structure::numbered_paragraphs::editorial_line(text) {
                     self.recontext(slot, |context| context.quotation = quotation);
                     continue;
                 }
                 quotations.close(stream);
             }
             let quoted = self.paragraphs.count[at].is_none()
-                && legal_structure_model::structure_analysis().printed_paragraph_number(text).is_some_and(|number| own.get(&stream).is_some_and(|numbers| numbers.contains(&(number as u32))));
+                && legal_structure::numbered_paragraphs::paragraph_number(text).is_some_and(|number| own.get(&stream).is_some_and(|numbers| numbers.contains(&(number as u32))));
             if quoted {
                 let quotation = quotations.open(stream);
                 self.recontext(slot, |context| context.quotation = quotation);

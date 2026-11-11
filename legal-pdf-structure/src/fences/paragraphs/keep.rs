@@ -94,7 +94,7 @@ impl Reading<'_> {
     fn text_words(&self, slot: Slot, kept: &[Slot]) -> bool {
         let (fences, pages, slots, evidence) = (self.fences, self.pages, self.slots, self.evidence);
         let (at, line, bbox, size) = (slot.index(), &slots.line(pages, slot).text, slots.line(pages, slot).bbox, slots.line(pages, slot).size);
-        let text = size * 2.0 >= fences.label_size() || size == 0.0 || legal_structure_model::structure_analysis().editorial_line(line)
+        let text = size * 2.0 >= fences.label_size() || size == 0.0 || legal_structure::numbered_paragraphs::editorial_line(line)
     || slots.line(pages, slot).recognized() && (!self.edge_line(slot) || kept.last().is_some_and(|last| !sentence_ended(&slots.line(pages, *last).text)));
         let further_in = bbox[0] - self.measures.column(slots.page(slot), fences.at(at).translation) > QUOTED_INDENT;
         let wordmark = fences.body.is_some_and(|(_, body)| size * 2.0 >= f64::from(body) * 1.6) && (line.trim().chars().count() > 1 || further_in) && line.split_whitespace().count() <= 6;

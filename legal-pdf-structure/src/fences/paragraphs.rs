@@ -55,7 +55,7 @@ struct Reading<'a> {
 impl<'a> Reading<'a> {
     fn new(fences: &'a Fences, pages: &'a [Page], slots: &'a Slots, evidence: &'a Evidence) -> Self {
         // (Each line's printed number, read once.)
-        let printed: Vec<Option<usize>> = (0..slots.len()).map(|at| legal_structure_model::structure_analysis().printed_paragraph_number(&slots.line(pages, Slot(at as u32)).text)).collect();
+        let printed: Vec<Option<usize>> = (0..slots.len()).map(|at| legal_structure::numbered_paragraphs::paragraph_number(&slots.line(pages, Slot(at as u32)).text)).collect();
         let stream_of = fences.streams(&printed);
         let marker_of = fences.marker_rows(pages, evidence, slots, &stream_of);
         let attached = marker_of.values().filter(|(_, added)| !added).map(|(marker, _)| *marker).collect();
@@ -96,7 +96,7 @@ impl<'a> Reading<'a> {
     fn hold(&self, text: &str, written: &Written, kept: &[Slot], stream: Stream, paragraphs: &mut Paragraphs) {
         let (pages, slots, place) = (self.pages, self.slots, &written.place);
         let kept_at: HashMap<Slot, usize> = kept.iter().enumerate().map(|(at, slot)| (*slot, at)).collect();
-        let read = legal_structure_model::structure_analysis().judgment_paragraphs(text);
+        let read = legal_structure::case_outline::judgment_paragraphs(text);
         // (The lines the numbers open on: a marker opening any other line is a quotation's or a list's.)
         let mut opens: HashSet<Slot> = read.iter().filter_map(|(_, ranges)| ranges.first()).filter_map(|range| {
             place.get(range.start..range.end.min(place.len())).unwrap_or_default().iter().flatten().next().map(|(slot, _)| *slot)

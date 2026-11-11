@@ -386,7 +386,7 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                 }
                 let body_index = aligned_note_body_among(&page.lines, page_rows, members.iter().copied(), index)?;
                 let body = &page.lines[body_index];
-                (body.bbox[1] > page.height * 0.86 && page.lines[body_index].size < body_size * 0.90 && legal_structure_model::structure_analysis().has_citation_signal(&body.text))
+                (body.bbox[1] > page.height * 0.86 && page.lines[body_index].size < body_size * 0.90 && legal_structure::analysis::has_citation_signal(&body.text))
                     .then_some([index, body_index])
             }).flatten());
             for (&slot, &index) in view.lines.iter().zip(&members) {

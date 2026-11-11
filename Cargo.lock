@@ -1162,6 +1162,7 @@ name = "legal-pdf-language"
 version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
+ "legal-structure",
  "legal-structure-model",
  "libc",
  "quick-xml",
@@ -1220,6 +1221,7 @@ name = "legal-pdf-structure"
 version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
+ "legal-structure",
  "legal-structure-model",
  "ort",
  "pdf-inspector",

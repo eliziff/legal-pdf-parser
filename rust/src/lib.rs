@@ -40,10 +40,9 @@ pub use legal_pdf_core::model::*;
 #[cfg(feature = "pdf")]
 pub use legal_pdf_core::{AuthorityTextUnit, Error, FailureKind, Result};
 
-/// Supplies the structure engine to the parsers: its document reading, and its services on
-/// laid-out text. The first one supplied stays.
-pub fn install_structure_analysis(analysis: &'static dyn legal_structure_model::StructureAnalysis) {
-    legal_structure_model::install_structure_analysis(analysis);
+/// Supplies the structure engine's services on laid-out text to extraction. The first one supplied stays.
+#[cfg(feature = "pdf")]
+pub fn install_structure_analysis(analysis: &'static dyn legal_structure_model::LayoutAnalysis) {
     legal_pdf_core::install_layout_analysis(analysis);
 }
 #[cfg(feature = "language")]

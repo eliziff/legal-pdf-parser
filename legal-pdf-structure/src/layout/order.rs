@@ -240,7 +240,7 @@ pub(crate) fn page_order(
 /// (an examination's "BY MR. JONES:", "EXHIBIT NO. 3", "--- Upon resuming").
 pub(crate) fn opens_turn(line: &Line) -> bool {
     let text = line.text.trim_start();
-    legal_pdf_core::layout_analysis().speaker_label(text).is_some()
+    legal_structure::transcript::speaker_label(text).is_some()
         || text.starts_with("--")
         || (text.chars().any(char::is_alphabetic) && !text.chars().any(char::is_lowercase))
 }

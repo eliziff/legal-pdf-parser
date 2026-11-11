@@ -135,7 +135,7 @@ pub(crate) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<
             let counter = words.get(1)?;
             let kind = if PACKAGE_UNITS.contains(&unit.as_str()) && (label_remainder().is_match(counter) || roman(counter).is_some()) {
                 unit.clone()
-            } else if authorities == Some(entry.level) && legal_structure_model::structure_analysis().numbering_marker(entry.title.split_whitespace().next()?, None).is_some() {
+            } else if authorities == Some(entry.level) && legal_structure::candidates::numbering_marker(entry.title.split_whitespace().next()?, None).is_some() {
                 "authority".to_owned()
             } else {
                 return None;

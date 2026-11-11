@@ -290,7 +290,7 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
             let number = if bare || marker { leading_note_number(&fold) } else { None };
             let bare_claim = bare && number.is_some() && last_number.is_some_and(|last| number == Some(last + 1));
             let continuation = *anchored && !sentence_ended(last_text);
-            let anchored_citation = position < last_note && !legal_structure_model::structure_analysis().protected_citation_spans(text).is_empty();
+            let anchored_citation = position < last_note && !legal_structure::analysis::protected_citation_spans(text).is_empty();
             if (bare && !bare_claim) || !(marker || continuation || anchored_citation || bare_claim) {
                 trail = Trail::Broken;
                 continue;
