@@ -4,7 +4,7 @@ use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, FailureKind, Result
 use legal_pdf_extraction_processor::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
-use legal_pdf_structure::{StructureIdentity, StructureOutput};
+use legal_pdf_structure::{Doc, StructureIdentity, StructureOutput};
 use legal_pdf_support::{profile, PdfDocument, PdfStatus};
 #[cfg(feature = "ppdoc")]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
@@ -279,8 +279,9 @@ fn cache_key(
     ppdoc_identity: Option<&str>,
     ocr_pages: Option<&[usize]>,
     semantic_profile: Option<DetectionProfile>,
+    doc_identity: Option<&str>,
 ) -> String {
-    let value = json!({
+    let mut value = json!({
         "source_sha256": source_hash,
         "schema_version": SCHEMA_VERSION,
         "parser_version": PARSER_VERSION,
@@ -296,14 +297,57 @@ fn cache_key(
         "ocr_pages": ocr_pages,
         "profile": semantic_profile,
     });
+    // A request naming DOC: its stages and the modes it reads in. One naming none keeps the key it had.
+    if let Some(identity) = doc_identity {
+        value["structure_provider"] = json!({ "doc": identity, "modes": DOC_PROMOTED });
+    }
     serialization_sha256(&value)
 }
 
+/// A PDF's mode, which the structure census grades apart: born digital, or read by recognition (any page of it).
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PdfMode {
+    DigitalBorn,
+    Recognized,
+}
+
+/// The modes whose census promoted DOC (the structure stage's tier 1) over tier 0: none yet, so a request naming DOC is
+/// read by tier 0 in every mode.
+const DOC_PROMOTED: &[PdfMode] = &[];
+
+impl PdfMode {
+    fn of(pages: &[legal_pdf_core::model::Page]) -> Self {
+        if pages.iter().any(|page| page.source != "native") { Self::Recognized } else { Self::DigitalBorn }
+    }
+}
+
+/// DOC's stages under a request's model pack, loaded once a process (each parse reads on sessions of its own), and their
+/// identity: their export's settings (`docparse.json`), which each fit writes anew.
+#[cfg(feature = "doc")]
+fn doc_reader(options: &crate::contract::DocOptions) -> Result<(std::sync::Arc<Doc>, String)> {
+    type Loaded = std::sync::Mutex<std::collections::HashMap<PathBuf, (std::sync::Arc<Doc>, String)>>;
+    static LOADED: OnceLock<Loaded> = OnceLock::new();
+    let mut loaded = LOADED.get_or_init(Loaded::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(found) = loaded.get(&options.model_pack) {
+        return Ok(found.clone());
+    }
+    let settings = options.model_pack.join("docparse.json");
+    let settings = fs::read(&settings).map_err(|source| Error::Io { path: settings, source })?;
+    let reader = Doc::load(&options.model_pack, options.runtime.as_deref(), false, false).map_err(Error::Message)?;
+    let found = (std::sync::Arc::new(reader), format!("{:x}", Sha256::digest(settings)));
+    loaded.insert(options.model_pack.clone(), found.clone());
+    Ok(found)
+}
+
+/// The extraction's structure, its moves DOC's where the request names `doc` and the PDF's mode is promoted, else tier 0's.
 fn derive_extracted(
     extracted: &mut ExtractedPdf,
     source_hash: &str,
     semantic_profile: Option<DetectionProfile>,
+    doc: Option<&Doc>,
 ) -> Result<StructureOutput> {
+    let doc = doc.filter(|_| DOC_PROMOTED.contains(&PdfMode::of(&extracted.pages)));
     let mut derived = legal_pdf_structure::derive(
         &mut extracted.pages,
         &extracted.separators,
@@ -314,6 +358,7 @@ fn derive_extracted(
             page_labels: extracted.metadata.embedded_page_labels.clone(),
         },
         std::env::var_os("LEGALPDF_DECISION_TRACE").map(PathBuf::from).as_deref(),
+        doc,
     )?;
     extracted.diagnostics.append(&mut derived.diagnostics);
     Ok(derived)
@@ -360,12 +405,13 @@ fn derive_document(
     source_hash: &str,
     key: &str,
     semantic_profile: Option<DetectionProfile>,
+    doc: Option<&Doc>,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
     // The witnesses passages read: the pages as extracted, before the structure stage rewrites their lines.
     let passage_pages = extracted.pages.clone();
     let derived = profile::measure("derive_document", || {
-        derive_extracted(&mut extracted, source_hash, semantic_profile)
+        derive_extracted(&mut extracted, source_hash, semantic_profile, doc)
     })?;
     let document_status = if extracted.diagnostics.is_empty() { PdfStatus::Ready } else { PdfStatus::Degraded };
     if let Some(pages) = pages {
@@ -428,13 +474,13 @@ pub fn gold_structure_document(
     source_hash: &str,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
-    derive_document(extracted, source_hash, "structure-gold", None, pages)
+    derive_document(extracted, source_hash, "structure-gold", None, None, pages)
 }
 
 /// A cached extraction through the structure stage, as a parse reads it, checked: the pages as the stage left them and the
 /// structure, its revision taken, with the extraction's diagnostics.
 fn corpus_structure(source_hash: &str, mut extracted: ExtractedPdf) -> Result<(ExtractedPdf, DocumentStructure)> {
-    let mut derived = derive_extracted(&mut extracted, source_hash, None)?;
+    let mut derived = derive_extracted(&mut extracted, source_hash, None, None)?;
     derived.structure_graph.refresh_revision()?;
     Ok((extracted, derived.structure_graph))
 }
@@ -571,7 +617,7 @@ fn parsed_pdf(
         }
         return Ok(cached);
     }
-    let (key, providers) = reading(&source_hash, options)?;
+    let (key, mut providers) = reading(&source_hash, options)?;
     if let Some(cached) = cached_document(&cache_root, &key, &source_hash) {
         validate_output_size(&cached, options)?;
         return Ok(Some(cached));
@@ -579,8 +625,9 @@ fn parsed_pdf(
     let Some(bytes) = bytes else {
         return Ok(None);
     };
+    let doc = providers.doc.take();
     let extracted = recognized_extraction(bytes, &source_hash, options, Some(&cache_root), providers, progress, require_cache_write)?;
-    let parsed = derive_document(extracted, &source_hash, &key, options.profile, None)?;
+    let parsed = derive_document(extracted, &source_hash, &key, options.profile, doc.as_deref(), None)?;
     validate_output_size(&parsed, options)?;
     let cache_path = parse_cache_root(&cache_root).join("documents").join(format!("{key}.json.gz"));
     match profile::measure("document_cache_write", || write_gzip_json(&cache_path, &parsed)) {

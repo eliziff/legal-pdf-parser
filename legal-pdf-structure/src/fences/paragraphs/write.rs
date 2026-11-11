@@ -1,6 +1,9 @@
 //! A stream's text, written as a provider writes a decision: a block to a line.
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+use legal_pdf_core::model::{Line, sentence_ended};
+use crate::model::Slot;
+use super::{Reading, Stream};
 
 /// The most lines a heading over a numbered paragraph runs to.
 const CLOSING_LINES: usize = 4;

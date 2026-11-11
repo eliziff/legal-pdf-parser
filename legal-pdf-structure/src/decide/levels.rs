@@ -5,7 +5,16 @@
 //! transcript's rule gave it, then its depth on the numbering ladder of its context's headings, set
 //! on the scale its anchored headings show, then its look's rank among the context's headings.
 
-use super::*;
+use legal_pdf_core::model::{Page, PdfOutlineEntry};
+use pdf_inspector::markdown::has_dot_leaders;
+use crate::headings;
+use crate::fences::fences::Fences;
+use crate::layout::Geometry;
+use crate::model::{Role, Slot, Slots};
+use crate::model::evidence::{Evidence, SourceTag};
+use crate::text::text::enumerated;
+use super::residual::{apart, Families, Look, look_of, marker_alone};
+use super::rules::{body_like, Decision, OutlineAnchor, Sequences};
 use crate::headings::rules::{ladder_levels, ATTACHMENTS};
 use crate::headings::bookmarks::{
     classify, generic_title, normalize_title, restack, same_title, validate, Entry, Tier, BACKFILL_MAX_TITLE, MAX_TITLE_LINES,

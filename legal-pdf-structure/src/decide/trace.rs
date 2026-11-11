@@ -3,7 +3,13 @@
 //! each weighed choice with the evidence it weighed (`ResidualRecord`). The parse is the same with a
 //! trace or without one.
 
-use super::*;
+use legal_pdf_core::model::Page;
+use crate::fences::fences::Fences;
+use crate::model::{Runs, Slot, Slots};
+use crate::model::evidence::{Evidence, MarkerReading};
+use super::notes::Notes;
+use super::residual::{LOOK, OWN};
+use super::rules::Decision;
 
 /// One residual candidate as the residual weighed it: its lines (slots), its reading context and look
 /// (an index among the context's looks), the indicators its own log-odds sum (`OWN`, in order), the

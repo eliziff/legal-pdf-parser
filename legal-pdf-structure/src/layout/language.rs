@@ -1,6 +1,9 @@
 //! Parallel English and French text: which column, and which lines, read in each language.
 
-use super::*;
+use std::collections::HashSet;
+use legal_pdf_core::{Line, median};
+use crate::model::{PageView, Slot};
+use super::{ColumnKind, ColumnModel, has_valid_bbox, line_center_x};
 
 /// English and French function words counted in some lines: (english, french).
 pub(crate) fn language_votes<'a>(lines: impl Iterator<Item = &'a Line>) -> (usize, usize) {

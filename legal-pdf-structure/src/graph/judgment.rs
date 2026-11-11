@@ -1,7 +1,10 @@
 //! A judgment's numbered paragraphs, written from what the reading decided once (`Fences::read_paragraphs`): each
 //! paragraph the spans of its lines it holds, in each language that prints it. Nothing is read here.
 
-use super::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use legal_pdf_core::model::Page;
+use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureNode};
+use crate::model::Decided;
 use crate::model::Held;
 use legal_structure_model::{DocumentStructure, SourceFragment};
 

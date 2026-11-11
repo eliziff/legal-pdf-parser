@@ -1,5 +1,10 @@
 //! The contents lists, a table of authorities' lines left to the body, and the pages wholly contents.
-use super::*;
+use std::collections::HashSet;
+use legal_pdf_core::model::Page;
+use crate::headings::contents_lists;
+use crate::model::{PageView, Role, Rule, Slots};
+use crate::model::evidence::Evidence;
+use super::Fences;
 
 impl Fences {
     /// The contents lists (`contents_lists::read`), pdf-inspector's contents among them, each from

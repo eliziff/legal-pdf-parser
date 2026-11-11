@@ -2,17 +2,12 @@
 //! line assembly, rules, source lines, pictures and recognition, each in its own module; the
 //! extracted document and its assembly are here.
 
-use legal_pdf_core::{Error, FailureKind, Result};
-use legal_pdf_core::model::{
-    Diagnostic, Line, Page, PdfExtractionMetadata, PdfOutlineEntry, Span, Word,
-};
-use legal_pdf_core::{median, profile, union_bbox, OcrLine, OcrPageRequest, PdfOcrProvider};
-use lopdf::{Document, Object, ObjectId};
-use pdf_inspector::types::{FidelityGlyph, ItemType, PdfLine, PdfRect, TextItem, TextLine};
+use legal_pdf_core::{profile, Error, FailureKind, Result};
+use legal_pdf_core::model::{Diagnostic, Page, PdfExtractionMetadata, PdfOutlineEntry};
+use lopdf::Document;
+use pdf_inspector::types::{ItemType, PdfLine, TextItem, TextLine};
 use pdf_inspector::PdfTypeResult;
-use legal_pdf_core::regex;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 mod geometry;

@@ -1,7 +1,11 @@
 //! Each judgment's numbered paragraphs, read from the fenced lines: the streams of its counts and languages, the lines each
 //! keeps, and what the reader of its text holds of them.
 
-use super::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use legal_pdf_core::model::{Page, sentence_ended};
+use crate::model::{Held, Paragraphs, Role, Slot, Slots};
+use crate::model::evidence::Evidence;
+use super::fences::Fences;
 
 pub(crate) mod ends;
 pub(crate) mod keep;
@@ -10,7 +14,6 @@ pub(crate) mod notes;
 pub(crate) mod write;
 
 use measures::{Counts, Numbers, PageMeasures};
-use notes::NoteWalk;
 use write::Written;
 
 /// The stream a line is read in, apart from the column it stands in (`Fences::translation`): a judgment in one language

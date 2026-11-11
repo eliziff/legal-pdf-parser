@@ -1,6 +1,10 @@
 //! A line assembled from its items: its spans (with raised note labels), glyphs, words and type size.
 
-use super::*;
+use legal_pdf_core::{median, union_bbox};
+use legal_pdf_core::model::{Span, Word};
+use pdf_inspector::types::{TextItem, TextLine};
+use super::geometry::{item_bbox, round3};
+use super::renderer::{item_baseline, normalize_text};
 
 #[derive(Debug)]
 pub(crate) struct AssembledSpan {

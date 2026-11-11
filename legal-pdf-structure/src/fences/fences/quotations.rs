@@ -1,5 +1,8 @@
 //! The quotations of another writing's numbered paragraphs, read off the judgment's own count.
-use super::*;
+use std::collections::{HashMap, HashSet};
+use legal_pdf_core::model::Page;
+use crate::model::{Role, Slots};
+use super::Fences;
 
 impl Fences {
     /// The quotations of another writing's numbered paragraphs, read off the judgment's count (`read_paragraphs`): in

@@ -31,7 +31,18 @@
 //! body's that sits nearer the line above than the text below (a signature block's names, a form's
 //! field).
 
-use super::*;
+use legal_pdf_core::model::{Page, sentence_ended};
+use crate::headings;
+use crate::fences::fences::Fences;
+use crate::headings::native::date_line;
+use crate::layout::Geometry;
+use crate::model::{Role, Rule, Slot, Slots};
+use crate::model::evidence::{Evidence, LOOK_BOLD, LOOK_ITALIC, LOOK_UNDERLINED, SourceTag, WORD_DIVISION, WORD_SPEAKER};
+use crate::text::text::all_caps;
+use super::rules::{body_like, Decision, Sequences};
+use super::trace::{
+    ResidualRecord, VETO_EDITORIAL, VETO_ENDS, VETO_LABEL, VETO_RUNS_ON, VETO_TAGGED, VETO_TESTIMONY, VETO_WORDS,
+};
 use std::cmp::Reverse;
 
 /// How a document sets a short line: its face (an index into the evidence's faces), its size in

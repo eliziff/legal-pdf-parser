@@ -6,9 +6,12 @@
 //! line that set each). Applying a move moves the state and says what the move made of the line: the reference it
 //! paired.
 
-use super::*;
+use std::collections::HashMap;
+use crate::fences::fences::Fences;
+use crate::model::Slot;
+use crate::model::evidence::{Evidence, MarkerReading};
+use crate::model::regions::{LINE_LABEL, NOTE, PAGE_LABEL, QUOTE, TEXT};
 use crate::machine::lines::LineTable;
-use crate::model::regions::*;
 
 /// Regions whose lines set reference marks notes answer: the body's, and headings' and titles'.
 pub(crate) const REFERRING: [u8; 8] = [1, 2, 3, 4, 8, 9, 14, 16];

@@ -12,7 +12,6 @@
 
 
 pub(crate) mod band;
-pub(crate) use band::*;
 pub(crate) mod lanes;
 pub(crate) mod lines;
 pub(crate) use lines::*;

@@ -4,7 +4,17 @@
 //! marks, the words the lexicon knows, a furniture edge, a table cell, the note band). Nothing here is
 //! a decision: every value is measured on the pages or read by an evidence reader.
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+use legal_pdf_core::model::{Line, Page};
+use crate::decide::notes::Notes;
+use crate::decide::rules::Decision;
+use crate::evidence::{marker_readings, reference_spans};
+use crate::fences::fences::Fences;
+use crate::model::{Held, Slot, Slots};
+use crate::model::evidence::{
+    Evidence, LOOK_BOLD, LOOK_CAPS, LOOK_ITALIC, MarkerReading, REFERENCE_DETACHED, REFERENCE_GLUED, REFERENCE_RAISED,
+    REFERENCE_SUPERSCRIPT, WORD_DIVISION,
+};
 use legal_pdf_core::{flag_share, text_shape, BOLD, ITALIC, MONOSPACED, SUPERSCRIPT};
 use crate::layout::Geometry;
 

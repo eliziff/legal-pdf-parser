@@ -1,20 +1,6 @@
 //! The parsed PDF as applications read it: the projected document (`document`), lookups by locator
 //! (`lookup`).
 
-use legal_pdf_core::model::{
-    Page, PdfExtractionMetadata, ScalarRange, PARSER_VERSION,
-};
-use legal_structure_model::{
-    serialization_sha256, utf16_len,
-    ScalarText,
-};
-use legal_structure_model::{
-    DocumentStructure, NodeKind, StructureNode,
-};
-use serde::{Deserialize, Serialize};
-use unicode_normalization::UnicodeNormalization;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
 
 mod document;
 pub use document::*;

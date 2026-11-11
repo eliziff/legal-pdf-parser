@@ -11,8 +11,12 @@
 //! document's own count does not hold, each with the editorial lines set under it; the reading
 //! contexts; and each line's continuation of the line before it.
 
-use super::*;
-use crate::tables::PageItems;
+use legal_pdf_core::model::{Diagnostic, Page, PdfOutlineEntry};
+use crate::constituents;
+use crate::headings::contents_lists;
+use crate::layout::ColumnModel;
+use crate::model::{Context, Edge, PageView, Paragraphs, Role, Rule, Slot, Slots};
+use crate::model::evidence::{Evidence, Rows};
 
 pub(crate) mod band;
 pub(crate) mod columns;

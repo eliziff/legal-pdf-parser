@@ -18,7 +18,15 @@
 //! holding a tenth of the document's running text, so that a note's type, however common, never
 //! becomes the body's.
 
-use super::*;
+use std::collections::{BTreeMap, HashMap};
+use legal_pdf_core::regex;
+use legal_pdf_core::model::{Diagnostic, Page};
+use legal_structure_model::text::{label_prefix, line_start_label_prefix, normalize_label};
+use crate::fences::fences::Fences;
+use crate::model::{PageView, Role, Runs, Slot, Slots};
+use crate::model::evidence::Evidence;
+use crate::notes::band::{Document, NoteKind, read_band, separator_tolerance, verified_endnotes};
+use crate::notes::lines::endnote_heading;
 use crate::notes::lanes::note_promotions;
 
 /// A line saying a note runs on across the page: "(Footnote continued…)", "Notes continued".

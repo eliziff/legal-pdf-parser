@@ -1,7 +1,11 @@
 //! A note band's lines: where a band begins, a label set apart from its note's text, and the order
 //! of a band set in columns.
 
-use super::*;
+use std::collections::HashMap;
+use legal_pdf_core::Line;
+use legal_structure_model::text::{is_note_symbol, MAX_SYMBOL_LABEL_LEN};
+use super::{ColumnKind, line_center_x, line_width};
+use super::columns::{columns_of, kept_items, note_column_model};
 
 pub(crate) fn band_geometry_top(line: &Line) -> f64 {
     line.words.iter().map(|word| word.bbox[1]).min_by(f64::total_cmp).unwrap_or(line.bbox[1])

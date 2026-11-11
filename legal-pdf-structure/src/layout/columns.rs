@@ -1,6 +1,9 @@
 //! A page's columns, as pdf-inspector reads them, and the margin column a page sets its notes in.
 
-use super::*;
+use std::collections::HashSet;
+use legal_pdf_core::Line;
+use super::{ColumnKind, ColumnModel, has_valid_bbox, line_center_x, line_width};
+use super::note_lines::{aligned_note_body_among, standalone_note_label};
 
 /// The text items of the page's lines `keep` holds, taken from the page's items (`page_items`),
 /// each carrying its line's slot on the page (as its `mcid`).

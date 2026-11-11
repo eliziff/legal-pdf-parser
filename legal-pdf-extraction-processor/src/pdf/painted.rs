@@ -1,6 +1,6 @@
 //! Text painted twice at one place (a bold faked by overprinting, a shadow) read once.
 
-use super::*;
+use pdf_inspector::types::{FidelityGlyph, TextItem};
 
 pub(crate) fn same_painted_text(left: &TextItem, right: &TextItem) -> bool {
     let (Some(left_fidelity), Some(right_fidelity)) = (left.fidelity.as_ref(), right.fidelity.as_ref()) else {

@@ -1,7 +1,12 @@
 //! A lookup by page, paragraph, section or footnote: the request, the units it returns, and how
 //! each locator finds its units.
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+use legal_pdf_core::model::{Page, ScalarRange};
+use legal_structure_model::{DocumentStructure, NodeKind, ScalarText, serialization_sha256, StructureNode, utf16_len};
+use serde::{Deserialize, Serialize};
+use super::{LOCATOR_KINDS, MAX_CONTEXT, MAX_RETURN_CHARS, MAX_UNITS};
+use super::document::{lookup_payload_sha256, page_confidence, page_index, page_number, PdfDocument};
 use legal_document_query::{note_named, DocumentQuery, Provisions};
 
 /// A paragraph a PDF numbers in print ("[12]", or 12 in the margin): its number and its printings, the structure's

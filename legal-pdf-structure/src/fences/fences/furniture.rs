@@ -1,5 +1,10 @@
 //! Folios, running heads and feet: the document's and, once its constituent documents are known, each one's own.
-use super::*;
+use std::collections::HashMap;
+use legal_pdf_core::model::Page;
+use crate::furniture::page_labels_among;
+use crate::model::{PageView, Role, Rule, Slot, Slots};
+use crate::model::evidence::{Evidence, Rows};
+use super::Fences;
 
 
 impl Fences {

@@ -1,6 +1,7 @@
 //! Tier 1 over tier 0's reading: Detect-Order-Construct (`doc`, with `encoder`) reads the document's lines, measured over
 //! tier 0's line table and decision, and gives each line a move (`machine::Move`); the writer takes them in place of tier
-//! 0's, the notes aside (`crate::emit`). What it reads is one value, `Settings`, filled once from the environment's
+//! 0's, the notes aside (`crate::emit`). A parse given a `Doc` (the engine's, where the request names DOC and its mode
+//! is promoted) reads with it. What else it reads is one value, `Settings`, filled once from the environment's
 //! LEGALPDF_TRANSITION_ names for the harnesses:
 //! - LEGALPDF_TRANSITION_DOC, a folder holding Detect-Order-Construct's stages as `docparse.py` exports them (`doc`);
 //!   LEGALPDF_TRANSITION_DOC_ORDER=on, the reading's order read off the successor head; LEGALPDF_TRANSITION_DOC_TIMES,
@@ -29,6 +30,12 @@ pub(crate) use stylesheet::*;
 #[macro_use]
 mod onnx;
 mod doc;
+
+/// Tier 1, DOC's stages loaded (`Doc::load`), which a parse reads with where it is given one; none without `encoder`.
+#[cfg(feature = "encoder")]
+pub use doc::Reader as Doc;
+#[cfg(not(feature = "encoder"))]
+pub enum Doc {}
 
 /// The region-and-opening classes (`region * 2 + opens`) DOC's line head scores.
 const CLASSES: usize = 34;
@@ -66,7 +73,7 @@ impl Settings {
             doc_oracle: std::env::var_os("LEGALPDF_TRANSITION_DOC_ORACLE").is_some(),
             #[cfg(feature = "encoder")]
             doc: var("LEGALPDF_TRANSITION_DOC").and_then(|dir| {
-                doc::Reader::load(&dir, std::env::var("LEGALPDF_TRANSITION_DOC_ORDER").is_ok_and(|v| v == "on"), std::env::var_os("LEGALPDF_TRANSITION_DOC_TIMES").is_some())
+                doc::Reader::load(&dir, None, std::env::var("LEGALPDF_TRANSITION_DOC_ORDER").is_ok_and(|v| v == "on"), std::env::var_os("LEGALPDF_TRANSITION_DOC_TIMES").is_some())
                     .map_err(|e| eprintln!("transition parser: {e}")).ok()
             }),
             confusions: var("LEGALPDF_TRANSITION_CONFUSIONS").map(|path| read_confusions(&path)).unwrap_or_default(),
@@ -125,18 +132,18 @@ fn read_gold(path: &Path) -> GoldLabels {
 }
 
 /// DOC's moves over tier 0's reading of a document (its notes and decision, `table` the line table both tiers read),
-/// where its reader or its oracle is given, each move's `reading` naming one of the line's readings in `table`; and the
-/// dump DOC is fitted on, where it is asked. None where neither reads: the output is tier 0's.
+/// where its reader (`doc`, else the harnesses') or its oracle is given, each move's `reading` naming one of the line's
+/// readings in `table`; and the dump DOC is fitted on, where it is asked. None where neither reads: the output is tier 0's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &crate::layout::Geometry, outline: &[PdfOutlineEntry], sha256: &str,
-    notes: &Notes, decision: &Decision, table: &LineTable) -> Option<Vec<Move>> {
+    notes: &Notes, decision: &Decision, table: &LineTable, doc: Option<&Doc>) -> Option<Vec<Move>> {
     let s = settings();
     let gold = s.gold.as_ref().and_then(|g| g.0.get(sha256));
     let oracle = s.doc_oracle && gold.is_some();
     #[cfg(feature = "encoder")]
-    let reader = s.doc.as_ref();
+    let reader = doc.or(s.doc.as_ref());
     #[cfg(not(feature = "encoder"))]
-    let reader: Option<()> = None;
+    let reader = doc;
     if reader.is_none() && !oracle && s.dump.is_none() { return None; }
     let measures = table.measure(pages, slots, evidence, fences, geometry, notes, decision);
     let sheet = Stylesheet::read(pages, slots, evidence, fences, geometry, outline, table, &measures);

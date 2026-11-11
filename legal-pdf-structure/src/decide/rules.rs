@@ -8,7 +8,22 @@
 //! levels (`levels`). A rule fills only an open line: where two strong rules disagree on one, the
 //! first keeps it. Each line keeps the rule that decided it, and each marker the unit it opens.
 
-use super::*;
+use legal_pdf_core::model::{Page, PdfOutlineEntry, sentence_ended};
+use crate::headings;
+use crate::fences::fences::{Continuation, Fences};
+use crate::layout::Geometry;
+use crate::model::{Member, Role, Rule, Run, Runs, Slot, Slots};
+use crate::model::evidence::{
+    Evidence, LOOK_BOLD, SourceTag, WORD_AUTHOR, WORD_COURT, WORD_DATE, WORD_DIVISION, WORD_EXAMINATION, WORD_FIELD,
+    WORD_HEARING_PART, WORD_HISTORY, WORD_INDEX_ENTRY, WORD_INDEX_LETTER, WORD_JURAT, WORD_LABEL, WORD_PARTY,
+    WORD_SIGNATURE, WORD_TRANSCRIPT_PART, WORD_WITNESS,
+};
+use crate::text::heading_ladder::{enumerator_interpretations, EnumeratorInterpretation, parse_heading_runs};
+use crate::text::text::all_caps;
+use super::levels::{anchors, heading_levels};
+use super::notes::Notes;
+use super::residual::weigh;
+use super::trace::ResidualRecord;
 use crate::text::heading_ladder::HeadingLadderStatus;
 use legal_structure_model::{CandidateGrammar, CandidateObservationV2, UnitRole};
 

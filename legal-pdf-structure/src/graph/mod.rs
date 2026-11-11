@@ -4,15 +4,13 @@
 //! `PdfResolutionInput`), the graph's nodes (`nodes`), each node's membership and context
 //! (`contexts`), and the outline its units hang in (`outline`).
 
-use crate::model::{Decided, Evidence, Role, Rule, Run, Slots};
-use crate::text::text_index::{source_membership, PdfTextIndex};
+use crate::model::{Evidence, Role, Rule, Run, Slots};
 use legal_pdf_core::model::Page;
-use legal_pdf_core::{Error, Result};
 use legal_structure_model::{
-    CandidateGrammar, Derivation, NodeKind, ScalarRange, ScalarText, StructureNode,
+    CandidateGrammar, ScalarRange,
 };
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 pub(crate) mod nodes;

@@ -1,5 +1,10 @@
 //! The reading order page by page, and the paragraph numbers a report prints in its margin, set before their rows.
-use super::*;
+use std::collections::HashMap;
+use legal_pdf_core::model::{Line, Page};
+use crate::layout::order::{page_order, Stream};
+use crate::model::{Edge, Role, Slot, Slots};
+use crate::model::evidence::Evidence;
+use super::Fences;
 
 impl Fences {
     /// Every page's lines in reading order (`page_order`): its running head, its body by its columns

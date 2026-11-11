@@ -1,7 +1,9 @@
 //! A page's geometry (its box, rotation and user unit) and the transforms that bring pdf-inspector's
 //! items onto it; a symbol font's private-use text mapped back.
 
-use super::*;
+use std::collections::BTreeMap;
+use lopdf::{Document, Object, ObjectId};
+use pdf_inspector::types::TextItem;
 
 pub(crate) fn prune_extraction_object(object: &mut Object) {
     if let Object::Array(values) = object {

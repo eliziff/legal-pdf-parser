@@ -17,7 +17,14 @@ use legal_pdf_core::model::sentence_ended;
 use legal_structure_model::text::{is_note_symbol, label_prefix, normalize_label};
 use regex::Regex;
 use std::collections::HashMap;
-use crate::model::evidence::*;
+use crate::model::evidence::{
+    Cited, Evidence, LOOK_BOLD, LOOK_CAPS, LOOK_ITALIC, LOOK_UNDERLINED, Marker, MarkerReading, NoteLabel, PageEvidence,
+    REFERENCE_DETACHED, REFERENCE_GLUED, REFERENCE_RAISED, REFERENCE_SUPERSCRIPT, Rows, SourceTag, SUPPRESS_COMMA,
+    SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED, WORD_AUTHOR, WORD_CITATION_TITLE, WORD_CLOSING,
+    WORD_CONTENTS_TITLE, WORD_COURT, WORD_DATE, WORD_DIVISION, WORD_EXAMINATION, WORD_FIELD, WORD_HEARING_PART,
+    WORD_HISTORY, WORD_INDEX_ENTRY, WORD_INDEX_LETTER, WORD_JURAT, WORD_LABEL, WORD_NOTES_HEADING, WORD_PARTY,
+    WORD_REASONS, WORD_RESET_HEADING, WORD_SIGNATURE, WORD_SPEAKER, WORD_TRANSCRIPT_PART, WORD_TURN, WORD_WITNESS,
+};
 use crate::model::{Slot, Slots};
 use legal_pdf_core::{dominant_face, regex, CitationSpan, ITALIC};
 use crate::tables::PageItems;

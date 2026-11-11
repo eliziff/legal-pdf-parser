@@ -1,6 +1,7 @@
 //! Each item's line and order as the renderer lays them out, and its text normalized.
 
-use super::*;
+use std::borrow::Cow;
+use pdf_inspector::types::{ItemType, TextItem};
 
 /// Where the renderer's pen stands in the text block it is laying out.
 #[derive(Default)]

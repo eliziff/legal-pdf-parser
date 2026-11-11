@@ -1,14 +1,8 @@
 //! A page's layout: its geometry, columns, languages, reading order and note-band lines,
 //! each in its own module; the line geometry they share is here.
 
-use crate::model::{PageView, Slot};
-use crate::tables::has_table_caption;
-use legal_structure_model::text::{is_note_symbol, MAX_SYMBOL_LABEL_LEN};
-use legal_pdf_core::{median, Columns, Diagnostic, Line, Page, PageMeasure};
-use std::{
-    cell::OnceCell,
-    collections::{HashMap, HashSet},
-};
+use legal_pdf_core::{Columns, Line, Page, PageMeasure};
+use std::cell::OnceCell;
 
 pub(crate) mod columns;
 pub(crate) use columns::*;

@@ -1,6 +1,10 @@
 //! Each node's exact membership and role, and the context its outline lives in.
 
-use super::*;
+use std::collections::HashSet;
+use legal_structure_model::{NodeKind, ScalarRange};
+use crate::model::Decided;
+use crate::text::text_index::{PdfTextIndex, source_membership};
+use super::outline::OutlineContext;
 
 /// Settle each node's exact membership and role, and give the context its outline lives in: the
 /// constituent document holding it, and its quotation, note, table cell or parallel text.

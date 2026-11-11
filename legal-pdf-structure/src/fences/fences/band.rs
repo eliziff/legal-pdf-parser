@@ -1,5 +1,10 @@
 //! The note band: under each page's separator, clear of its tables, and what shows a rule is no separator; the body's type.
-use super::*;
+use std::collections::HashMap;
+use legal_pdf_core::model::Page;
+use crate::model::{Role, Slot, Slots};
+use crate::model::evidence::Evidence;
+use crate::notes::band::{separator_beside_tables, separator_tolerance};
+use super::Fences;
 use crate::notes::has_prior_reference;
 use legal_structure_model::text::{is_note_symbol, label_prefix};
 

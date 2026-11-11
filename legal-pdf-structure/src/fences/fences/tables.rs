@@ -1,5 +1,10 @@
 //! The document's tables and each line's cell, and the cells given back to the lines no fence took.
-use super::*;
+use std::collections::HashSet;
+use legal_pdf_core::model::Page;
+use crate::model::{Role, Rule, Slot, Slots};
+use crate::model::evidence::{Evidence, WORD_SPEAKER};
+use crate::tables::PageItems;
+use super::Fences;
 
 impl Fences {
     /// The document's tables, the lines any of them holds, and the lines a contents list read as one holds.

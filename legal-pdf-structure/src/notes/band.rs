@@ -21,7 +21,10 @@
 //! A line a page layout model labelled keeps that label's reading of note or text under
 //! LEGALPDF_ABLATE=layout_notes.
 
-use super::*;
+use super::lines::{
+    citation_shaped_candidate, continuing_note_heading, endnote_heading, has_prior_reference, longest_label_run,
+    structural_reset_heading,
+};
 use legal_pdf_core::model::{Diagnostic, Line, Page};
 use legal_pdf_core::median;
 use crate::headings::recognized_page;

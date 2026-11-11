@@ -375,7 +375,7 @@ fn read_in(moves: &mut [Move], ranks: &[i64], pages: &[usize]) {
 
 // ------------------------------------------------------------------------------------------------- the model
 #[cfg(feature = "encoder")]
-pub(crate) use model::Reader;
+pub use model::Reader;
 
 #[cfg(feature = "encoder")]
 mod model {
@@ -423,7 +423,8 @@ mod model {
         }
     }
 
-    pub(crate) struct Reader {
+    /// DOC's stages, loaded: tier 1, which a parse reads with (`derive`) where it is given one.
+    pub struct Reader {
         dir: PathBuf,
         sessions: Mutex<Vec<Sessions>>,
         /// Whether each tree's graph gives its nodes' gaps (`gap`).
@@ -461,15 +462,15 @@ mod model {
     }
 
     impl Reader {
-        /// The stages under `dir`, their ONNX Runtime the one LEGALPDF_ONNX_RUNTIME or LEGALPDF_ONNXRUNTIME
-        /// names; the text model's reading checked against Python's on `parity.json`'s texts.
-        pub(crate) fn load(dir: &Path, reorder: bool, times: bool) -> std::result::Result<Self, String> {
+        /// The stages under `dir`, their ONNX Runtime at `runtime` (else the one LEGALPDF_ONNX_RUNTIME or
+        /// LEGALPDF_ONNXRUNTIME names); the text model's reading checked against Python's on `parity.json`'s texts.
+        pub fn load(dir: &Path, runtime: Option<&Path>, reorder: bool, times: bool) -> std::result::Result<Self, String> {
             let read = |name: &str| std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"));
             let meta: Meta = serde_json::from_str(&read("docparse.json")?).map_err(|e| format!("docparse.json: {e}"))?;
             if meta.width != ALL || meta.classes != CLASSES || meta.mean.len() != ALL || meta.std.len() != ALL {
                 return Err(format!("docparse.json reads {} features and {} classes; the parser has {ALL} and {CLASSES}", meta.width, meta.classes));
             }
-            init_runtime("the DOC reader needs LEGALPDF_ONNX_RUNTIME")?;
+            init_runtime(runtime, "the DOC reader needs LEGALPDF_ONNX_RUNTIME")?;
             let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
             let embeddings = f32s(&std::fs::read(dir.join("embeddings.f32")).map_err(|e| format!("embeddings.f32: {e}"))?);
             if embeddings.len() != meta.vocabulary * meta.text_dim {

@@ -1,7 +1,9 @@
 //! Whether a page's white space can be read for tables set without rules: rows of aligned columns pdf-inspector's
 //! grid detector reads, kept where the page's lines stand in a plain grid.
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+use legal_pdf_core::model::{Line, Page};
+use super::PageItems;
 use crate::layout::{has_valid_bbox, line_center_y};
 use legal_pdf_core::{median, regex};
 

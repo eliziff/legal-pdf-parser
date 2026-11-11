@@ -52,6 +52,7 @@ use emit::Settled;
 use machine::lines::LineTable;
 use machine::machine::LineView;
 use std::path::Path;
+pub use transition::Doc;
 
 use legal_pdf_core::model::{Diagnostic, LineZone, Page, PdfOutlineEntry};
 use legal_structure_model::StructureNode;
@@ -93,13 +94,14 @@ fn give_back(zones: &mut [LineZone], slots: &Slots, notes: &[StructureNode]) {
         }
     }
 }
-/// The document's structure. With `trace`, the decision is also written to that folder (`decide::trace`); the parse is
-/// the same.
+/// The document's structure, its moves DOC's where `doc` is given (tier 1), else tier 0's. With `trace`, the decision is also
+/// written to that folder (`decide::trace`); the parse is the same.
 pub fn derive(pages: &mut [Page],
     separators: &[Option<f64>],
     outline: &[PdfOutlineEntry],
     identity: StructureIdentity,
     trace: Option<&std::path::Path>,
+    doc: Option<&Doc>,
 ) -> Result<StructureOutput> {
     use legal_pdf_core::profile::measure;
     if separators.len() != pages.len() {
@@ -117,7 +119,7 @@ pub fn derive(pages: &mut [Page],
     });
     let mut fences = measure("derive.fences", || Fences::read(pages, &slots, &evidence, outline, &identity.page_labels));
     let runs = measure("derive.runs", || crate::runs::read(pages, &slots, &mut evidence, &mut fences, &geometry))?;
-    measure("derive.machine", || output(pages, &mut slots, &evidence, fences, &runs, &geometry, outline, &identity, trace))
+    measure("derive.machine", || output(pages, &mut slots, &evidence, fences, &runs, &geometry, outline, &identity, trace, doc))
 }
 
 /// Tier 0's reading of the document written: its decision (`tier0::decide`), DOC's moves over it where DOC is given
@@ -133,6 +135,7 @@ fn output(pages: &mut [Page],
     outline: &[PdfOutlineEntry],
     identity: &StructureIdentity,
     trace: Option<&Path>,
+    doc: Option<&Doc>,
 ) -> Result<StructureOutput> {
     let mut diagnostics = std::mem::take(&mut fences.diagnostics);
     let fences = fences;
@@ -140,7 +143,7 @@ fn output(pages: &mut [Page],
     let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, transition::confusions());
     let (mut notes, decision) = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &table, trace.is_some());
     // DOC's reading where it is given, read off the pages as they came, before this reading writes and orders them.
-    let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, outline, &identity.source_sha256, &notes, &decision, &table);
+    let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, outline, &identity.source_sha256, &notes, &decision, &table, doc);
     diagnostics.append(&mut notes.diagnostics);
     if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision, &table.readings, &table.references);

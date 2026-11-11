@@ -2,7 +2,14 @@
 //! rectangles there and the start of its words, and each quotation's rectangles, line by line and page by page. Also
 //! where a Word brief's citations fall on the pages of a PDF saved from it, read by the same words.
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+use legal_pdf_core::model::{Page, ScalarRange};
+use legal_structure_model::{NodeKind, ScalarText, utf16_len};
+use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
+use super::document::PdfDocument;
+use super::lookup::{PdfLookupRequest, PdfLookupStatus};
 use legal_structure_model::{PrimaryRole, SourceFragment};
 use std::collections::BTreeMap;
 

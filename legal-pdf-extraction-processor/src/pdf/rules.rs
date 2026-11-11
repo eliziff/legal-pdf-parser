@@ -1,6 +1,11 @@
 //! Ruled lines and rectangles: a note separator, words underlined, and the regions rectangles box.
 
-use super::*;
+use std::collections::HashMap;
+use legal_pdf_core::median;
+use legal_pdf_core::model::{Line, Page};
+use pdf_inspector::types::{PdfLine, PdfRect};
+use super::geometry::{PageGeometry, PageGeometryMap, round3, transform_point};
+use super::lines::begins_with_note_label;
 
 /// The page's `index`th region of `kind` drawn (a rule, a rectangle), counted from 1.
 fn drawn(page: &Page, kind: &str, index: usize, bbox: [f64; 4]) -> legal_pdf_core::model::Region {

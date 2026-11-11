@@ -8,11 +8,12 @@ macro_rules! tensor { ($shape:expr, $data:expr) => { ort::value::TensorRef::from
 /// A graph's output `name`, its values, its error as text.
 macro_rules! output { ($outputs:expr, $name:expr) => { $outputs[$name].try_extract_tensor::<f32>().map_err(|e| e.to_string())?.1 }; }
 
-/// The ONNX Runtime LEGALPDF_ONNX_RUNTIME or LEGALPDF_ONNXRUNTIME names, initialized; `missing` the error where neither does.
-pub(crate) fn init_runtime(missing: &str) -> std::result::Result<(), String> {
-    let runtime = ["LEGALPDF_ONNX_RUNTIME", "LEGALPDF_ONNXRUNTIME"].iter().find_map(|name| std::env::var_os(name).filter(|v| !v.is_empty()))
-        .ok_or(missing)?;
-    legal_pdf_core::init_ort_runtime(Path::new(&runtime), None).map_err(|e| e.to_string())?;
+/// The ONNX Runtime at `runtime`, else the one LEGALPDF_ONNX_RUNTIME or LEGALPDF_ONNXRUNTIME names, initialized; `missing`
+/// the error where none is named.
+pub(crate) fn init_runtime(runtime: Option<&Path>, missing: &str) -> std::result::Result<(), String> {
+    let named = ["LEGALPDF_ONNX_RUNTIME", "LEGALPDF_ONNXRUNTIME"].iter().find_map(|name| std::env::var_os(name).filter(|v| !v.is_empty()));
+    let runtime = runtime.map(Path::as_os_str).or(named.as_deref()).ok_or(missing)?;
+    legal_pdf_core::init_ort_runtime(Path::new(runtime), None).map_err(|e| e.to_string())?;
     Ok(())
 }
 

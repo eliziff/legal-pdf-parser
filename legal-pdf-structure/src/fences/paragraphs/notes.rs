@@ -1,6 +1,8 @@
 //! The notes among a stream's lines: a note's label counts on from the last, and a stream's walk knows where it stands.
 
-use super::*;
+use legal_pdf_core::model::sentence_ended;
+use crate::model::{Role, Slot};
+use super::{Reading, Stream};
 
 /// How far a note's label may pass the last, its lost labels between.
 const NOTE_LOST: u32 = 3;

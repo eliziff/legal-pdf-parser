@@ -47,6 +47,24 @@ pub struct PdfRequest {
     #[cfg(not(feature = "ppdoc"))]
     #[serde(default, rename = "layout", deserialize_with = "unsupported")]
     _layout: Option<()>,
+    /// What scores the structure stage's moves in place of tier 0: DOC, tier 1, read only in the modes its census
+    /// promoted (`engine::DOC_PROMOTED`).
+    #[cfg(feature = "doc")]
+    #[serde(default, rename = "structure", deserialize_with = "structure")]
+    pub(crate) doc: Option<DocOptions>,
+    #[cfg(not(feature = "doc"))]
+    #[serde(default, rename = "structure", deserialize_with = "unsupported")]
+    _structure: Option<()>,
+}
+
+/// DOC as a request names it: its model pack (the stages `docparse.py export` writes) and the ONNX Runtime it runs in
+/// (else the one LEGALPDF_ONNX_RUNTIME names).
+#[cfg(feature = "doc")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DocOptions {
+    pub(crate) model_pack: PathBuf,
+    pub(crate) runtime: Option<PathBuf>,
 }
 
 fn sha256<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<String>, D::Error> {
@@ -102,7 +120,19 @@ fn layout<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Opt
     Ok(Some(settings))
 }
 
-#[cfg(any(not(feature = "ocr"), not(feature = "ppdoc")))]
+#[cfg(feature = "doc")]
+fn structure<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<DocOptions>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(tag = "provider", deny_unknown_fields)]
+    enum Provider {
+        #[serde(rename = "doc")]
+        Doc { settings: DocOptions },
+    }
+    let Provider::Doc { settings } = Provider::deserialize(deserializer)?;
+    Ok(Some(settings))
+}
+
+#[cfg(any(not(feature = "ocr"), not(feature = "ppdoc"), not(feature = "doc")))]
 fn unsupported<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<()>, D::Error> {
     serde::de::IgnoredAny::deserialize(deserializer)?;
     Err(D::Error::custom("this legalpdf binary was built without the provider the request names"))

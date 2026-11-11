@@ -1,6 +1,11 @@
 //! The page's lines in the order its source writes them, made into the model's lines.
 
-use super::*;
+use legal_pdf_core::union_bbox;
+use legal_pdf_core::model::Line;
+use pdf_inspector::types::{TextItem, TextLine};
+use super::geometry::item_bbox;
+use super::lines::{assemble_line, line_spans, line_words};
+use super::renderer::item_baseline;
 
 pub(crate) fn make_line(text_line: TextLine, page_index: usize, local_index: usize, source_index: usize, page_height: f64) -> Option<Line> {
     let renderer_block = text_line.items.iter().find_map(|item| item.fidelity.as_ref().map(|value| value.renderer_block as usize));

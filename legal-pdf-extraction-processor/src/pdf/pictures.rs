@@ -1,6 +1,9 @@
 //! Scanned pages and the pictures of text on typeset pages, and the recognized lines placed in them.
 
-use super::*;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use legal_pdf_core::model::{Line, Page};
+use pdf_inspector::types::{ItemType, TextItem};
+use super::geometry::{PageGeometry, PageGeometryMap, transform_bbox};
 
 /// The pages that are a picture of their text: an image covers at least half of the page and the
 /// page's visible text, laid end to end, would not fill one line across it (a filing stamp, a record

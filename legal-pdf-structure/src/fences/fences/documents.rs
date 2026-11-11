@@ -1,5 +1,9 @@
 //! Each line's constituent document, and which documents are transcripts.
-use super::*;
+use legal_pdf_core::model::PdfOutlineEntry;
+use crate::constituents;
+use crate::model::{PageView, Role, Slot, Slots};
+use crate::model::evidence::{Evidence, WORD_SPEAKER};
+use super::Fences;
 
 impl Fences {
     /// Each line's constituent document: the openings the document's bookmarks name, and those its

@@ -2,7 +2,8 @@
 //! reading order within each constituent document. Source membership, quotation containers and
 //! locators stay unchanged.
 
-use super::*;
+use std::collections::HashMap;
+use legal_structure_model::{NodeKind, ScalarText, StructureNode};
 use legal_structure_model::{NumberingMarker, PrimaryRole};
 
 /// A unit's document, quotation, and note, table cell or parallel text membership.

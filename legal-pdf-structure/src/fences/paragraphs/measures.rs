@@ -1,7 +1,12 @@
 //! What a judgment's paragraphs are read against: where each page's text stands, which printed numbers are the
 //! judgment's own, and which of its counts each line stands in.
 
-use super::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use legal_pdf_core::model::Page;
+use crate::fences::fences::Fences;
+use crate::model::{Role, Slot, Slots};
+use crate::model::evidence::Evidence;
+use super::{QUOTED_INDENT, Stream};
 
 /// Where each page's text stands.
 pub(crate) struct PageMeasures<'a> {

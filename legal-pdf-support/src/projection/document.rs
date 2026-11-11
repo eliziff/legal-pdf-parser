@@ -1,6 +1,12 @@
 //! The projected document: its pages, lines and words as the reader sees them, and its summary.
 
-use super::*;
+use std::sync::{Arc, OnceLock};
+use legal_pdf_core::model::{Page, PARSER_VERSION, PdfExtractionMetadata, ScalarRange};
+use legal_structure_model::{DocumentStructure, NodeKind, ScalarText, serialization_sha256, StructureNode};
+use serde::{Deserialize, Serialize};
+use super::lookup::{
+    PdfLookupRequest, PdfLookupStatus, PdfStructureLookup, PrintedParagraph, rendered_slice, structure_lookup,
+};
 
 #[derive(Deserialize, Serialize)]
 pub struct PdfDocument {
