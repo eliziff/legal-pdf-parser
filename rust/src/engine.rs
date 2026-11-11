@@ -646,8 +646,6 @@ fn reading(source_hash: &str, options: &PdfRequest) -> Result<(String, Providers
     }))
 }
 
-/// The cache key a reading of a PDF would be kept under, without reading it: the PDF is named by the request's
-/// expected source hash.
 /// The cache key a PDF's reading is kept under: of `bytes` where given (they must be the source expected), else of
 /// the source expected.
 pub fn pdf_cache_key(bytes: Option<&[u8]>, options: &PdfRequest) -> Result<String> {
