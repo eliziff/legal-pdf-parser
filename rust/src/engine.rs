@@ -21,7 +21,7 @@ use std::sync::{
 };
 use std::time::SystemTime;
 
-const EXTRACTION_CACHE_SCHEMA: &str = "legalpdf.extraction-cache.v2";
+const EXTRACTION_CACHE_SCHEMA: &str = "legalpdf.extraction-cache.v3";
 const PARSE_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[cfg(feature = "ocr")]

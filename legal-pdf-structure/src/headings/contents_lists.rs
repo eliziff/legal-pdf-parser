@@ -13,6 +13,7 @@
 
 use crate::headings::bookmarks::normalize_title;
 use crate::model::{Evidence, PageView, Role, Slot, Slots, SourceTag};
+use crate::fences::Fences;
 use legal_pdf_core::Line;
 use legal_pdf_core::regex;
 use std::collections::{HashMap, HashSet};
@@ -290,11 +291,11 @@ pub(crate) struct Lists {
     pub(crate) titles: Vec<Slot>,
 }
 
-/// What the lists are read against, by slot: each line's role so far (a transcript's line number, the page's
-/// furniture: running heads and feet, folios), the source's tag (a heading already), whether a table holds it; and
-/// each view's page number (the label the PDF declares for it, else its folio's).
+/// What the lists are read against: the fences so far (each line's role: a transcript's line number, the page's
+/// furniture, folios), the evidence (the source's tag, a heading already; each line's row), whether a table holds
+/// each line, by slot; and each view's page number (the label the PDF declares for it, else its folio's).
 pub(crate) struct ListInput<'a> {
-    pub(crate) role: &'a [Role],
+    pub(crate) fences: &'a Fences,
     pub(crate) slots: &'a Slots,
     pub(crate) evidence: &'a Evidence,
     pub(crate) in_table: &'a [bool],
@@ -303,11 +304,11 @@ pub(crate) struct ListInput<'a> {
 
 impl ListInput<'_> {
     fn line_label(&self, slot: Slot) -> bool {
-        self.role[slot.index()] == Role::LineLabel
+        self.fences.role[slot.index()] == Role::LineLabel
     }
 
     fn furniture(&self, slot: Slot) -> bool {
-        matches!(self.role[slot.index()], Role::Furniture | Role::PageLabel)
+        matches!(self.fences.role[slot.index()], Role::Furniture | Role::PageLabel)
     }
 
     fn heading(&self, slot: Slot) -> bool {

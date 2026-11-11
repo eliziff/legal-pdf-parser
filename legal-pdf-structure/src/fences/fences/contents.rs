@@ -39,7 +39,7 @@ impl Fences {
         let lists = legal_pdf_core::profile::measure("classify.contents_lists", || {
             contents_lists::read(
                 views,
-                &contents_lists::ListInput { role: &self.role, slots, evidence, in_table, numbers: &numbers },
+                &contents_lists::ListInput { fences: self, slots, evidence, in_table, numbers: &numbers },
             )
         });
         let mut listed_contents = vec![false; slots.len()];

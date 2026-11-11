@@ -91,7 +91,8 @@ impl Reading<'_> {
                 slots.page(**next) == page && !opens.contains(*next) && slots.line(pages, **next).bbox[0] - left > QUOTED_INDENT
             });
             if in_quotation || set_out.is_some() {
-                let bbox = set_out.filter(|_| !in_quotation).map_or(bbox, |next| slots.line(pages, *next).bbox);
+                let mut prior = set_out.filter(|_| !in_quotation).map_or(last, |next| *next);
+                let bbox = slots.line(pages, prior).bbox;
                 let mut row = bbox;
                 // (The quotation's own leading, from its last two lines on the page.)
                 let tops: Vec<f64> = spans.keys().rev().filter(|&&slot| slots.page(slot) == page).take(2).map(|&slot| slots.line(pages, slot).bbox[1]).collect();
@@ -99,7 +100,7 @@ impl Reading<'_> {
                 for at in from + 1..kept.len() {
                     let under = slots.line(pages, kept[at]);
                     let enumerator = under.text.split_whitespace().next().is_some_and(|token| token.chars().count() <= 5 && token.ends_with(['.', ')']));
-                    let same_row = (under.bbox[1] - row[1]).abs() <= 2.0;
+                    let same_row = self.evidence.row(slots, kept[at]) != u32::MAX && self.evidence.row(slots, kept[at]) == self.evidence.row(slots, prior);
                     // (In the quotation's small type, an item of its own further in is its: "[ ... ]" / "d) Les défenderesses ...".)
                     let quoted = small && self.smaller(kept[at].index());
                     let marked = self.marker_of.contains_key(&(kept[at], self.stream_of[kept[at].index()]));
@@ -110,6 +111,7 @@ impl Reading<'_> {
                         break;
                     }
                     row = under.bbox;
+                    prior = kept[at];
                     spans.entry(kept[at]).or_insert((0, under.text.encode_utf16().count() as u32));
                 }
             }

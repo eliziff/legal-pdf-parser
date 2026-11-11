@@ -251,33 +251,6 @@ pub(crate) fn line_words(text: &str, text_line: &TextLine, assembled: &Assembled
     words
 }
 
-pub(crate) fn model_line_font_size(line: &Line) -> f64 {
-    let has_body = line.spans.iter().any(|span| span.size > 0.0 && !span.superscript);
-    let mut sizes: Vec<_> = line
-        .spans
-        .iter()
-        .filter(|span| span.size > 0.0 && (!has_body || !span.superscript))
-        .map(|span| (span.size, span.text.chars().count().clamp(1, 100)))
-        .collect();
-    if sizes.is_empty() {
-        return 0.0;
-    }
-    sizes.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let count = sizes.iter().map(|(_, count)| count).sum::<usize>();
-    let (left_index, right_index) = ((count - 1) / 2, count / 2);
-    let (mut seen, mut left_value) = (0, None);
-    for (size, count) in sizes {
-        seen += count;
-        if left_value.is_none() && seen > left_index {
-            left_value = Some(size);
-        }
-        if seen > right_index {
-            return (left_value.unwrap_or(size) + size) / 2.0;
-        }
-    }
-    unreachable!("weighted median has at least one value")
-}
-
 pub(crate) fn begins_with_note_label(text: &str) -> bool {
     let trimmed = text.trim_start();
     let count = trimmed.chars().take_while(|character| character.is_ascii_digit()).count();

@@ -452,7 +452,7 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
             for index in margin {
                 found[index] = None;
             }
-            for (index, edge) in print_margins(view, &line_label) {
+            for (index, edge) in print_margins(view, page_rows, &line_label) {
                 found[index] = Some((edge, Rule::PrintMargin));
             }
             extend_running_heads(page, &members, found, body_size, |index| line_label(view.slot(index)));
@@ -563,25 +563,24 @@ pub(crate) fn printed_label(value: &str) -> Option<String> {
 /// outer margins, with the page title and "1 of 3" on the same rows. They are furniture on
 /// a single page too, where nothing repeats to show it. Each such line of the view, by line slot
 /// on the page, with its edge; a line `line_label` holds is none.
-fn print_margins(view: &PageView, line_label: impl Fn(Slot) -> bool) -> Vec<(usize, Edge)> {
+fn print_margins(view: &PageView, rows: &[u32], line_label: impl Fn(Slot) -> bool) -> Vec<(usize, Edge)> {
     let stamp = regex!(r"(?i)(?:^|\s)(?:https?://|www\.)\S+|(?:^|\s)\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4},?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:[ap]\.?\s?m\.?)?");
     let (height, band) = (view.page.height, view.page.height * 0.06);
     let edge = |line: &Line| if line.bbox[1] <= band { Some(Edge::Top) } else { (line.bbox[3] >= height - band).then_some(Edge::Bottom) };
-    let rows: Vec<(Edge, f64, f64)> = view
+    // Each stamp's row on the page (`Rows`) and its edge.
+    let stamped: Vec<(Edge, u32)> = view
         .iter()
-        .filter(|(_, line)| stamp.is_match(line.text.trim()))
-        .filter_map(|(_, line)| edge(line).map(|kind| (kind, line.bbox[1], line.bbox[3])))
+        .filter(|(slot, line)| stamp.is_match(line.text.trim()) && rows[view.place(*slot)] != u32::MAX)
+        .filter_map(|(slot, line)| edge(line).map(|kind| (kind, rows[view.place(slot)])))
         .collect();
-    if rows.is_empty() {
+    if stamped.is_empty() {
         return Vec::new();
     }
     view.iter()
         .filter(|(slot, _)| !line_label(*slot))
         .filter_map(|(slot, line)| {
             let kind = edge(line)?;
-            let height = (line.bbox[3] - line.bbox[1]).max(1.0);
-            rows.iter()
-                .any(|(row, top, bottom)| *row == kind && line.bbox[3].min(*bottom) - line.bbox[1].max(*top) > height * 0.5)
+            stamped.contains(&(kind, rows[view.place(slot)]))
                 .then_some((view.place(slot), kind))
         })
         .collect()

@@ -128,7 +128,7 @@ pub(crate) fn separator_y(geometry: PageGeometry, lines: &[Line], rules: &[PdfLi
     // Prefer prose-length lines: a dense table must not redefine the body font.
     let sizes = |prose: bool| -> Vec<f64> {
         let upper = lines.iter().filter(|line| line.bbox[1] < geometry.height * 0.80 && (!prose || line.text.chars().count() >= 40));
-        upper.map(model_line_font_size).filter(|size| *size > 0.0).collect()
+        upper.map(legal_pdf_core::line_font_size).filter(|size| *size > 0.0).collect()
     };
     let prose = sizes(true);
     let body_size = median(if prose.is_empty() { sizes(false) } else { prose });
@@ -137,7 +137,7 @@ pub(crate) fn separator_y(geometry: PageGeometry, lines: &[Line], rules: &[PdfLi
         let first = line.spans.first();
         (begins_with_note_label(&line.text) || first.is_some_and(|span| span.superscript && begins_with_note_label(&span.text)))
             && body_size > 0.0
-            && (model_line_font_size(line) <= body_size * 0.90 || first.is_some_and(|span| span.size <= body_size * 0.78))
+            && (legal_pdf_core::line_font_size(line) <= body_size * 0.90 || first.is_some_and(|span| span.size <= body_size * 0.78))
             // A detached label needs a body to its right; a footer page
             // number alone cannot establish a note region.
             && (worded(line) || lines.iter().any(|body| body.bbox[0] >= line.bbox[2] && body.bbox[1] < line.bbox[3] && line.bbox[1] < body.bbox[3] && worded(body)))

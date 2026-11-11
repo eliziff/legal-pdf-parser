@@ -89,23 +89,23 @@ impl Reading<'_> {
     /// (A letterhead, far larger than the body, is no one's: "Federal Court" / "of Appeal" at twice its type. One letter so large
     /// is a first paragraph's drop capital, at the text's left; further in it is a mark on the page, a rule in the margin read "I".)
     fn text_words(&self, slot: Slot, kept: &[Slot]) -> bool {
-        let (fences, pages, slots) = (self.fences, self.pages, self.slots);
-        let (at, line, bbox) = (slot.index(), &slots.line(pages, slot).text, slots.line(pages, slot).bbox);
-        let text = slots.line(pages, Slot(at as u32)).size * 2.0 >= fences.label_size() || slots.line(pages, Slot(at as u32)).size == 0.0 || legal_structure_model::structure_analysis().editorial_line(line)
+        let (fences, pages, slots, evidence) = (self.fences, self.pages, self.slots, self.evidence);
+        let (at, line, bbox, size) = (slot.index(), &slots.line(pages, slot).text, slots.line(pages, slot).bbox, slots.line(pages, slot).size);
+        let text = size * 2.0 >= fences.label_size() || size == 0.0 || legal_structure_model::structure_analysis().editorial_line(line)
     || slots.line(pages, slot).recognized() && (!self.edge_line(slot) || kept.last().is_some_and(|last| !sentence_ended(&slots.line(pages, *last).text)));
         let further_in = bbox[0] - self.measures.column(slots.page(slot), fences.at(at).translation) > QUOTED_INDENT;
-        let wordmark = fences.body.is_some_and(|(_, size)| slots.line(pages, Slot(at as u32)).size * 2.0 >= f64::from(size) * 1.6) && (line.trim().chars().count() > 1 || further_in) && line.split_whitespace().count() <= 6;
-        // (A layer may print one line twice, the second a suffix of the first in its box.)
+        let wordmark = fences.body.is_some_and(|(_, body)| size * 2.0 >= f64::from(body) * 1.6) && (line.trim().chars().count() > 1 || further_in) && line.split_whitespace().count() <= 6;
+        // (A layer may print one line twice, the second a suffix of the first on its row.)
+        let row = evidence.row(slots, slot);
         let repeated = kept.last().is_some_and(|last| {
             let above = slots.line(pages, *last);
-            let middle = (bbox[1] + bbox[3]) / 2.0;
-            slots.page(*last) == slots.page(slot) && above.bbox[1] <= middle && middle <= above.bbox[3] && line.trim().chars().count() >= 12 && above.text.trim_end().ends_with(line.trim())
+            row != u32::MAX && slots.page(*last) == slots.page(slot) && evidence.row(slots, *last) == row && line.trim().chars().count() >= 12 && above.text.trim_end().ends_with(line.trim())
         });
         text && !wordmark && !repeated
     }
 
     fn in_reading_order(&self, kept: &mut [Slot]) {
-        let (pages, slots, fences) = (self.pages, self.slots, self.fences);
+        let (pages, slots, fences, evidence) = (self.pages, self.slots, self.fences, self.evidence);
         // A table's reading may take prose set about it out of its order ("[4] This appeal ..." under its own next lines):
         // what a table holds reads down its page.
         let mut from = 0;
@@ -118,13 +118,13 @@ impl Reading<'_> {
             });
             from = to.max(from + 1);
         }
-        // A layer may split a line and set its tail first: the tail's top stands a little above its line's.
+        // A layer may split a line and set its tail first: the tail on its line's row, to its right.
         for at in 1..kept.len() {
             let (tail, opening) = (slots.line(pages, kept[at - 1]).bbox, slots.line(pages, kept[at]).bbox);
-            let shared = tail[3].min(opening[3]) - tail[1].max(opening[1]);
             // (A scan's pieces may overlap by a few points.)
             let overlap = if slots.line(pages, kept[at]).recognized() { opening[3] - opening[1] } else { 0.0 };
-            if slots.page(kept[at - 1]) == slots.page(kept[at]) && opening[2] <= tail[0] + overlap && shared * 2.0 > (tail[3] - tail[1]).min(opening[3] - opening[1]) {
+            let row = evidence.row(slots, kept[at]);
+            if slots.page(kept[at - 1]) == slots.page(kept[at]) && opening[2] <= tail[0] + overlap && row != u32::MAX && evidence.row(slots, kept[at - 1]) == row {
                 kept.swap(at - 1, at);
             }
         }
