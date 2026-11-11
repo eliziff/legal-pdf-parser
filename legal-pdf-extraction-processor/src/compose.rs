@@ -7,6 +7,7 @@ use crate::page_labels::label_rules;
 use legal_pdf_core::{Error, Result};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, SaveOptions, Stream, StringFormat};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -294,6 +295,7 @@ impl Label {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "kebab-case")]
 pub enum Position { TopRight, TopCentre, BottomRight, BottomCentre }
 
@@ -302,7 +304,8 @@ pub enum Target { Page(usize), At(usize, f64), Uri(String) }
 
 pub struct Meta<'a> { pub title: &'a str, pub subject: &'a str, pub creator: &'a str, pub producer: &'a str, pub lang: Option<&'a str>, pub xmp: bool }
 
-struct FontSlot { face: Face, id: ObjectId, name: String, base: String, embedded: Option<(&'static [u8], BTreeMap<u16, char>)> }
+/// A font: a standard face, Arial's own file, or (`file`) a font file given for what the standard faces cannot set.
+struct FontSlot { face: Face, id: ObjectId, name: String, base: String, embedded: Option<(Cow<'static, [u8]>, BTreeMap<u16, char>)>, file: bool }
 
 #[derive(Default)]
 struct Page { id: ObjectId, ops: Vec<u8>, fonts: BTreeSet<usize>, xobjects: Vec<(String, ObjectId)>, states: Vec<(String, f64)>, annots: Vec<ObjectId>, frame: ([f64; 4], i64) }
@@ -382,13 +385,33 @@ impl Composer {
     pub fn font(&mut self, face: Face) -> usize {
         if let Some(index) = self.fonts.iter().position(|f| f.face == face) { return index; }
         let id = self.doc.new_object_id();
-        let embedded = if face.arial() { system_arial(face).filter(|b| ttf_parser::Face::parse(b, 0).is_ok()).map(|b| (b, BTreeMap::new())) } else { None };
+        let embedded = if face.arial() { system_arial(face).filter(|b| ttf_parser::Face::parse(b, 0).is_ok()).map(|b| (Cow::Borrowed(b), BTreeMap::new())) } else { None };
         // Named as pdf-lib names a font in a page's resources: its PostScript name and a number.
-        self.fonts.push(FontSlot { face, id, name: format!("{}-{}", face.base_name(), self.fonts.len() + 1), base: face.base_name().into(), embedded });
+        self.fonts.push(FontSlot { face, id, name: format!("{}-{}", face.base_name(), self.fonts.len() + 1), base: face.base_name().into(), embedded, file: false });
         self.fonts.len() - 1
     }
+    /// A TrueType font file, subset into the PDF with the glyphs it shows: for text the standard faces cannot set.
+    pub fn font_file(&mut self, bytes: Vec<u8>) -> Result<usize> {
+        let face = ttf_parser::Face::parse(&bytes, 0).map_err(|e| fail(format!("The font could not be read: {e}")))?;
+        let base = face.names().into_iter().filter(|n| n.name_id == ttf_parser::name_id::POST_SCRIPT_NAME).find_map(|n| n.to_string()).unwrap_or_else(|| "Font".into());
+        let id = self.doc.new_object_id();
+        self.fonts.push(FontSlot { face: Face::Times, id, name: format!("{base}-{}", self.fonts.len() + 1), base, embedded: Some((Cow::Owned(bytes), BTreeMap::new())), file: true });
+        Ok(self.fonts.len() - 1)
+    }
     pub fn face(&self, font: usize) -> Face { self.fonts[font].face }
-    pub fn width(&self, font: usize, text: &str, size: f64) -> f64 { self.fonts[font].face.width(text, size) }
+    /// The font file of a font given as one.
+    fn file(&self, font: usize) -> Option<ttf_parser::Face<'_>> {
+        let slot = &self.fonts[font];
+        slot.embedded.as_ref().filter(|_| slot.file).and_then(|(bytes, _)| ttf_parser::Face::parse(bytes, 0).ok())
+    }
+    /// Whether the font sets `c`.
+    pub fn sets(&self, font: usize, c: char) -> bool { self.file(font).map_or(win_ansi(c).is_some(), |face| face.glyph_index(c).is_some()) }
+    pub fn width(&self, font: usize, text: &str, size: f64) -> f64 {
+        match self.file(font) {
+            Some(face) => text.chars().filter_map(|c| face.glyph_hor_advance(face.glyph_index(c)?)).map(f64::from).sum::<f64>() * size / f64::from(face.units_per_em()),
+            None => self.fonts[font].face.width(text, size),
+        }
+    }
 
     /// The text as the font's codes: WinAnsi bytes, or an embedded font's glyphs.
     fn encode(&mut self, font: usize, text: &str) -> String {
@@ -396,7 +419,7 @@ impl Composer {
         let mut hex = String::new();
         match &mut slot.embedded {
             Some((bytes, used)) => {
-                let face = ttf_parser::Face::parse(bytes, 0).expect("parsed when embedded");
+                let face = ttf_parser::Face::parse(&bytes[..], 0).expect("parsed when embedded");
                 for c in text.chars() {
                     let glyph = face.glyph_index(c).map_or(0, |g| g.0);
                     used.entry(glyph).or_insert(c);
@@ -865,7 +888,7 @@ impl Composer {
                         "Widths" => widths, "Encoding" => "WinAnsiEncoding", "FontDescriptor" => descriptor }
                 }
                 Some((bytes, used)) => {
-                    let parsed = ttf_parser::Face::parse(bytes, 0).map_err(|e| fail(format!("Arial could not be read: {e}")))?;
+                    let parsed = ttf_parser::Face::parse(&bytes, 0).map_err(|e| fail(format!("The font could not be read: {e}")))?;
                     let scale = 1000.0 / f64::from(parsed.units_per_em());
                     let mut glyphs: Vec<u16> = used.keys().copied().collect();
                     glyphs.insert(0, 0);
@@ -921,7 +944,7 @@ fn subset_truetype(face: &ttf_parser::Face, glyphs: &[u16]) -> Result<Vec<u8>> {
     let table = |tag: &[u8; 4]| raw.table(ttf_parser::Tag::from_bytes(tag));
     let (head, loca, glyf) = match (table(b"head"), table(b"loca"), table(b"glyf")) {
         (Some(h), Some(l), Some(g)) if h.len() >= 54 => (h, l, g),
-        _ => return Err(fail("Arial's file has no TrueType outlines.")),
+        _ => return Err(fail("The font file has no TrueType outlines.")),
     };
     let long = i16::from_be_bytes([head[50], head[51]]) == 1;
     let count = usize::from(face.number_of_glyphs());
