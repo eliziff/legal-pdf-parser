@@ -143,7 +143,7 @@ fn output(pages: &mut [Page],
     let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, transition::confusions());
     let (mut notes, decision) = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &table, trace.is_some());
     // DOC's reading where it is given, read off the pages as they came, before this reading writes and orders them.
-    let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, outline, &identity.source_sha256, &notes, &decision, &table, doc);
+    let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, &identity.source_sha256, &notes, &decision, &table, doc);
     diagnostics.append(&mut notes.diagnostics);
     if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision, &table.readings, &table.references);

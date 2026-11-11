@@ -697,14 +697,12 @@ mod model {
                 if before[i].is_none() && role(i) == HEADING { (section, last_heading) = (section + 1, Some(i)); }
                 sections[i] = section;
             }
-            let (idx_marker, idx_val, idx_pref, idx_c0, idx_w0, idx_x0, idx_size) =
-                (feature("marker"), feature("marker_value"), feature("marker_prefix"), feature("count_1"), feature("wrap_()"), feature("x0"), feature("size"));
-            // A line's marker: its numbering's family (its count and wrap), value and prefix.
+            let (idx_x0, idx_size) = (feature("x0"), feature("size"));
+            // A line's marker, its first reading in the line table: its numbering's family (its count and wrap), value and prefix.
             let line_family = |k: usize| -> (i64, i64, i64) {
-                let row = measures.row(k);
-                if row[idx_marker] <= 0.5 { return (0, -1, 0); }
-                let (count_idx, wrap_idx) = (argmax(&row[idx_c0..idx_c0 + 9]) as i64, argmax(&row[idx_w0..idx_w0 + 5]) as i64);
-                (count_idx * 5 + wrap_idx + 1, (row[idx_val].max(0.0).exp_m1()).round() as i64, row[idx_pref].max(0.0).round() as i64)
+                let Some(first) = table.readings[k].first() else { return (0, -1, 0) };
+                let (_, count, wrap) = marker_family(first);
+                (count.unwrap_or(0) as i64 * 5 + wrap.unwrap_or(0) as i64 + 1, i64::from(first.value), first.prefix.len() as i64)
             };
             let tree = |session: &mut Session, has_gap: bool, has_pairs: bool, nodes: &[usize]| -> std::result::Result<Vec<usize>, String> {
                 let h = nodes.len();

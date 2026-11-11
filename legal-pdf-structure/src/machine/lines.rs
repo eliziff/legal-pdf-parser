@@ -50,8 +50,8 @@ const ROLES: usize = 14;
 /// What t0 decided of a line: its role, one of `ROLES`, twelve flags and its heading's level (`docparse.T0`).
 pub(crate) const T0: usize = ROLES + 13;
 
-/// How common each look is across the document: a heading's look is rare and set apart, the body's
-/// the commonest. A look is a style (face and half-point size) and its bold, italic and capitals.
+/// How common each look is across the document: a heading's look is rare and set apart, the body's (`Fences::body`,
+/// t0's) the commonest. A look is a style (face and half-point size) and its bold, italic and capitals.
 struct Looks {
     style_chars: HashMap<(u16, u16), usize>,
     look_chars: HashMap<(u16, u16, u8), usize>,
@@ -68,10 +68,10 @@ struct Looks {
 const LOOK_STYLE: u8 = LOOK_BOLD | LOOK_ITALIC | LOOK_CAPS;
 
 impl Looks {
-    fn tally(pages: &[Page], slots: &Slots, evidence: &Evidence) -> Self {
+    fn tally(pages: &[Page], slots: &Slots, evidence: &Evidence, body: Option<(u16, u16)>) -> Self {
         let mut looks = Looks {
             style_chars: HashMap::new(), look_chars: HashMap::new(), look_lines: HashMap::new(), look_pages: HashMap::new(),
-            size_rank: HashMap::new(), body: None, chars: 0, lines: 0, pages: pages.len().max(1), median_length: 1.0,
+            size_rank: HashMap::new(), body, chars: 0, lines: 0, pages: pages.len().max(1), median_length: 1.0,
         };
         let mut lengths = Vec::new();
         for at in 0..slots.len() {
@@ -91,7 +91,6 @@ impl Looks {
             looks.look_pages.entry(look).or_default().insert(slots.page(slot));
         }
         looks.median_length = legal_pdf_core::upper_median(lengths).max(1.0);
-        looks.body = looks.style_chars.iter().max_by_key(|(style, n)| (**n, std::cmp::Reverse(**style))).map(|(style, _)| *style);
         let mut sizes: Vec<u16> = looks.style_chars.keys().map(|style| style.1).collect();
         sizes.sort_unstable();
         sizes.dedup();
@@ -235,7 +234,7 @@ impl LineTable {
             (measure, columns, rank, ink, weight)
         }).collect();
         let off_grid: Vec<usize> = pages.iter().map(|page| legal_pdf_core::off_grid_sizes(page.lines.iter().filter(|line| !line.exclude_from_body))).collect();
-        let looks = Looks::tally(pages, slots, evidence);
+        let looks = Looks::tally(pages, slots, evidence, fences.body);
         let page_count = pages.len().max(1) as f64;
         let mut own = vec![0f32; n * WIDTH];
         for (k, &slot) in order.iter().enumerate() {

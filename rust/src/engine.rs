@@ -449,6 +449,7 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
     };
     let ocr = options.ocr.as_ref().map(OcrProvider::prepare).transpose()?;
     let providers = Providers {
+        doc: None,
         ocr_identity: ocr.as_ref().map(|provider| (provider.name().to_owned(), provider.identity().to_owned())),
         ocr,
         #[cfg(feature = "ppdoc")]
@@ -659,9 +660,16 @@ fn reading(source_hash: &str, options: &PdfRequest) -> Result<(String, Providers
         Some(supplied) => Some(("supplied".to_owned(), supplied.identity(source_hash)?)),
         None => ocr_identity,
     };
+    #[cfg(feature = "doc")]
+    let doc = profile::measure("provider_identity_doc", || options.doc.as_ref().map(doc_reader).transpose())
+        .map_err(|error| error.failure(FailureKind::Parser))?;
+    #[cfg(not(feature = "doc"))]
+    let doc: Option<(std::sync::Arc<Doc>, String)> = None;
     let ocr_pair = ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
-    let key = cache_key(source_hash, document_identity(), ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile);
+    let key = cache_key(source_hash, document_identity(), ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile,
+        doc.as_ref().map(|(_, identity)| identity.as_str()));
     Ok((key, Providers {
+        doc: doc.map(|(reader, _)| reader),
         ocr_identity,
         #[cfg(feature = "ocr")]
         ocr: ocr_prepared,
@@ -695,8 +703,9 @@ fn source_hash(bytes: Option<&[u8]>, options: &PdfRequest) -> Result<String> {
 }
 
 /// The providers a parse reads its pages with, prepared: its recognizer and the identity its
-/// readings are cached under, and its layout model.
+/// readings are cached under, its layout model, and DOC where the request names it.
 struct Providers {
+    doc: Option<std::sync::Arc<Doc>>,
     ocr_identity: Option<(String, String)>,
     #[cfg(feature = "ocr")]
     ocr: Option<PreparedOcrProvider>,
