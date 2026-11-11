@@ -255,14 +255,29 @@ fn outline_of(document: &Document, offset: usize) -> Vec<Outline> {
     branch(document, first, &pages, offset, &mut BTreeSet::new())
 }
 
-/// Each page's size as it is shown ([width, height] of its crop box, turned by its rotation): how many pages a PDF
-/// has, and how big.
-pub fn page_sizes(bytes: &[u8]) -> Result<Vec<[f64; 2]>> {
+/// A page as links are placed on it: its crop box ([x, y, width, height]), its rotation, and its own links to web
+/// addresses, each by its place in the page's annotations, with its address and rect ([x1, y1, x2, y2]).
+#[derive(Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
+pub struct PageFrame { pub crop: [f64; 4], pub rotation: i64, pub links: Vec<(usize, String, [f64; 4])> }
+
+/// Each page of a PDF as links are placed on it: how many pages it has, how big, and the links it carries.
+pub fn page_frames(bytes: &[u8]) -> Result<Vec<PageFrame>> {
     let document = Document::load_mem(bytes).map_err(lo)?;
     if document.is_encrypted() { return Err(fail("PDF is encrypted.")); }
+    fn deref<'a>(document: &'a Document, o: &'a Object) -> Option<&'a Object> { document.dereference(o).ok().map(|(_, o)| o) }
+    let get = |o| deref(&document, o);
     document.get_pages().into_values().map(|id| {
-        let ([_, _, width, height], rotation) = crate::annotate::page_frame(&document, id)?;
-        Ok(if rotation.rem_euclid(180) == 90 { [height, width] } else { [width, height] })
+        let (crop, rotation) = crate::annotate::page_frame(&document, id)?;
+        let annots = document.get_dictionary(id).ok().and_then(|p| get(p.get(b"Annots").ok()?)).and_then(|a| a.as_array().ok());
+        let links = annots.into_iter().flatten().enumerate().filter_map(|(index, item)| {
+            let annotation = get(item)?.as_dict().ok()?;
+            let uri = lopdf::decode_text_string(get(get(annotation.get(b"A").ok()?)?.as_dict().ok()?.get(b"URI").ok()?)?).ok()?;
+            let rect: Vec<f64> = get(annotation.get(b"Rect").ok()?)?.as_array().ok()?.iter()
+                .map(|v| get(v).and_then(|v| v.as_float().ok().map(f64::from).or_else(|| v.as_i64().ok().map(|n| n as f64)))).collect::<Option<_>>()?;
+            (rect.len() == 4).then(|| (index, uri, [rect[0].min(rect[2]), rect[1].min(rect[3]), rect[0].max(rect[2]), rect[1].max(rect[3])]))
+        }).collect();
+        Ok(PageFrame { crop, rotation, links })
     }).collect()
 }
 
@@ -449,6 +464,34 @@ impl Composer {
         self.pages[page].annots.push(id);
     }
 
+    /// The page's own links to `uri`, taken to a page of this document, or taken out.
+    pub fn relink(&mut self, page: usize, uri: &str, target: Option<Target>) -> Result<()> {
+        let id = self.pages[page].id;
+        let annots = self.doc.get_dictionary(id).map_err(lo)?.get(b"Annots").ok().cloned();
+        let list = match annots { Some(Object::Reference(r)) => self.doc.get_object(r).map_err(lo)?.as_array().map_err(lo)?.clone(),
+            Some(Object::Array(items)) => items, _ => return Ok(()) };
+        let dest: Option<Vec<Object>> = match target {
+            None => None,
+            Some(Target::Page(at)) => Some(vec![self.pages[at].id.into(), "Fit".into()]),
+            Some(Target::At(at, top)) => Some(vec![self.pages[at].id.into(), "XYZ".into(), Object::Null, real(top), Object::Null]),
+            Some(Target::Uri(_)) => return Err(fail("A link is retargeted within the document.")),
+        };
+        let mut kept = Vec::new();
+        for item in list {
+            let linked = item.as_reference().ok().filter(|r| {
+                let action = self.doc.get_dictionary(*r).ok().and_then(|a| self.doc.dereference(a.get(b"A").ok()?).ok()).and_then(|(_, a)| a.as_dict().ok());
+                action.and_then(|a| lopdf::decode_text_string(a.get(b"URI").ok()?).ok()).is_some_and(|u| u == uri)
+            });
+            match (linked, &dest) {
+                (Some(_), None) => continue,
+                (Some(annotation), Some(dest)) => { let a = self.doc.get_dictionary_mut(annotation).map_err(lo)?; a.remove(b"A"); a.set("Dest", dest.clone()); }
+                _ => {}
+            }
+            kept.push(item);
+        }
+        self.doc.get_dictionary_mut(id).map_err(lo)?.set("Annots", kept);
+        Ok(())
+    }
     /// A scan's recognized text as an invisible text layer (render mode 3): found by search and selection, never seen.
     pub fn ocr_text(&mut self, page: usize, font: usize, value: &str) {
         use unicode_normalization::UnicodeNormalization;
