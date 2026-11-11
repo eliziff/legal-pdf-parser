@@ -78,7 +78,7 @@ fn destination_page(document: &Document, node: &Dictionary, pages: &HashMap<Obje
     usize::try_from(target.as_i64().ok()?).ok()
 }
 
-fn destination_array<'a>(document: &'a Document, object: &'a Object) -> Option<&'a [Object]> {
+pub(crate) fn destination_array<'a>(document: &'a Document, object: &'a Object) -> Option<&'a [Object]> {
     let object = document.dereference(object).ok()?.1;
     match object {
         Object::Array(values) => Some(values),

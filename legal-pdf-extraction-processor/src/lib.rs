@@ -1,4 +1,5 @@
 mod annotate;
+pub mod compose;
 mod extract;
 mod outline;
 mod page_labels;

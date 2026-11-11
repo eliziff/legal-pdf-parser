@@ -60,7 +60,7 @@ pub fn write_annotations(bytes: &[u8], marks: &[AnnotationMark], namespace: &str
 fn number(object: &Object) -> Option<f64> { object.as_float().ok().map(f64::from).or_else(|| object.as_i64().ok().map(|v| v as f64)) }
 
 /// The page's crop box (falling back to its media box), inherited through /Parent, and its /Rotate.
-fn page_frame(document: &Document, page_id: ObjectId) -> Result<([f64; 4], i64)> {
+pub(crate) fn page_frame(document: &Document, page_id: ObjectId) -> Result<([f64; 4], i64)> {
     let (mut crop, mut media, mut rotate) = (None, None, None);
     let mut node = document.get_dictionary(page_id).map_err(lo)?;
     for _ in 0..64 {
@@ -172,7 +172,7 @@ fn text_of(document: &Document, dict: &Dictionary, key: &[u8]) -> Option<String>
 
 /// Whether an action only moves the reader: to a place in the document, to a web or mail address, or to a PDF
 /// named relatively beside it (pdfAssembly.mjs `inertAction`).
-fn inert(document: &Document, action: &Dictionary) -> bool {
+pub(crate) fn inert(document: &Document, action: &Dictionary) -> bool {
     let kind = action.get(b"S").ok().and_then(|o| document.dereference(o).ok()).and_then(|(_, o)| o.as_name().ok().map(<[u8]>::to_vec));
     match kind.as_deref() {
         Some(b"GoTo") => true,
@@ -195,7 +195,7 @@ fn edit_object(update: &mut IncrementalDocument, id: ObjectId, edit: impl FnOnce
 
 /// pdfAssembly.mjs `disarm`: drops /AA and, unless the action under `key` is inert (whose /Next chain is dropped)
 /// or an array, the action itself.
-fn disarm_dict(document: &Document, holder: &mut Dictionary, key: &[u8]) -> bool {
+pub(crate) fn disarm_dict(document: &Document, holder: &mut Dictionary, key: &[u8]) -> bool {
     let mut changed = holder.remove(b"AA").is_some();
     let action = holder.get(key).ok().cloned();
     match action {

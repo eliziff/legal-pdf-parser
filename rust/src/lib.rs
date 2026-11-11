@@ -18,7 +18,7 @@ pub use legal_pdf_pages::{reread, Bands};
 #[cfg(feature = "pdf")]
 pub use legal_pdf_extraction_processor::{pdf_opening, PdfOpening, PdfOpeningPage};
 #[cfg(feature = "pdf")]
-pub use legal_pdf_extraction_processor::{write_annotations, AnnotationFragment, AnnotationMark};
+pub use legal_pdf_extraction_processor::{compose, write_annotations, AnnotationFragment, AnnotationMark};
 #[cfg(feature = "pdf")]
 pub use page_map::{page_evidence, page_map, EdgeLine, PageEvidence, PdfPageBinding};
 #[cfg(feature = "ocr")]

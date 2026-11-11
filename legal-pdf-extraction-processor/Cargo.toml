@@ -14,6 +14,9 @@ lopdf = { version = "0.45.0", default-features = false }
 pdf-inspector = { workspace = true }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
+# Arial's own file, read and subset into the PDFs compose.rs writes; the parser's own TrueType reader.
+ttf-parser = "0.25"
+unicode-normalization = "0.1"
 ts-rs = { version = "12", optional = true, features = ["serde-json-impl"] }
 
 # Native builds read a PDF's objects in parallel; the browser engine has one thread.
