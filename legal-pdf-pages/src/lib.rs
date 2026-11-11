@@ -54,8 +54,6 @@ pub struct EdgeLine {
 pub struct PdfPageBinding {
     /// The PDF page, from 1.
     pub pdf_page: u32,
-    /// The number the page prints, read on the page alone (`printed`), where it reads one.
-    pub observed: Option<String>,
     pub label: Option<String>,
     /// The line printing `label` (its index among the page's evidence lines), where the page prints it.
     #[serde(skip)]
@@ -133,9 +131,9 @@ pub fn page_map(pages: &[PageEvidence], starts: &[u32], is_citation: &dyn Fn(&st
     }
     let observed: Vec<Option<String>> = read.iter().map(|read| read.as_ref().map(|(label, _)| label.clone())).collect();
     let mut bindings = resolve(&observed, &pages.iter().map(|page| page.embedded.clone()).collect::<Vec<_>>());
-    sequence(&mut bindings, pages, starts);
+    sequence(&mut bindings, &observed, pages, starts);
     counters(&mut bindings, pages);
-    anchor(&mut bindings, starts);
+    anchor(&mut bindings, &observed, starts);
     numberings(&mut bindings, pages);
     printing_lines(&mut bindings, pages, &read);
     bindings
@@ -231,7 +229,7 @@ fn counters(bindings: &mut [PdfPageBinding], pages: &[PageEvidence]) {
         if binding.label.is_some() {
             continue;
         }
-        let numbers: std::collections::BTreeSet<i64> = page_candidates(binding, Some(page)).iter()
+        let numbers: std::collections::BTreeSet<i64> = page_candidates(None, Some(page)).iter()
             .filter(|c| c.kind == Kind::Counter && sequence_anchor(c)).map(|c| c.number).collect();
         if let [number] = numbers.into_iter().collect::<Vec<_>>()[..] {
             binding.label = Some(number.to_string());
@@ -260,7 +258,7 @@ fn resolve(observed: &[Option<String>], embedded: &[Option<String>]) -> Vec<PdfP
                 (false, None, None) => (None, None),
             };
             let status = if conflict { "ambiguous" } else if label.is_some() { "resolved" } else { "unknown" };
-            PdfPageBinding { pdf_page: index as u32 + 1, observed: detected, label, line: None, source: source.map(str::to_owned), status: status.to_owned(), numbers: Vec::new() }
+            PdfPageBinding { pdf_page: index as u32 + 1, label, line: None, source: source.map(str::to_owned), status: status.to_owned(), numbers: Vec::new() }
         })
         .collect()
 }
@@ -727,9 +725,9 @@ fn rows(page: &PageEvidence) -> Vec<Row> {
 }
 
 /// One page's candidates, best first, its structural head and foot numbers kept and the rest up to eight.
-fn page_candidates(binding: &PdfPageBinding, page: Option<&PageEvidence>) -> Vec<Candidate> {
+fn page_candidates(observed: Option<&str>, page: Option<&PageEvidence>) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
-    if let Some(number) = binding.observed.as_deref().and_then(|l| l.parse::<i64>().ok()).filter(|n| (1..=99_999).contains(n)) {
+    if let Some(number) = observed.and_then(|l| l.parse::<i64>().ok()).filter(|n| (1..=99_999).contains(n)) {
         candidates.push(Candidate { number, kind: Kind::Isolated, zone: Zone::Top, score: 1.0, year_like: false, citation_like: false, y: None, line: 1_000_000, text: number.to_string(), context: number.to_string(), running: false });
     }
     if let Some(page) = page {
@@ -907,12 +905,12 @@ impl Sequence {
 /// it fails the hard requirements (too few anchors, too short a span, anchors at inconsistent heights, too sparse for a
 /// long document), a close competitor leaves the numbering in doubt, or a running head's sequence outranks a local
 /// footer count. A short document with one numbered page takes that page's shift.
-fn sequence(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], starts: &[u32]) {
+fn sequence(bindings: &mut [PdfPageBinding], observed: &[Option<String>], pages: &[PageEvidence], starts: &[u32]) {
     let total = bindings.len();
     if total == 0 {
         return;
     }
-    let (candidates, ranked) = ranked_sequences(bindings, pages);
+    let (candidates, ranked) = ranked_sequences(observed, pages);
     let required = if total == 1 { 1 } else { 2 };
     // a PDF binding documents of their own numberings (a book of authorities, a volume's plates): each part its own run
     let parts = parts(&ranked, total);
@@ -1223,10 +1221,11 @@ fn numberings(bindings: &mut [PdfPageBinding], pages: &[PageEvidence]) {
     }
 }
 
-/// Each page's candidates, and the shifts their anchors support, best first (`ranked_delta_sequences`).
-fn ranked_sequences(bindings: &[PdfPageBinding], pages: &[PageEvidence]) -> (Vec<Vec<Candidate>>, Vec<Sequence>) {
-    let total = bindings.len();
-    let mut candidates: Vec<Vec<Candidate>> = bindings.iter().enumerate().map(|(at, binding)| page_candidates(binding, pages.get(at))).collect();
+/// Each page's candidates (`observed`: what each prints as read), and the shifts their anchors support, best first
+/// (`ranked_delta_sequences`).
+fn ranked_sequences(observed: &[Option<String>], pages: &[PageEvidence]) -> (Vec<Vec<Candidate>>, Vec<Sequence>) {
+    let total = observed.len();
+    let mut candidates: Vec<Vec<Candidate>> = observed.iter().enumerate().map(|(at, observed)| page_candidates(observed.as_deref(), pages.get(at))).collect();
     for (page, chained) in candidates.iter_mut().zip(folio_runs(pages)) {
         page.extend(chained);
     }
@@ -1405,7 +1404,7 @@ fn roman_numeral(mut value: i64) -> String {
 }
 
 /// Where a sequence was weighed and ruled on, a folio read on a page it does not number (`numbered`) is one the fit did not
-/// bear out (a local count, a rival in doubt): no page number (the page keeps it as `observed`).
+/// bear out (a local count, a rival in doubt): no page number.
 fn unconfirmed(bindings: &mut [PdfPageBinding], numbered: std::ops::Range<usize>) {
     for (at, binding) in bindings.iter_mut().enumerate() {
         if !numbered.contains(&at) && binding.source.as_deref() == Some("detected") && binding.label.as_deref().is_some_and(|label| label.parse::<i64>().is_ok()) {
@@ -1420,23 +1419,20 @@ fn unconfirmed(bindings: &mut [PdfPageBinding], numbered: std::ops::Range<usize>
 /// from): what the fit weighed, for a person checking a page map.
 #[doc(hidden)]
 pub fn weighed(pages: &[PageEvidence]) -> Vec<(i64, Vec<(usize, i64, String)>)> {
-    let (_, ranked) = ranked_sequences(&resolve(&observed(pages), &vec![None; pages.len()]), pages);
+    let (_, ranked) = ranked_sequences(&observed(pages), pages);
     ranked.into_iter().map(|row| (row.shift, row.anchors.into_iter().map(|(at, c)| (at + 1, c.number, c.text)).collect())).collect()
 }
 
 /// Whether a page's lines print a number in a folio's shape.
 pub fn prints_a_folio(page: &PageEvidence) -> bool {
-    let observed = printed(page).map(|(label, _)| label);
-    let binding = PdfPageBinding { pdf_page: 1, observed, label: None, line: None, source: None, status: String::new(), numbers: Vec::new() };
-    page_candidates(&binding, Some(page)).iter().any(sequence_anchor)
+    page_candidates(printed(page).map(|(label, _)| label).as_deref(), Some(page)).iter().any(sequence_anchor)
 }
 
 /// Each page's candidates (number, how it is printed, its zone, its score, whether it anchors a sequence, its line), for a
 /// person checking a page map.
 #[doc(hidden)]
 pub fn candidates_of(pages: &[PageEvidence]) -> Vec<Vec<String>> {
-    let bindings = resolve(&observed(pages), &vec![None; pages.len()]);
-    bindings.iter().zip(pages).map(|(binding, page)| page_candidates(binding, Some(page)).iter()
+    observed(pages).iter().zip(pages).map(|(observed, page)| page_candidates(observed.as_deref(), Some(page)).iter()
         .map(|c| format!("{} {:?} {:?} {:.2} {} | {}", c.number, c.kind, c.zone, c.score, if sequence_anchor(c) { "ANCHOR" } else { "-" }, c.text))
         .collect()).collect()
 }
@@ -1444,7 +1440,7 @@ pub fn candidates_of(pages: &[PageEvidence]) -> Vec<Vec<String>> {
 /// The parts the fit finds (shift, first and last PDF page, anchors), for a person checking a page map.
 #[doc(hidden)]
 pub fn parts_of(pages: &[PageEvidence]) -> Vec<(i64, usize, usize, usize)> {
-    let (_, ranked) = ranked_sequences(&resolve(&observed(pages), &vec![None; pages.len()]), pages);
+    let (_, ranked) = ranked_sequences(&observed(pages), pages);
     parts(&ranked, pages.len()).iter().map(|part| (part.shift, part.anchors[0].0 + 1, part.anchors.last().unwrap().0 + 1, part.anchors.len())).collect()
 }
 
@@ -1453,7 +1449,7 @@ pub fn parts_of(pages: &[PageEvidence]) -> Vec<(i64, usize, usize, usize)> {
 /// own count of its pages at the foot (`local_article_count`), as a repository's copy prints over the journal's page whose
 /// folio is in the image of its head. A page the body's numbers seem to number is no page whose folio was read.
 pub fn read_again(pages: &[PageEvidence]) -> Vec<bool> {
-    let (_, ranked) = ranked_sequences(&resolve(&observed(pages), &vec![None; pages.len()]), pages);
+    let (_, ranked) = ranked_sequences(&observed(pages), pages);
     let local = ranked.first().is_some_and(|best| best.local_article_count(pages.len()));
     pages.iter().map(|page| {
         let band = PageEvidence {
@@ -1601,11 +1597,11 @@ fn cited_anchor(candidates: &[Vec<Candidate>], total: usize, starts: &[u32]) -> 
 }
 
 /// Rule 4's anchors: each page printing a citation's first page numbers its run, up to the next anchor, where most of
-/// the run's numbers agree with that numbering.
-fn anchor(bindings: &mut [PdfPageBinding], starts: &[u32]) {
-    let anchors: Vec<(usize, u32)> = bindings.iter().enumerate()
-        .filter(|(_, binding)| binding.status == "resolved")
-        .filter_map(|(index, binding)| binding.observed.as_deref()?.parse::<u32>().ok().filter(|n| *n >= 1 && starts.contains(n)).map(|n| (index, n)))
+/// the run's numbers agree with that numbering (`observed`: what each page prints as read).
+fn anchor(bindings: &mut [PdfPageBinding], observed: &[Option<String>], starts: &[u32]) {
+    let anchors: Vec<(usize, u32)> = bindings.iter().zip(observed).enumerate()
+        .filter(|(_, (binding, _))| binding.status == "resolved")
+        .filter_map(|(index, (_, observed))| observed.as_deref()?.parse::<u32>().ok().filter(|n| *n >= 1 && starts.contains(n)).map(|n| (index, n)))
         .collect();
     for (k, &(start, first)) in anchors.iter().enumerate() {
         let end = anchors.get(k + 1).map_or(bindings.len(), |&(next, _)| next);
