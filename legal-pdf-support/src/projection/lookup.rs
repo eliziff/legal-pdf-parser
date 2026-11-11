@@ -15,13 +15,14 @@ use legal_document_query::{note_named, DocumentQuery, Provisions};
 pub type PrintedParagraph = (usize, Vec<usize>);
 
 #[derive(Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS), ts(optional_fields = nullable))]
 pub struct PdfLookupRequest {
     pub locator_kind: String,
     pub locator: String,
     #[serde(default)]
     pub end_locator: Option<String>,
     #[serde(default)]
+    #[cfg_attr(feature = "binding-types", ts(as = "Option<usize>", optional))]
     pub context_blocks: usize,
     #[serde(default)]
     pub page: Option<u32>,
