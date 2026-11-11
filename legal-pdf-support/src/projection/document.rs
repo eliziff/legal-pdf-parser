@@ -16,6 +16,7 @@ pub struct PdfDocument {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PdfSummary {
     pub embedded_page_labels: Vec<Option<String>>,
@@ -31,11 +32,15 @@ pub struct PdfSummary {
     pub ocr_routed_pages: Vec<usize>,
     #[serde(default)]
     pub scanned_pages: Vec<usize>,
+    /// The PDF's own bookmarks, in outline order (`legal_pdf_core::model::PdfOutlineEntry`).
+    #[serde(default)]
+    pub outline: Vec<legal_pdf_core::model::PdfOutlineEntry>,
 }
 
 /// Whether the parse read the document whole: degraded where it diagnosed anything, a page needing recognition among
 /// them (which pages, `PdfSummary::pages_needing_ocr`).
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum PdfStatus {
     Ready,
@@ -71,6 +76,7 @@ impl PdfDocument {
         cache_key: &str,
         status: PdfStatus,
         metadata: PdfExtractionMetadata,
+        outline: Vec<legal_pdf_core::model::PdfOutlineEntry>,
         page_text_quality: Vec<f64>,
         mut evidence: Vec<Page>,
         authority_text_units: Vec<legal_pdf_core::AuthorityTextUnit>,
@@ -87,6 +93,7 @@ impl PdfDocument {
             pages_needing_ocr: metadata.pages_needing_ocr,
             ocr_routed_pages: metadata.ocr_routed_pages,
             scanned_pages: metadata.scanned_pages,
+            outline,
         };
         for line in evidence.iter_mut().filter(|page| page.source != "native").flat_map(|page| &mut page.lines) {
             if line.text.is_empty() {

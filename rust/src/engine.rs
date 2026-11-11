@@ -367,7 +367,7 @@ fn derive_document(
         pages.clone_from(&extracted.pages);
     }
     Ok(profile::measure("project_document", || {
-        PdfDocument::from_parts(source_hash, key, document_status, extracted.metadata, extracted.pages.iter().map(|page| page.text_quality).collect(), passage_pages, derived.authority_text_units, derived.structure_graph)
+        PdfDocument::from_parts(source_hash, key, document_status, extracted.metadata, extracted.outline, extracted.pages.iter().map(|page| page.text_quality).collect(), passage_pages, derived.authority_text_units, derived.structure_graph)
     }))
 }
 
