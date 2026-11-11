@@ -4,8 +4,7 @@
 //! is promoted) reads with it. What else it reads is one value, `Settings`, filled once from the environment's
 //! LEGALPDF_TRANSITION_ names for the harnesses:
 //! - LEGALPDF_TRANSITION_DOC, a folder holding Detect-Order-Construct's stages as `docparse.py` exports them (`doc`);
-//!   LEGALPDF_TRANSITION_DOC_ORDER=on, the reading's order read off the successor head; LEGALPDF_TRANSITION_DOC_TIMES,
-//!   each document's stages' times;
+//!   LEGALPDF_TRANSITION_DOC_TIMES, each document's stages' times;
 //! - LEGALPDF_TRANSITION_DOC_ORACLE, the gold given: the document read by the same decoding from the heads' answers read
 //!   off the gold (`doc::oracle`), what the decoding and the moves can hold;
 //! - LEGALPDF_TRANSITION_GOLD, the gold's labels (the grader's predictions format, rows' gold), for the oracle and the dump;
@@ -37,7 +36,7 @@ pub use doc::Reader as Doc;
 pub enum Doc {}
 #[cfg(not(feature = "encoder"))]
 impl Doc {
-    pub fn load(_: &Path, _: Option<&Path>, _: bool, _: bool) -> Result<Self, String> {
+    pub fn load(_: &Path, _: Option<&Path>, _: bool) -> Result<Self, String> {
         Err("this parser was built without DOC (the encoder feature)".to_owned())
     }
 }
@@ -78,7 +77,7 @@ impl Settings {
             doc_oracle: std::env::var_os("LEGALPDF_TRANSITION_DOC_ORACLE").is_some(),
             #[cfg(feature = "encoder")]
             doc: var("LEGALPDF_TRANSITION_DOC").and_then(|dir| {
-                doc::Reader::load(&dir, None, std::env::var("LEGALPDF_TRANSITION_DOC_ORDER").is_ok_and(|v| v == "on"), std::env::var_os("LEGALPDF_TRANSITION_DOC_TIMES").is_some())
+                doc::Reader::load(&dir, None, std::env::var_os("LEGALPDF_TRANSITION_DOC_TIMES").is_some())
                     .map_err(|e| eprintln!("transition parser: {e}")).ok()
             }),
             confusions: var("LEGALPDF_TRANSITION_CONFUSIONS").map(|path| read_confusions(&path)).unwrap_or_default(),
@@ -188,7 +187,7 @@ pub(crate) fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fen
     }
     // Detect-Order-Construct's decoding from the gold's answers, else its reading where its stages are given.
     if oracle {
-        return Some(doc::oracle(&gold_rows, &ranks, views, &texts, &line_pages));
+        return Some(doc::oracle(&gold_rows, views, &texts, &line_pages));
     }
     #[cfg(feature = "encoder")]
     return reader.and_then(|reader| reader.read(table, &measures, views, &texts, &line_pages, &doc::Style::of(&sheet, table, &measures))

@@ -11,14 +11,14 @@
 //!    line's continuation of the one before.
 //! 3. Numbered (`Runs`): each reading context's numbering runs, read and resolved by the engine.
 //! 4. Notes (`Notes`): each document's note band and the lanes that take more lines for notes (`notes`).
-//! 5. Decided (`tier0`): every rule heard on every line (`Decision::hear`), one decision on each line in
-//!    reading order (`settle`), the headings' levels (`Decision::finish`). Paragraph numbers are fixed input.
-//! 6. Written once (`write_lines`): each line's place in its page's reading order; and read by slot, each line's zone
-//!    and block (`zones`, `blocks`).
-//! 7. Derived from the decision: notes paired (the engine's pairer, over `note_lines`), a note band's line no note holds
-//!    given back to the body, propositions and cross-references (`note_context`), and the moves the decided lines make
-//!    (`tier0::moves_of`, over `tier0::reading_regions`) emitted as the structure graph (`emit`). Tier 1 (DOC, with
-//!    `encoder`) reads over tier 0's reading (`transition`).
+//! 5. Decided (`tier0`): every rule heard on every line (`Decision::hear`), then one walk in reading order deciding each
+//!    line, its block and the unit it opens or goes on in (`settle`), then the title and the headings' levels
+//!    (`Decision::finish`). Paragraph numbers are fixed input. Tier 1 (DOC, with `encoder`) reads over tier 0's
+//!    reading (`transition`), its moves in tier 0's place.
+//! 6. Written once (`write_lines`): each line's place in its page's reading order; and read by slot, each line's zone.
+//! 7. Derived from the decision: notes paired (the engine's pairer, over `note_lines`), laid over the units the moves
+//!    make (a line a note holds is the note's; a note band's line none holds is the body's), propositions and
+//!    cross-references (`note_context`), the units emitted as the structure graph.
 //!
 //! Measure a change with the grader's digest (`structure-gold digest`): every parse hashed, two builds compared.
 
@@ -44,7 +44,7 @@ use evidence::normalize;
 use model::Evidence;
 use fences::Fences;
 use model::{Runs, Slots};
-use decide::{blocks, note_lines, write_lines, write_trace, zones};
+use decide::{note_lines, write_lines, write_trace, zones};
 use text::text_index::PdfTextIndex;
 use notes::note_context::unmatched_reference_diagnostics;
 
@@ -57,10 +57,10 @@ use legal_pdf_core::model::{Diagnostic, LineZone, Page, PdfOutlineEntry};
 use legal_structure_model::StructureNode;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::DocumentStructure;
-use crate::machine::machine::{Move, State, MARGIN, OPENING, RANKED_BODY};
+use crate::machine::machine::{Move, MARGIN, OPENING};
 use crate::text::joining::{seam, split_words};
 use pdf_inspector::markdown::Join;
-use crate::model::regions::{HEADING, LINE_LABEL, NOTE, NOTE_QUOTE, PAGE_LABEL, REGIONS, TABLE};
+use crate::model::regions::{HEADING, LINE_LABEL, NOTE, NOTE_QUOTE, PAGE_LABEL, REGIONS, TABLE, TEXT};
 use crate::model::{Decided, Place, TRANSITION_ORIGIN};
 use legal_structure_model::{utf16_len, ContinuationKind, NodeKind, ScalarRange, ScalarText, SourceContinuation, SourceJoin};
 use std::collections::{HashMap, HashSet};
@@ -170,9 +170,9 @@ pub fn derive(pages: &mut [Page],
     measure("derive.machine", || output(pages, &mut slots, &evidence, fences, &runs, &geometry, outline, &identity, trace, doc))
 }
 
-/// The parse: tier 0's decision (`tier0::decide`), DOC's moves over it where DOC is given (`transition::over_tier0`),
-/// the lines written, the notes paired, the moves made (`tier0::moves_of`, DOC's in their place where it read them), and
-/// in one walk the units the moves make, written as the structure graph the consumers read.
+/// The parse: tier 0's decision (`tier0::decide`, its one walk), DOC's moves over it where DOC is given
+/// (`transition::over_tier0`), the lines written, the notes paired, and the units the moves make, the pairer's notes laid
+/// over them, written as the structure graph the consumers read.
 #[allow(clippy::too_many_arguments)]
 fn output(pages: &mut [Page],
     slots: &mut Slots,
@@ -192,7 +192,7 @@ fn output(pages: &mut [Page],
     // The fences' roles are the decision's to fill from here.
     let fenced = (std::mem::take(&mut fences.role), std::mem::take(&mut fences.rule));
     let views = LineView::all(evidence, &fences, &table);
-    let mut decision = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &notes, &views, fenced, trace.is_some());
+    let (mut decision, blocks) = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &notes, &views, fenced, trace.is_some());
     // DOC's reading where it is given, read off the pages as they came, before this reading writes and orders them.
     let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, &identity.source_sha256, &notes, &decision, &table, &views, doc);
     diagnostics.append(&mut notes.diagnostics);
@@ -200,7 +200,6 @@ fn output(pages: &mut [Page],
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision, &table.readings, &table.references);
     }
     write_lines(pages, slots, &fences, &decision);
-    let blocks = blocks(pages, slots, evidence, &fences, &decision);
     let mut zones = zones(slots, evidence, &fences, &notes, &decision);
     // The lines are read in reading order from here on, the pairer's and the output's: each page's put in it once.
     slots.read_in_order(pages, &fences.order);
@@ -216,21 +215,25 @@ fn output(pages: &mut [Page],
     diagnostics.extend(pairing.diagnostics);
     give_back(&mut zones, slots, &notes);
     diagnostics.extend(unmatched_reference_diagnostics(fences.order.iter().map(|&slot| (slots.line(pages, slot), zones[slot.index()])), &notes, &index, &decided));
-    tier0::moves_of(slots, &fences, runs, &views, &mut decision, &tier0::reading_regions(pages, slots, &fences, &zones, &blocks), &notes);
-    // The units the moves make, in one walk: each line opening one or in the one its move names, the state moved by
-    // each move; as a line joins its unit the seam with the unit's line before it is written (`joining::seam`): a dropped
-    // hyphen a manuscript edit, a join with no space a join, a page crossed a continuation; and each hyphen inside a line
-    // that splits a word (`joining::split_words`) an edit. A line's move is DOC's where it read one, grouped in the line's
-    // record, the run members tier 0 opens on kept; but for the notes, the pairer's (a line either reads as a note keeps
-    // this reading's move). DOC reads the same table, so its reading of a marker names one of this reading's. A body unit
-    // t0 opens takes its numbering's depth (`State::stack_depth`).
+    // The units the moves make: each line opening one or in the one its move names; as a line joins its unit the seam
+    // with the unit's line before it is written (`joining::seam`): a dropped hyphen a manuscript edit, a join with no
+    // space a join, a page crossed a continuation; and each hyphen inside a line that splits a word
+    // (`joining::split_words`) an edit. A line's move is DOC's where it read one and neither reads the line as a note's,
+    // the run members tier 0 opens on kept: DOC reads the same table, so its reading of a marker names one of this
+    // reading's. The pairer's notes lie over the units: a line a note holds is the note's and no unit's, and a line of
+    // the note band no note holds is the body's, a paragraph of its own from each note label.
     let (index, fences, decided) = (&index, &fences, &decided);
     let moves = &mut decision.moves;
     let mut notes = notes;
+    let note_move = |m: &Move| matches!(m.region, NOTE | NOTE_QUOTE);
+    for (record, read) in moves.iter_mut().zip(doc.iter().flatten()) {
+        if !note_move(read) && !note_move(record) {
+            *record = Move { role: record.role, rule: record.rule, joined: record.joined, unit: record.unit, member: record.member.take(), within: std::mem::take(&mut record.within), ..read.clone() };
+        }
+    }
+    let moves = &*moves;
     let texts: Vec<String> = fences.order.iter().map(|&slot| slots.line(pages, slot).text.clone()).collect();
     let ids: Vec<String> = fences.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
-    let text_of = |k: usize| texts[k].clone();
-    let id_of = |k: usize| ids[k].clone();
     // Each line's source fragment (UTF-16) and page, what a seam is written in.
     let fragment = |id: &str| index.line(id).map(|f| (f.range, f.page_index));
     let vocabulary = crate::text::joining::vocabulary(pages);
@@ -238,73 +241,62 @@ fn output(pages: &mut [Page],
     let mut joins: Vec<SourceJoin> = Vec::new();
     let mut continuations: Vec<SourceContinuation> = Vec::new();
     let place_of: HashMap<&str, usize> = ids.iter().enumerate().map(|(k, id)| (id.as_str(), k)).collect();
-    let note_move = |m: &Move| matches!(m.region, NOTE | NOTE_QUOTE);
-    // Units, each line opening one or in the one its move names.
-    let mut state = State::default();
+    let mut noted = vec![false; ids.len()];
+    for k in notes.iter().flat_map(|note| &note.line_ids).filter_map(|id| place_of.get(id.as_str())) {
+        noted[*k] = true;
+    }
     let mut units: Vec<Unit> = Vec::new();
     // Each unit by its first line.
     let mut unit_at: HashMap<usize, usize> = HashMap::new();
+    // The body unit the note band's lines no note holds go on in.
+    let mut given: Option<usize> = None;
     // The lines the parser opened a constituent document on; a start on a line of no region passes to the next unit.
     let mut started: Vec<usize> = Vec::new();
     for (k, line) in views.iter().enumerate() {
-        let record = &mut moves[k];
-        if let Some(read) = doc.as_ref().and_then(|read| read.get(k)).filter(|read| !note_move(read) && !note_move(&*record)) {
-            let read = Move { member: record.member.take(), within: std::mem::take(&mut record.within), ..read.clone() };
-            record.regroup(read);
-        } else if record.opens && RANKED_BODY.contains(&record.region) {
-            record.depth = state.stack_depth(line, record).min(9) as u8;
-        }
         let chosen = &moves[k];
-        state.apply(line, chosen);
         if chosen.starts {
             started.push(k);
         }
-        if chosen.region == 0 {
+        let back = chosen.region == NOTE;
+        if chosen.region == 0 || noted[k] {
+            given = None;
             continue;
         }
-        let single = matches!(chosen.region, LINE_LABEL | PAGE_LABEL);
-        let held = chosen.resumes.and_then(|first| unit_at.get(&(first as usize)).copied());
+        let region = if back { TEXT } else { chosen.region };
+        let single = matches!(region, LINE_LABEL | PAGE_LABEL);
+        let held = if back {
+            given.filter(|_| evidence.label[fences.order[k].index()].is_none())
+        } else {
+            chosen.resumes.and_then(|first| unit_at.get(&(first as usize)).copied())
+        };
         let u = if let Some(u) = held {
             u
         } else {
             // A unit counting on the margin's number prints its marker on the margin's line.
             let marker_line = match (chosen.reading, line.margin()) {
-                (Some(MARGIN), Some((margin, _))) => margin as usize,
+                (Some(MARGIN), Some((margin, _))) if !back => margin as usize,
                 _ => k,
             };
-            let text = text_of(marker_line);
-            let reading = line.reading(chosen.reading);
-            // A note's label is the number its move counts on: where the label reader found it, else the
-            // figures its opening token starts on ("27" of "27Ibid"); a note counting on none has none.
-            let marker = if chosen.region == NOTE {
-                chosen.note.and_then(|value| {
-                    let found = evidence.label[fences.order[k].index()].filter(|label| label.value == value);
-                    found.and_then(|label| opening(&text, false).map(|(s, _)| (s, s + usize::from(label.end).max(1))))
-                        .or_else(|| leading_figures(&text).filter(|&(figures, _)| figures == value).map(|(_, range)| range))
-                })
+            let text = texts[marker_line].clone();
+            let marker = if back {
+                None
             } else if chosen.reading == Some(OPENING) {
                 opening(&text, false)
             } else {
-                reading.and_then(|r| opening(&text, r.family.matches(':').count() > 1))
+                line.reading(chosen.reading).and_then(|r| opening(&text, r.family.matches(':').count() > 1))
             };
-            // A unit's label is its marker as printed ("12", "(a)", "[4]"), a note's its number, a line
-            // number's or page label's its text.
+            // A unit's label is its marker as printed ("12", "(a)", "[4]"), a line number's or page label's its text.
             let printed = |(start, end): (usize, usize)| ScalarText::new(&text).slice_utf16(start..end).unwrap_or_default().trim().trim_end_matches('.').to_owned();
-            let label = if single {
-                Some(text.trim().to_owned())
-            } else if chosen.region == NOTE {
-                chosen.note.map(|v| v.to_string())
-            } else {
-                marker.map(printed)
-            };
-            let level = if chosen.opens && chosen.region == HEADING { chosen.level.max(1) as usize } else { 0 };
-            units.push(Unit { region: chosen.region, lines: Vec::new(), marker, marker_line, label, level, last: None, page_start: None });
+            let label = if single { Some(text.trim().to_owned()) } else { marker.map(printed) };
+            let level = if chosen.opens && region == HEADING { chosen.level.max(1) as usize } else { 0 };
+            units.push(Unit { region, lines: Vec::new(), marker, marker_line, label, level, last: None, page_start: None });
             unit_at.insert(k, units.len() - 1);
             units.len() - 1
         };
+        given = back.then_some(u);
         units[u].lines.push(k);
         let written = texts[k].trim();
-        if chosen.region != NOTE && !matches!(REGIONS[usize::from(chosen.region)], "furniture" | "page_label" | "line_label") && !written.is_empty() {
+        if !matches!(REGIONS[usize::from(region)], "furniture" | "page_label" | "line_label") && !written.is_empty() {
             if let Some((range, page)) = fragment(&ids[k]) {
                 let unit = &mut units[u];
                 if let Some(j) = unit.last {
@@ -340,6 +332,8 @@ fn output(pages: &mut [Page],
     // Nodes, their ranges in UTF-16 code units of the text, as the index places the lines; their parents are the
     // outline's (`assemble_outline`).
     let line_range = |k: usize| index.line(&ids[k]).map(|l| l.range);
+    // Where a run member's place stands in the text.
+    let placed = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
     let mut nodes: Vec<StructureNode> = Vec::new();
     // A written page's line set apart keeps the id its line's kind gives it, as the projection reads such lines.
     let folios: HashSet<&str> = pages.iter().filter_map(|page| page.printed_label_line_id.as_deref()).collect();
@@ -368,10 +362,6 @@ fn output(pages: &mut [Page],
         nodes.push(node);
     }
     for (u, unit) in units.iter().enumerate() {
-        // The pairer's notes are written from its claims below.
-        if unit.region == NOTE {
-            continue;
-        }
         let ranges: Vec<ScalarRange> = unit.lines.iter().filter_map(|&k| line_range(k)).collect();
         let Some(envelope) = ranges.iter().map(|r| r.start).min().zip(ranges.iter().map(|r| r.end).max()) else { continue };
         let range = ScalarRange { start: envelope.0, end: envelope.1 };
@@ -400,9 +390,8 @@ fn output(pages: &mut [Page],
         let mut node = StructureNode::new(node_id(u), kind, range, TRANSITION_ORIGIN, derivation, None);
         node.role = role;
         node.ranges = ranges.clone();
-        node.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
-        let marker_range = unit.marker.and_then(|(start, end)| index.global_range(&id_of(unit.marker_line), start, end));
-        let placed = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
+        node.line_ids = unit.lines.iter().map(|&k| ids[k].clone()).collect();
+        let marker_range = unit.marker.and_then(|(start, end)| index.global_range(&ids[unit.marker_line], start, end));
         let lines: Vec<&str> = unit.lines.iter().map(|&k| texts[k].as_str()).collect();
         // A settled unit is addressed as the run it opens on reads it: a paragraph by its count, a provision by its
         // grammar's value (a clause, a part, an article), its printing an alias; its marker and text where they stand.
@@ -458,7 +447,6 @@ fn output(pages: &mut [Page],
         let mut holder = nodes.len() - 1;
         for &(run, at) in &opening.within {
             let member = &runs.runs[run as usize].members[at as usize];
-            let placed = |place: Place| index.line(&ids[fences.place[place.slot.index()] as usize]).map(|line| line.range.start + place.offset as usize);
             let (Some((start, end)), Some(role)) = (placed(member.marker[0]).zip(placed(member.marker[1])), member.kind) else { continue };
             let kind = match role {
                 legal_structure_model::UnitRole::Section => NodeKind::Section,
@@ -472,7 +460,7 @@ fn output(pages: &mut [Page],
             let mut own = StructureNode::new(format!("{}-{start}", node_id(u)), kind, ScalarRange { start, end: range.end }, TRANSITION_ORIGIN, Derivation::Native, Some(above.id.clone()));
             own.role = Some(PrimaryRole::Text);
             own.ranges = ranges.iter().filter(|part| part.end > start).map(|part| ScalarRange { start: part.start.max(start), end: part.end }).collect();
-            own.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
+            own.line_ids = unit.lines.iter().map(|&k| ids[k].clone()).collect();
             own.marker_range = Some(ScalarRange { start, end: end.max(start) });
             own.grammar.clone_from(&nodes[holder].grammar);
             own.content_start = placed(member.content);
@@ -507,20 +495,20 @@ fn output(pages: &mut [Page],
     nodes.extend(crate::graph::quotation_nodes(index, decided, TRANSITION_ORIGIN)?);
     // Text the parser read as no region's lies outside the body, as the gold leaves it: furniture.
     for (k, chosen) in moves.iter().enumerate() {
-        if chosen.region != 0 || texts[k].trim().is_empty() {
+        if chosen.region != 0 || noted[k] || texts[k].trim().is_empty() {
             continue;
         }
         let Some(range) = line_range(k) else { continue };
         let mut node = StructureNode::new(format!("transition-none-{:06}", k + 1), NodeKind::Prose, range, TRANSITION_ORIGIN, Derivation::Heuristic, None);
         node.role = Some(PrimaryRole::Furniture);
         node.ranges = vec![range];
-        node.line_ids = vec![id_of(k)];
+        node.line_ids = vec![ids[k].clone()];
         nodes.push(node);
     }
     // The constituent documents the parser opened, each of the kind the constituents reader names its
     // opening line, else a document.
     let starts: Vec<constituents::Start> = started.iter().map(|&k| {
-        let id = id_of(k);
+        let id = ids[k].clone();
         let kind = fences.starts.iter().find(|start| start.line_id == id).map_or("document", |start| start.kind()).to_owned();
         constituents::Start::new(id, &kind)
     }).collect();

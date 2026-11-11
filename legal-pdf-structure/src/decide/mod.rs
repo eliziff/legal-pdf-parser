@@ -6,9 +6,9 @@
 //! the reading order and each line's continuation of the one before). Each reading context's
 //! numbering runs are read and resolved (`runs`), and each document's note band is read against
 //! them (`notes`). Each line's readings are then heard (`rules`), the lines no rule settled weighed
-//! for headings (`residual`); the machine takes one decision on each line (`transition::tier0`); the
-//! document's outline is found on its lines and every heading levelled (`levels`), and the decision
-//! written to the pages once (`write`).
+//! for headings (`residual`); one walk decides and groups each line (`tier0::settle`), parting blocks as
+//! `write::Paragraphs` reads them; the document's outline is found on its lines and every heading
+//! levelled (`levels`), and the decision written to the pages once (`write`).
 
 
 pub(crate) mod notes;

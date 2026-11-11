@@ -26,6 +26,8 @@ use super::notes::Notes;
 use super::residual::weigh;
 use super::trace::ResidualRecord;
 use crate::machine::machine::Move;
+use crate::model::regions::TITLE;
+use crate::model::MarkerReading;
 use legal_structure_model::{CandidateGrammar, CandidateObservationV2, UnitRole};
 
 /// A unit a line opens: its run (an index into the document's runs) and its kind.
@@ -72,10 +74,11 @@ pub(crate) struct Heard {
 }
 
 /// What each line is: its move (`moves`, in reading order, `place` each slot's), the one record of its role, the rule
-/// that gave it, the unit it opens, whether it goes on with the line above it and its heading level; by slot, the reading
-/// of its opening marker that may open its unit (`readings`), the level a rule gives it (0 for none) and the anchor
-/// naming it (an index among the anchors, plus one; 0 for none); and, where the decision is traced, each residual
-/// candidate as the residual weighed it. A trace holds its readings of the lines.
+/// that gave it, the unit it opens or goes on in, whether it goes on with the line above it and its heading level; and
+/// what the hearing read, by slot: the reading of its opening marker that may open its unit (`openings`), the level a
+/// rule gives it (0 for none: a transcript's part, an anchor's) and the anchor naming it (an index among the anchors,
+/// plus one; 0 for none), each standing where the line's rule is that rule's; and, where the decision is traced, each
+/// residual candidate as the residual weighed it. A trace holds its readings of the lines.
 #[derive(Debug, Default, serde::Serialize)]
 pub(crate) struct Decision {
     pub(crate) moves: Vec<Move>,
@@ -94,8 +97,6 @@ pub(crate) struct Decision {
     /// is open to each rule, and what each says stands in `heard`. The moves hold the first reading of each line
     /// meanwhile, what a rule asks of the lines around it; `tier0::settle` puts the chosen move in its place.
     #[serde(skip)]
-    pub(crate) hearing: bool,
-    #[serde(skip)]
     pub(crate) free: Vec<bool>,
     #[serde(skip)]
     pub(crate) heard: Vec<Heard>,
@@ -107,7 +108,7 @@ pub(crate) struct Decision {
 /// ladder's and the ladder's before a list's, wherever each run starts (the engine has already
 /// read an order's count inside a numbered paragraph as a list; a factum's "PART I" ladder,
 /// starting above its first paragraph, takes no paragraph's number from the count).
-fn readings(runs: &Runs, count: usize) -> Vec<Option<(u32, u32)>> {
+fn openings(runs: &Runs, count: usize) -> Vec<Option<(u32, u32)>> {
     let mut chosen: Vec<Option<(u32, u32)>> = vec![None; count];
     let rank = |(r, k): (u32, u32)| (runs.runs[r as usize].members[k as usize].marker[0].offset, grammar_rank(runs.runs[r as usize].grammar));
     for (r, run) in runs.runs.iter().enumerate() {
@@ -163,35 +164,28 @@ impl Decision {
         &mut self.moves[self.place[at] as usize]
     }
 
-    /// Gives an open line a role; a decided line keeps its own. While the rules are heard, it is a rule's reading of a
-    /// line no fence took, for the one decision on it, and the line's first reading stands for the rules that ask what
-    /// is around them.
+    /// A rule's reading of a line no fence took, for the one decision on it; the line's first reading stands for the
+    /// rules that ask what is around them. Whether the line was open to it.
     fn fill(&mut self, slot: Slot, role: Role, rule: Rule) -> bool {
-        let at = slot.index();
-        if self.hearing && !self.free[at] {
+        if !self.free[slot.index()] {
             return false;
         }
-        if self.hearing {
-            self.heard.push(Heard { slot, role, rule, weight: 0.0, joined: false });
-        }
-        let line = self.line_mut(at);
-        let open = line.role == Role::Open;
-        if open {
+        self.heard.push(Heard { slot, role, rule, weight: 0.0, joined: false });
+        let line = self.line_mut(slot.index());
+        if line.role == Role::Open {
             (line.role, line.rule) = (role, rule);
         }
-        self.hearing || open
+        true
     }
 
     fn open(&self, slot: Slot) -> bool {
-        if self.hearing { self.free[slot.index()] } else { self.line(slot.index()).role == Role::Open }
+        self.free[slot.index()]
     }
 
     /// The reading just heard goes on with the line above it, or does not.
     fn heard_joined(&mut self, joined: bool) {
-        if self.hearing {
-            if let Some(last) = self.heard.last_mut() {
-                last.joined = joined;
-            }
+        if let Some(last) = self.heard.last_mut() {
+            last.joined = joined;
         }
     }
 
@@ -202,7 +196,7 @@ impl Decision {
     }
 
     /// The rules heard, none deciding: every reading each gives a line no fence took, in `heard`, for the one decision on
-    /// each line; `finish` follows it.
+    /// each line (`tier0::settle`); `finish` follows it. `readings`: each line's marker readings, by place.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn hear(pages: &[Page],
         slots: &Slots,
@@ -212,6 +206,7 @@ impl Decision {
         notes: &Notes,
         outline: &[PdfOutlineEntry],
         geometry: &Geometry,
+        readings: &[Vec<MarkerReading>],
         traced: bool,
         (role, rule): (Vec<Role>, Vec<Rule>),
     ) -> Self {
@@ -225,10 +220,9 @@ impl Decision {
         let mut decision = Self {
             moves,
             place: fences.place.clone(),
-            reading: readings(runs, count),
+            reading: openings(runs, count),
             given: vec![0; count],
             anchor: vec![0; count],
-            hearing: true,
             free,
             ..Self::default()
         };
@@ -347,37 +341,17 @@ impl Decision {
                         && place <= fences.place[slot.index()]
                 })
         };
-        weigh(pages, slots, evidence, fences, &sequences, geometry, &unnamed, &mut decision, traced);
+        weigh(pages, slots, evidence, fences, &sequences, geometry, readings, &unnamed, &mut decision, traced);
         decision.sequences = sequences;
         decision
     }
 
-    /// What follows the rules: the title among the headings, the counted markers no rule settled, the rest body, the
-    /// headings' levels and the disagreements.
-    pub(crate) fn finish(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry) {
+    /// What needs the whole document once the walk has decided its lines: the title among the headings, and the
+    /// headings' levels (`readings`: each line's marker readings, by place).
+    pub(crate) fn finish(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &Geometry, readings: &[Vec<MarkerReading>]) {
         let sequences = std::mem::take(&mut self.sequences);
         self.title(pages, slots, evidence, fences, &sequences, geometry);
-        // A counted marker no rule settled opens the unit its reading reads, the line carrying its
-        // text going on with it; every other line is body, or a quotation's.
-        for at in 0..self.place.len() {
-            let Some((r, k)) = self.reading[at] else { continue };
-            let member = &runs.runs[r as usize].members[k as usize];
-            let Some(kind) = member.kind else { continue };
-            let role = unit_role(kind);
-            if self.line(at).unit.is_none() && self.fill(member.slot, role, Rule::Opener) {
-                self.line_mut(at).unit = Some((r, kind));
-                self.join(member.text, role, Rule::Opener);
-            }
-        }
-        for (line, slot) in self.moves.iter_mut().zip(&fences.order) {
-            if line.role == Role::Open {
-                line.role = if fences.at(slot.index()).quotation != 0 { Role::Quote } else { Role::Body };
-                if line.rule == Rule::None {
-                    line.rule = Rule::Body;
-                }
-            }
-        }
-        heading_levels(pages, slots, evidence, fences, &sequences, geometry, self);
+        heading_levels(pages, slots, evidence, fences, &sequences, geometry, readings, self);
         self.sequences = sequences;
     }
 
@@ -730,8 +704,9 @@ impl Decision {
 
     /// The document's title, in each context outside a quotation: the first heading after its
     /// court's header and its parties and before its body opens (its first full line of prose), a
-    /// layout model's title among them, where the model labels it so or it is set as titles are
-    /// (centred in capitals or larger type, or larger in mixed case).
+    /// layout model's title among them where no rule but the residual's read the line, where the model labels it so or
+    /// it is set as titles are (centred in capitals or larger type, or larger in mixed case). An anchored heading is
+    /// none. The title's unit is the title's.
     fn title(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, sequences: &Sequences, geometry: &Geometry) {
         for (ctx, lines) in sequences.lines.iter().enumerate() {
             if fences.contexts[ctx].quotation != 0 {
@@ -753,7 +728,8 @@ impl Decision {
             for (k, &slot) in before.iter().enumerate().skip(parties) {
                 let at = slot.index();
                 let cue = evidence.tag[at] == SourceTag::Title;
-                if self.line(at).role != Role::Heading && !(cue && self.line(at).role == Role::Open) {
+                let unsettled = matches!(self.line(at).rule, Rule::Body | Rule::Residual);
+                if self.line(at).role != Role::Heading && !(cue && unsettled) {
                     continue;
                 }
                 let line = slots.line(pages, slot);
@@ -762,7 +738,7 @@ impl Decision {
                 let caps = all_caps(line.text.trim());
                 let larger = measure.size > 0.0 && f64::from(evidence.half_points[at]) / 2.0 >= measure.size * 1.1;
                 let set = cue || evidence.title_shaped[at] && (centred && (caps || larger) || larger && !caps);
-                if set && self.anchor[at] == 0 {
+                if set && self.line(at).rule != Rule::Anchor {
                     let wrapped = before[k + 1..]
                         .iter()
                         .take_while(|next| self.line(next.index()).joined && self.line(next.index()).role == Role::Heading)
@@ -770,7 +746,7 @@ impl Decision {
                     // A title has no heading's level.
                     for &title in &before[k..=k + wrapped] {
                         let line = self.line_mut(title.index());
-                        (line.role, line.rule, line.level) = (Role::Title, Rule::Title, 0);
+                        (line.role, line.rule, line.level, line.region) = (Role::Title, Rule::Title, 0, TITLE);
                     }
                 }
                 break;
@@ -787,7 +763,7 @@ fn centred(pages: &[Page], slots: &Slots, slot: Slot) -> bool {
 }
 
 /// The role of the line a marker opens a unit of its kind on.
-fn unit_role(kind: UnitRole) -> Role {
+pub(crate) fn unit_role(kind: UnitRole) -> Role {
     if kind == UnitRole::Item { Role::ListItem } else { Role::Body }
 }
 

@@ -15,7 +15,7 @@ use crate::headings::bookmarks::{
 };
 use crate::headings::rules::{ladder_levels, ATTACHMENTS};
 use crate::layout::Geometry;
-use crate::model::{Evidence, Role, Slot, Slots, SourceTag};
+use crate::model::{Evidence, MarkerReading, Role, Rule, Slot, Slots, SourceTag};
 use crate::text::text::enumerated;
 use super::residual::{apart, look_of, marker_alone, Families, Look};
 use super::rules::{body_like, Decision, OutlineAnchor, Sequences};
@@ -318,6 +318,7 @@ pub(crate) fn heading_levels(
     fences: &Fences,
     sequences: &Sequences,
     geometry: &Geometry,
+    readings: &[Vec<MarkerReading>],
     decision: &mut Decision,
 ) {
     let mut families = Families::default();
@@ -347,10 +348,16 @@ pub(crate) fn heading_levels(
             .zip(&texts)
             .map(|(unit, joined)| {
                 let first = if unit.len() > 1 && marker_alone(evidence, unit[0], text(unit[0])) { unit[1] } else { unit[0] };
-                look_of(pages, slots, evidence, fences, geometry, first, joined, &mut families).0
+                look_of(pages, slots, evidence, fences, geometry, first, joined, families.of(readings, fences, unit[0])).0
             })
             .collect();
-        let given = |unit: &[Slot]| usize::from(decision.given[unit[0].index()]);
+        // The level an anchor or a transcript's part gives its heading.
+        let rules: std::collections::HashMap<Slot, Rule> = units.iter().map(|unit| (unit[0], decision.line(unit[0].index()).rule)).collect();
+        let given = |unit: &[Slot]| match rules[&unit[0]] {
+            Rule::Anchor | Rule::TranscriptPart => usize::from(decision.given[unit[0].index()]),
+            _ => 0,
+        };
+        let anchored = |unit: &[Slot]| (rules[&unit[0]] == Rule::Anchor).then(|| decision.anchor[unit[0].index()]).filter(|&anchor| anchor > 0);
         let mut ranked: Vec<(Look, usize)> = Vec::new();
         for (k, look) in looks.iter().enumerate() {
             if given(&units[k]) == 0 && !ranked.iter().any(|(seen, _)| seen == look) {
@@ -366,13 +373,10 @@ pub(crate) fn heading_levels(
                 level => level,
             })
             .collect();
-        let placed = |unit: &[Slot]| {
-            let anchor = decision.anchor[unit[0].index()];
-            anchor > 0 && decision.anchors[anchor as usize - 1].confirmed
-        };
+        let placed = |unit: &[Slot]| anchored(unit).is_some_and(|anchor| decision.anchors[anchor as usize - 1].confirmed);
         // The level a tagged PDF's H1 to H6 gives a heading no anchor names.
         let tagged = |unit: &[Slot]| match evidence.tag[unit[0].index()] {
-            SourceTag::Heading(level) if level > 0 && decision.anchor[unit[0].index()] == 0 => Some(usize::from(level)),
+            SourceTag::Heading(level) if level > 0 && anchored(unit).is_none() => Some(usize::from(level)),
             _ => None,
         };
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();

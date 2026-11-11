@@ -322,7 +322,7 @@ fn derive_extracted(
     doc: Option<&crate::contract::DocOptions>,
 ) -> Result<StructureOutput> {
     let mode = if extracted.pages.iter().any(|page| page.source != "native") { "recognized" } else { "born-digital" };
-    let doc = doc.filter(|_| DOC_PROMOTED.contains(&mode)).map(|doc| Doc::load(&doc.model_pack, doc.runtime.as_deref(), false, false))
+    let doc = doc.filter(|_| DOC_PROMOTED.contains(&mode)).map(|doc| Doc::load(&doc.model_pack, doc.runtime.as_deref(), false))
         .transpose().map_err(|error| Error::Message(error).failure(FailureKind::Parser))?;
     let mut derived = legal_pdf_structure::derive(
         &mut extracted.pages,

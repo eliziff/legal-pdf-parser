@@ -37,7 +37,7 @@ use crate::fences::Fences;
 use crate::headings::date_line;
 use crate::layout::Geometry;
 use crate::model::{
-    Evidence, Role, Rule, Slot, Slots, SourceTag, LOOK_BOLD, LOOK_ITALIC, LOOK_UNDERLINED, WORD_DIVISION, WORD_SPEAKER,
+    Evidence, MarkerReading, Role, Rule, Slot, Slots, SourceTag, LOOK_BOLD, LOOK_ITALIC, LOOK_UNDERLINED, WORD_DIVISION, WORD_SPEAKER,
 };
 use crate::text::text::all_caps;
 use super::rules::{body_like, Decision, Sequences};
@@ -73,27 +73,16 @@ impl Look {
 pub(crate) struct Families(Vec<String>);
 
 impl Families {
-    fn id(&mut self, family: String) -> u16 {
-        if let Some(at) = self.0.iter().position(|known| *known == family) {
+    /// The family the line at `slot` opens a numbering in, as the numbering grammar reads its marker
+    /// (`MarkerReading::family`, its first reading; none where it reads no marker), by its index.
+    pub(crate) fn of(&mut self, readings: &[Vec<MarkerReading>], fences: &Fences, slot: Slot) -> u16 {
+        let family = readings[fences.place[slot.index()] as usize].first().map_or("", |reading| reading.family.as_str());
+        if let Some(at) = self.0.iter().position(|known| known == family) {
             return at as u16;
         }
-        self.0.push(family);
+        self.0.push(family.to_owned());
         (self.0.len() - 1).min(usize::from(u16::MAX)) as u16
     }
-}
-
-/// The numbering family of an enumerator's value and punctuation: arabic, roman, letter, by case.
-fn family(value: &str, punctuation: &str) -> String {
-    let kind = if value.chars().all(|c| c.is_ascii_digit()) {
-        "1"
-    } else if value.chars().all(|c| c.is_ascii_uppercase()) {
-        if value.len() == 1 { "A" } else { "I" }
-    } else if value.len() == 1 {
-        "a"
-    } else {
-        "i"
-    };
-    format!("{kind}{punctuation}")
 }
 
 /// How a line's type stands against the body's: the body's own (its face and size, neither bold,
@@ -118,8 +107,9 @@ fn positive_median(mut values: Vec<f64>) -> f64 {
     values[values.len() / 2]
 }
 
-/// The look of a heading or candidate whose first line is `first` and whose text, its lines joined,
-/// is `text`, and how its type stands against the body's (`Typeset`). A line no face was read for
+/// The look of a heading or candidate whose first line is `first`, whose text, its lines joined,
+/// is `text` and whose numbering family is `family` (`Families::of`), and how its type stands against the body's
+/// (`Typeset`). A line no face was read for
 /// (a scan's recognition) is set in the body's type unless it measures otherwise: larger where its
 /// height reads a size 1.1 times its page's, bold where its strokes are 1.2 times as thick as its
 /// page's.
@@ -131,7 +121,7 @@ pub(crate) fn look_of(
     geometry: &Geometry,
     first: Slot,
     text: &str,
-    families: &mut Families,
+    family: u16,
 ) -> (Look, Typeset) {
     let at = first.index();
     let page = slots.page(first);
@@ -169,7 +159,6 @@ pub(crate) fn look_of(
         larger,
         set_apart: bold || larger || underlined || caps || italic && !smaller,
     };
-    let family = headings::rules::enumerator(text).map_or_else(String::new, |(value, punctuation)| family(&value, &punctuation));
     let look = Look {
         face: evidence.face[at],
         size: evidence.half_points[at],
@@ -178,7 +167,7 @@ pub(crate) fn look_of(
         caps,
         underlined,
         place,
-        family: families.id(family),
+        family,
     };
     (look, typeset)
 }
@@ -238,6 +227,7 @@ pub(crate) fn weigh(pages: &[Page],
     fences: &Fences,
     sequences: &Sequences,
     geometry: &Geometry,
+    readings: &[Vec<MarkerReading>],
     unnamed: &impl Fn(Slot) -> bool,
     decision: &mut Decision,
     traced: bool,
@@ -333,7 +323,7 @@ pub(crate) fn weigh(pages: &[Page],
             }
             let text = sequence[k..end].iter().map(|&slot| line(slot).text.trim()).collect::<Vec<_>>().join(" ");
             // A numbered title is set as its title's line is, whatever its number's type.
-            let (look, typeset) = look_of(pages, slots, evidence, fences, geometry, title, &text, &mut families);
+            let (look, typeset) = look_of(pages, slots, evidence, fences, geometry, title, &text, families.of(readings, fences, first));
             let enumerated = headings::rules::enumerator(&text);
             let division_word = enumerated.as_ref().is_some_and(|(_, punctuation)| punctuation.chars().any(char::is_alphabetic));
             let next = sequence.get(end).copied();

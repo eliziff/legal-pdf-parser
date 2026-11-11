@@ -1,7 +1,7 @@
 //! The decision as the readers after it take it: written to the pages once (each line's place in
 //! its page's reading order, whether it is held out of the body as a transcript's line number, each
-//! page's printed label and the line printing it), and read by slot (each line's zone and block, and
-//! the lines as the note pairer reads them).
+//! page's printed label and the line printing it), and read by slot (each line's zone, and the lines as the note pairer
+//! reads them); and what parts the lines into blocks (`Paragraphs`), which the walk numbers as it decides them.
 //!
 //! A block is one printed paragraph or unit: it starts where a unit opens (its marker and the line
 //! beside it one start), where a heading, title or marginal note starts (its wrapped lines going on
@@ -25,6 +25,7 @@ use crate::notes::band::NoteKind;
 use crate::text::paragraphs::{measure_of, paragraphs_of, Measure};
 use super::notes::Notes;
 use super::rules::Decision;
+use crate::machine::machine::Move;
 use legal_structure_model::UnitRole;
 use legal_pdf_core::model::{LineZone, NoteLine, NoteMode, NotePage};
 
@@ -143,11 +144,18 @@ fn same_row(evidence: &Evidence, slots: &Slots, a: Slot, b: Slot) -> bool {
     row != u32::MAX && slots.page(a) == slots.page(b) && evidence.row(slots, b) == row
 }
 
-/// Each line's block, by slot, numbered on each page after the page's own blocks; a line label, folio or furniture keeps
-/// its own.
-pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, decision: &Decision) -> Vec<usize> {
+/// What parts a page's lines into blocks, read before the walk decides them (`tier0::settle`, which numbers the blocks
+/// as it goes): each line's printed paragraph (`paragraphs_of`) among its document and language's counted lines and its
+/// contents entry (`entry_rows`), over the roles the rules first gave the lines; and each document's first page.
+pub(crate) struct Paragraphs {
+    paragraph: Vec<Option<usize>>,
+    entry: Vec<Option<usize>>,
+    opening: Vec<usize>,
+}
+
+impl Paragraphs {
+pub(crate) fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, role: impl Fn(usize) -> Role) -> Self {
     let count = slots.len();
-    let role = |at: usize| decision.line(at).role;
     let counted = |slot: Slot| matches!(class(role(slot.index())), Class::Body | Class::Contents | Class::Table);
     let group = |slot: Slot| (fences.at(slot.index()).document, fences.at(slot.index()).translation);
     // Each document and language's measure (`measure_of`), on its counted lines page by page.
@@ -169,34 +177,11 @@ pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences:
         }
     }
     let measures: Vec<((u16, bool), Measure)> = lines_of.iter().map(|(key, lines)| (*key, measure_of(lines))).collect();
-    // Each document's front: its first page, and the place of its first unit in the reading order.
-    let documents = fences.documents();
-    let (mut opening, mut first_unit) = (vec![usize::MAX; documents], vec![u32::MAX; documents]);
-    for (place, &slot) in fences.order.iter().enumerate() {
+    let mut opening = vec![usize::MAX; fences.documents()];
+    for &slot in &fences.order {
         let document = usize::from(fences.at(slot.index()).document);
         opening[document] = opening[document].min(slots.page(slot));
-        if decision.moves[place].unit.is_some() {
-            first_unit[document] = first_unit[document].min(place as u32);
-        }
     }
-    // A caption's line of front matter (`Rule::FrontMatter`) in its document's front: a field, a
-    // label, a court's name or a jurat, which stands on its own (`opens`), or one of those, a
-    // party's role or a date, after which the next line stands on its own (`closes`). A signature,
-    // an author's line or a lead-in's colon is no heading, and still the paragraph's it stands in.
-    let caption = |slot: Slot, bits: u32| {
-        let at = slot.index();
-        let document = usize::from(fences.at(at).document);
-        decision.line(at).rule == Rule::FrontMatter
-            && (slots.page(slot) < opening[document].saturating_add(2) || fences.place[at] < first_unit[document])
-            && (evidence.words[at] & bits != 0 || bits & WORD_FIELD != 0 && crate::text::paragraphs::field_label(slots.line(pages, slot)))
-    };
-    let opens = |slot: Slot| {
-        caption(slot, WORD_FIELD | WORD_LABEL | WORD_COURT | WORD_JURAT)
-            && evidence.words[slot.index()] & WORD_PARTY == 0
-            && fences.continues[slot.index()].is_none()
-    };
-    let closes = |slot: Slot| caption(slot, WORD_FIELD | WORD_LABEL | WORD_COURT | WORD_JURAT | WORD_PARTY | WORD_DATE);
-    let mut blocks = vec![None; count];
     let mut paragraph = vec![None; count];
     let mut entry = vec![None; count];
     for (page_slot, page) in pages.iter().enumerate() {
@@ -225,43 +210,46 @@ pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences:
                 entry[slot.index()] = number;
             }
         }
-        let mut next = page.lines.iter().map(|line| line.block_index).max().unwrap_or(0);
-        let mut previous: Option<Slot> = None;
-        for &slot in order {
-            let at = slot.index();
-            let kind = class(role(at));
-            if kind == Class::Edge {
-                previous = Some(slot);
-                continue;
-            }
-            // The line a margin's paragraph number numbers goes on in the number's block.
-            let start = previous.is_none_or(|prior| {
-                let before = prior.index();
-                if fences.margin_number[before] == Some(slot) {
-                    return false;
-                }
-                let free = !decision.line(at).joined && fences.continues[at].is_none();
-                class(role(before)) != kind
-                    || fences.ctx[before] != fences.ctx[at]
-                    || match kind {
-                        Class::Body => {
-                            decision.line(at).unit.is_some()
-                                || (opens(slot) || closes(prior) && free) && !decision.line(at).joined && !same_row(evidence, slots, prior, slot)
-                                || free && paragraph[at] != paragraph[before]
-                        }
-                        Class::Heading | Class::Title | Class::MarginalNote => !decision.line(at).joined,
-                        Class::Note => evidence.label[at].is_some(),
-                        Class::Contents => entry[at] != entry[before],
-                        Class::Table => paragraph[at] != paragraph[before] || fences.cell[at] != fences.cell[before],
-                        Class::Edge => true,
-                    }
-            });
-            if start {
-                next += 1;
-            }
-            blocks[at] = Some(next);
-            previous = Some(slot);
-        }
     }
-    blocks.into_iter().enumerate().map(|(at, block)| block.unwrap_or_else(|| slots.line(pages, Slot(at as u32)).block_index)).collect()
+    Self { paragraph, entry, opening }
+}
+
+/// Whether a line (its slot, its move, and whether it stands before its document's first unit) starts a block after
+/// `prior`, the line before it on its page (likewise); neither a line label, folio or furniture, which keeps its own.
+/// A caption's line of front matter (`Rule::FrontMatter`) in its document's front (its first two pages, its lines
+/// before its first unit): a field, a label, a court's name or a jurat stands on its own (`opens`), and the line after
+/// one of those, a party's role or a date stands on its own (`closes`). A signature, an author's line or a lead-in's
+/// colon is no heading, and still the paragraph's it stands in. The line a margin's paragraph number numbers goes on in
+/// the number's block.
+pub(crate) fn starts(&self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, prior: (Slot, &Move, bool), line: (Slot, &Move, bool)) -> bool {
+    let caption = |(slot, decided, front): (Slot, &Move, bool), bits: u32| {
+        let at = slot.index();
+        decided.rule == Rule::FrontMatter
+            && (slots.page(slot) < self.opening[usize::from(fences.at(at).document)].saturating_add(2) || front)
+            && (evidence.words[at] & bits != 0 || bits & WORD_FIELD != 0 && crate::text::paragraphs::field_label(slots.line(pages, slot)))
+    };
+    let (slot, decided, _) = line;
+    let (before, at) = (prior.0.index(), slot.index());
+    if fences.margin_number[before] == Some(slot) {
+        return false;
+    }
+    let kind = class(decided.role);
+    let free = !decided.joined && fences.continues[at].is_none();
+    let opens = || caption(line, WORD_FIELD | WORD_LABEL | WORD_COURT | WORD_JURAT) && evidence.words[at] & WORD_PARTY == 0 && fences.continues[at].is_none();
+    let closes = || caption(prior, WORD_FIELD | WORD_LABEL | WORD_COURT | WORD_JURAT | WORD_PARTY | WORD_DATE);
+    class(prior.1.role) != kind
+        || fences.ctx[before] != fences.ctx[at]
+        || match kind {
+            Class::Body => {
+                decided.unit.is_some()
+                    || (opens() || closes() && free) && !decided.joined && !same_row(evidence, slots, prior.0, slot)
+                    || free && self.paragraph[at] != self.paragraph[before]
+            }
+            Class::Heading | Class::Title | Class::MarginalNote => !decided.joined,
+            Class::Note => evidence.label[at].is_some(),
+            Class::Contents => self.entry[at] != self.entry[before],
+            Class::Table => self.paragraph[at] != self.paragraph[before] || fences.cell[at] != fences.cell[before],
+            Class::Edge => true,
+        }
+}
 }

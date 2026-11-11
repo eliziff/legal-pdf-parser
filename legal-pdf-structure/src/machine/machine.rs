@@ -40,9 +40,7 @@ pub(crate) struct Move {
     /// The unit the line is in, by its first line's place, where the line does not open it: the unit open above it, one
     /// picked up past a block quotation or a page's notes, or one of two read in turn (a form's labels and their values).
     pub(crate) resumes: Option<u32>,
-    /// The line's place in the reading the parse makes, where it reads the page in another order than the
-    /// parser's lines (two columns read one after the other, a form's labels with their values).
-    pub(crate) rank: Option<u32>,
+
     /// Opens a constituent document of the source (an exhibit, a schedule, a message an email quotes):
     /// its contexts, outline and numbering begin anew.
     pub(crate) starts: bool,
@@ -59,12 +57,7 @@ pub(crate) struct Move {
 impl Move {
     /// A move making nothing but its region and whether it opens.
     pub(crate) fn plain(region: u8, opens: bool) -> Self {
-        Self { role: Role::Open, rule: Rule::None, joined: false, unit: None, region, opens, reading: None, note: None, level: 0, depth: 0, resumes: None, rank: None, starts: false, answers: [None; 4], member: None, within: Vec::new() }
-    }
-
-    /// The line's grouping made anew (`made`), its decision kept: its role, rule, joining and unit.
-    pub(crate) fn regroup(&mut self, made: Move) {
-        *self = Move { role: self.role, rule: self.rule, joined: self.joined, unit: self.unit, ..made };
+        Self { role: Role::Open, rule: Rule::None, joined: false, unit: None, region, opens, reading: None, note: None, level: 0, depth: 0, resumes: None, starts: false, answers: [None; 4], member: None, within: Vec::new() }
     }
 }
 

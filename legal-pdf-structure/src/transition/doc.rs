@@ -12,9 +12,8 @@
 //! - Order, over the document's regions (rotary positions over the parser's order; each pair of regions within a
 //!   page of each other scored on their places too: their boxes, pages, distance in order, roles, and whether a
 //!   note's number is a mark the other sets): the region a unit goes on in (a paragraph past a page or a
-//!   quotation), a note's region the region holding its reference mark, and each region's successor in the
-//!   reading, the regions read by following it (the next unread region in the parser's order where it is unsure)
-//!   and each page's lines written in that order;
+//!   quotation), and a note's region the region holding its reference mark; the lines are read in the parser's
+//!   order (the successor head's reading of another was never written: it is not read);
 //! - Construct, over the headings that open a unit and over the body's: each node's parent and left sibling
 //!   among the nodes before it, the tree built by the paper's Algorithm 1 (each node the right-most child of
 //!   the node on the tree's right-most path whose parent score times its child's sibling score is greatest),
@@ -263,7 +262,7 @@ fn gold_region(g: &[i64; 8]) -> i64 {
 /// part, its tree (each node under the nearest open node of a smaller level, the left sibling that parent's
 /// last child), its gap, and a note's region the region before it (two pages back at most) holding a mark of
 /// its number the gold pairs; read through the same `insert` and `moves_of` as the model's.
-pub(crate) fn oracle(gold: &[[i64; 8]], ranks: &[i64], views: &[LineView], texts: &[&str], pages: &[usize]) -> Vec<Move> {
+pub(crate) fn oracle(gold: &[[i64; 8]], views: &[LineView], texts: &[&str], pages: &[usize]) -> Vec<Move> {
     let n = gold.len();
     // Each line's unit, as the gold's decoder reads its rows (`docparse.gold_units`).
     let mut unit = vec![usize::MAX; n];
@@ -349,24 +348,7 @@ pub(crate) fn oracle(gold: &[[i64; 8]], ranks: &[i64], views: &[LineView], texts
         found.map(|j| region_of[j])
     }).collect();
     let gold_marks: Vec<bool> = gold.iter().map(|g| g[3] == 1).collect();
-    let mut moves = moves_of(&lines, &regions, &Units { before, level, note }, views, texts, Some(&gold_marks));
-    read_in(&mut moves, ranks, pages);
-    moves
-}
-
-/// The reading's order of the lines: each page's lines by their ranks (a line without one just after the line
-/// before it), as places in the document.
-fn read_in(moves: &mut [Move], ranks: &[i64], pages: &[usize]) {
-    if ranks.iter().all(|&r| r < 0) { return; }
-    // A line without a rank takes the last rank before it on its page, read after that line.
-    let mut last = (usize::MAX, -1i64);
-    let mut keyed: Vec<(usize, i64, usize)> = (0..moves.len()).map(|k| {
-        if pages[k] != last.0 { last = (pages[k], -1); }
-        if ranks[k] >= 0 { last.1 = ranks[k]; }
-        (pages[k], last.1, k)
-    }).collect();
-    keyed.sort();
-    keyed.iter().enumerate().for_each(|(place, &(.., k))| moves[k].rank = Some(place as u32));
+    moves_of(&lines, &regions, &Units { before, level, note }, views, texts, Some(&gold_marks))
 }
 
 // ------------------------------------------------------------------------------------------------- the model
@@ -427,9 +409,6 @@ mod model {
         gaps: [bool; 2],
         /// Whether each tree's graph takes the pairwise grammar and geometry inputs (`family`).
         tree_pairs: [bool; 2],
-        /// Whether the reading's order is read off the successor head (by default the parser's order is kept:
-        /// ordered region by region, a transcript's line numbers would leave their lines).
-        reorder: bool,
         /// Whether each document's stages' times are written, for the reader's speed.
         times: bool,
         tokenizer: tokenizers::Tokenizer,
@@ -440,9 +419,6 @@ mod model {
     /// A successor link the predecessor head does not choose back is kept where the successor head holds it
     /// likelier than this.
     const SURE: f32 = 0.5;
-    /// The reading leaves the parser's order where the successor head holds another region at least this likely
-    /// (and the parser's next at most its complement).
-    const SURE_ORDER: f32 = 0.9;
     /// The Order graph's attention block (`docparse.BLOCK`): its regions come padded to whole blocks.
     const BLOCK: usize = 64;
 
@@ -460,7 +436,7 @@ mod model {
     impl Reader {
         /// The stages under `dir`, their ONNX Runtime at `runtime` (else the one LEGALPDF_ONNX_RUNTIME or
         /// LEGALPDF_ONNXRUNTIME names); the text model's reading checked against Python's on `parity.json`'s texts.
-        pub fn load(dir: &Path, runtime: Option<&Path>, reorder: bool, times: bool) -> std::result::Result<Self, String> {
+        pub fn load(dir: &Path, runtime: Option<&Path>, times: bool) -> std::result::Result<Self, String> {
             let read = |name: &str| std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"));
             let meta: Meta = serde_json::from_str(&read("docparse.json")?).map_err(|e| format!("docparse.json: {e}"))?;
             if meta.width != ALL || meta.classes != CLASSES || meta.mean.len() != ALL || meta.std.len() != ALL {
@@ -475,7 +451,7 @@ mod model {
             let first = Sessions::load(dir)?;
             let gaps = [&first.headings, &first.bodies].map(|s| s.outputs.iter().any(|o| o.name == "gap"));
             let tree_pairs = [&first.headings, &first.bodies].map(|s| s.inputs.iter().any(|i| i.name == "family"));
-            let reader = Self { dir: dir.to_path_buf(), sessions: Mutex::new(vec![first]), gaps, tree_pairs, reorder, times, tokenizer, embeddings, meta };
+            let reader = Self { dir: dir.to_path_buf(), sessions: Mutex::new(vec![first]), gaps, tree_pairs, times, tokenizer, embeddings, meta };
             let parity: Parity = serde_json::from_str(&read("parity.json")?).map_err(|e| format!("parity.json: {e}"))?;
             let ours = reader.embed(&parity.texts.iter().map(String::as_str).collect::<Vec<&str>>())?;
             let worst = parity.vectors.iter().flatten().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
@@ -616,7 +592,7 @@ mod model {
             let region_valid: Vec<bool> = (0..padded).map(|i| i < count).collect();
             region_boxes.resize(padded * 4, 0.0);
             region_pages.resize(padded, -1);
-            let (region_states, goes_on, note_of, successor) = {
+            let (region_states, goes_on, note_of) = {
                 let outputs = sessions.order.run(ort::inputs!["line_states" => tensor!([line_region.len(), d], &line_states[..]),
                     "line_region" => tensor!([line_region.len()], &line_region[..]), "region_roles" => tensor!([padded], &kinds[..]),
                     "region_valid" => tensor!([padded], &region_valid[..]), "region_boxes" => tensor!([padded, 4], &region_boxes[..]),
@@ -632,7 +608,7 @@ mod model {
                         q[i * d..(i + 1) * d].iter().zip(&k[j * d..(j + 1) * d]).map(|(a, b)| a * b).sum::<f32>() + r[p]
                     }).collect())
                 };
-                (take("regions")?, head("goes_on")?, head("note_of")?, head("successor")?)
+                (take("regions")?, head("goes_on")?, head("note_of")?)
             };
             // Each region's pairs (contiguous: built region by region), and each head's softmax over them.
             let mut rows: Vec<(usize, usize)> = vec![(0, 0); count];
@@ -646,30 +622,12 @@ mod model {
                 rows.iter().filter(|&&(a, z)| a < z).for_each(|&(a, z)| probs[a..z].copy_from_slice(&softmax_rows(&logits[a..z], z - a)));
                 probs
             };
-            let (goes_on, note_of, successor) = (row_softmax(&goes_on), row_softmax(&note_of), row_softmax(&successor));
+            let (goes_on, note_of) = (row_softmax(&goes_on), row_softmax(&note_of));
             // A region's likeliest other region by a head, with its probability (itself, where it has no pairs).
             let best = |probs: &[f32], i: usize, open: &dyn Fn(usize) -> bool| -> Option<(usize, f32)> {
                 let (a, z) = rows[i];
                 (a..z).filter(|&p| open(pair_j[p] as usize)).max_by(|&x, &y| probs[x].total_cmp(&probs[y])).map(|p| (pair_j[p] as usize, probs[p]))
             };
-            // The reading: from the parser's first region, each region's likeliest unread successor where the head
-            // holds it likelier than none (the region itself), else the next unread region in the parser's order.
-            let mut place = vec![usize::MAX; count];
-            let (mut at, mut next_unread) = (0usize, 0usize);
-            for position in 0..count {
-                place[at] = position;
-                while next_unread < count && place[next_unread] != usize::MAX { next_unread += 1; }
-                if position + 1 == count { break; }
-                // The parser's next unread region, unless the head is sure of another (and holds the parser's next
-                // all but impossible); a line's number or a page's label is never read out of the parser's order.
-                let labels = |i: usize| matches!(role(i), LINE_LABEL | PAGE_LABEL);
-                let unread = |j: usize| place[j] == usize::MAX && !labels(j);
-                let parsers = (rows[at].0..rows[at].1).find(|&p| pair_j[p] as usize == next_unread).map_or(0.0, |p| successor[p]);
-                at = match best(&successor, at, &unread) {
-                    Some((j, p)) if !labels(at) && j != next_unread && p >= SURE_ORDER && parsers <= 1.0 - SURE_ORDER => j,
-                    _ => next_unread,
-                };
-            }
             // Units: a region goes on in the later region its link holds likeliest, each region taken once, the
             // surest links first.
             let mut links: Vec<(usize, usize, f32)> = (0..count).filter_map(|i| best(&goes_on, i, &|_| true).filter(|&(j, _)| j > i).map(|(j, p)| (i, j, p))).collect();
@@ -752,11 +710,7 @@ mod model {
                 if target != i { claimed.insert((target, val)); note[i] = Some(target); }
             }
             lap(3, &mut since);
-            let mut moves = moves_of(&lines, &regions, &Units { before, level, note }, views, texts, None);
-            // Each line's rank: its region's place in the reading, then its place in the region.
-            let mut ranks = vec![-1i64; n];
-            regions.read.iter().enumerate().for_each(|(i, &r)| regions.lines[r].iter().enumerate().for_each(|(at, &k)| ranks[k] = place[i] as i64 * 100_000 + at as i64));
-            if self.reorder { read_in(&mut moves, &ranks, pages); }
+            let moves = moves_of(&lines, &regions, &Units { before, level, note }, views, texts, None);
             lap(4, &mut since);
             if self.times {
                 eprintln!("doc times: {n} lines {count} regions {} pairs; embed {:.3}s detect {:.3}s order {:.3}s trees {:.3}s decode {:.3}s",
