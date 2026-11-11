@@ -312,8 +312,8 @@ pub struct Composer {
 }
 
 fn fmt(value: f64) -> String {
-    let rounded = (value * 10_000.0).round() / 10_000.0;
-    let text = format!("{rounded:.4}");
+    let rounded = (value * 1_000_000.0).round() / 1_000_000.0;
+    let text = format!("{rounded:.6}");
     let text = text.trim_end_matches('0').trim_end_matches('.');
     if text == "-0" || text.is_empty() { "0".into() } else { text.into() }
 }
@@ -362,7 +362,8 @@ impl Composer {
         if let Some(index) = self.fonts.iter().position(|f| f.face == face) { return index; }
         let id = self.doc.new_object_id();
         let embedded = if face.arial() { system_arial(face).filter(|b| ttf_parser::Face::parse(b, 0).is_ok()).map(|b| (b, BTreeMap::new())) } else { None };
-        self.fonts.push(FontSlot { face, id, name: format!("BvF{}", self.fonts.len() + 1), base: face.base_name().into(), embedded });
+        // Named as pdf-lib names a font in a page's resources: its PostScript name and a number.
+        self.fonts.push(FontSlot { face, id, name: format!("{}-{}", face.base_name(), self.fonts.len() + 1), base: face.base_name().into(), embedded });
         self.fonts.len() - 1
     }
     pub fn face(&self, font: usize) -> Face { self.fonts[font].face }
