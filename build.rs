@@ -93,15 +93,17 @@ fn crate_inputs(root: &Path, name: &str) -> Vec<PathBuf> {
 }
 
 /// What reads a page's text: the OCR crate's manifest and its top-level sources, but not its
-/// re-exports (lib.rs), its raster measures (raster.rs, keyed on their own) or its command-line tool
-/// (bin); and the page renderer it reads.
+/// re-exports (lib.rs), its raster measures (raster.rs, keyed on their own), its command-line tool
+/// (bin), or where it finds its model pack and plans its run (model_pack.rs, planning.rs: the
+/// provider's identity, part of the key, holds the pack's hashes and the plan); and the page renderer
+/// it reads. Where a provider's files are found (legal-pdf-core's asset.rs) is no input either.
 fn recognition_sources(root: &Path) -> Vec<PathBuf> {
     let owner = root.join("legal-pdf-ocr");
     let mut inputs = vec![owner.join("Cargo.toml"), root.join("legal-pdf-core/src/render.rs")];
     for entry in fs::read_dir(owner.join("src")).unwrap().flatten() {
         let path = entry.path();
         let name = entry.file_name();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") && name != "lib.rs" && name != "raster.rs" {
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") && !["lib.rs", "raster.rs", "model_pack.rs", "planning.rs"].contains(&name.to_str().unwrap_or_default()) {
             inputs.push(path);
         }
     }
@@ -134,7 +136,6 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
     let mut recognition = paths(&[
         "legal-pdf-core/Cargo.toml",
         "legal-pdf-core/src/ocr_contract.rs",
-        "legal-pdf-core/src/asset.rs",
         "legal-pdf-core/src/ort_backend.rs",
         "legal-pdf-core/src/ort_runtime.rs",
     ]);
@@ -164,7 +165,6 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
     let layout = paths(&[
         "legal-pdf-core/Cargo.toml",
         "legal-pdf-core/src/model.rs",
-        "legal-pdf-core/src/asset.rs",
         "legal-pdf-core/src/ort_backend.rs",
         "legal-pdf-core/src/ort_runtime.rs",
         "legal-pdf-support/Cargo.toml",
