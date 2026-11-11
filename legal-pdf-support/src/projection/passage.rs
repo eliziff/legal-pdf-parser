@@ -363,20 +363,21 @@ fn place_quote(pages: &[ReadPage], status: PdfLookupStatus, quote: &QuoteSelecti
         rects: fragments[0].rects.clone(), fragments: Some(fragments) }
 }
 
-/// A unit of a Word brief whose citations are placed on the pages of a PDF saved from it: whether it is a note, its
-/// text, and its citations, each by its id, its span of the text (UTF-16) and its own text.
+/// A unit of a Word brief whose citations are placed on the pages of a PDF saved from it, as its draft holds it: the
+/// note it is (none for the body), its text, and its citations' ids.
 #[derive(Deserialize)]
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
 pub struct BriefUnit {
-    note: bool,
+    #[cfg_attr(feature = "binding-types", ts(type = "number | null"))]
+    footnote_id: Option<serde::de::IgnoredAny>,
     text: String,
-    occurrences: Vec<BriefOccurrence>,
+    occurrence_ids: Vec<String>,
 }
 
+/// A citation of the brief (the draft's, by its id): its span of its unit's text (UTF-16) and its own text.
 #[derive(Deserialize)]
-#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct BriefOccurrence {
-    id: String,
     start: usize,
     end: usize,
     text: String,
@@ -388,7 +389,8 @@ pub struct BriefOccurrence {
 /// before or those after, from where its stream left off and then from the start; the citation alone is tried last,
 /// and is not read on from, for it also matches the brief's own table of authorities, which lies past every later
 /// citation. A citation that cannot be placed has none.
-pub fn brief_occurrence_pages(pages: &[String], units: &[BriefUnit]) -> BTreeMap<String, u32> {
+pub fn brief_occurrence_pages(pages: &[String], units: &[BriefUnit], occurrences: &HashMap<String, BriefOccurrence>)
+    -> BTreeMap<String, u32> {
     let words: Vec<(String, u32)> = pages.iter().enumerate()
         .flat_map(|(at, text)| passage_words(text).into_iter().map(move |word| (word, at as u32 + 1))).collect();
     let mut positions = HashMap::<&str, Vec<usize>>::new();
@@ -401,8 +403,8 @@ pub fn brief_occurrence_pages(pages: &[String], units: &[BriefUnit]) -> BTreeMap
     let mut placed = BTreeMap::new();
     for unit in units {
         let text = ScalarText::new(&unit.text);
-        let stream = usize::from(unit.note);
-        for occurrence in &unit.occurrences {
+        let stream = usize::from(unit.footnote_id.is_some());
+        for (id, occurrence) in unit.occurrence_ids.iter().filter_map(|id| Some((id, occurrences.get(id)?))) {
             let before = passage_words(text.slice_utf16(0..occurrence.start).unwrap_or(""));
             let before = before[before.len().saturating_sub(4)..].to_vec();
             let core = passage_words(&occurrence.text);
@@ -416,7 +418,7 @@ pub fn brief_occurrence_pages(pages: &[String], units: &[BriefUnit]) -> BTreeMap
                 .chain([(&core, 0, cursor, true)]);
             for (needle, skip, from, alone) in attempts {
                 let Some(at) = (needle.len() > 1).then(|| find(needle, from)).flatten() else { continue };
-                placed.insert(occurrence.id.clone(), words[at + skip].1);
+                placed.insert(id.clone(), words[at + skip].1);
                 if !alone {
                     cursors[stream] = at + needle.len();
                 }

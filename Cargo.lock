@@ -1166,6 +1166,7 @@ dependencies = [
  "hayro",
  "legal-layout",
  "legal-structure",
+ "legal-structure-model",
  "ort",
  "serde",
  "serde_json",
