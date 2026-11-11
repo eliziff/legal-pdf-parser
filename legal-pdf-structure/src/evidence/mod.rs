@@ -10,18 +10,19 @@ use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median};
 use crate::furniture::compact_note_line;
 use crate::headings::native::{bold_char_share, date_line};
-use crate::headings::{self as headings, captions, contents_lists};
+use crate::headings::{self, captions, contents_lists};
 use crate::notes::{endnote_heading, label_is_raised, label_spans, reference_wrapped_onto, structural_reset_heading};
-use crate::text::text::{all_caps, party_label, sentence_ended};
+use crate::text::text::{all_caps, party_label};
+use legal_pdf_core::model::sentence_ended;
 use legal_structure_model::text::{is_note_symbol, label_prefix, normalize_label};
 use regex::Regex;
 use std::collections::HashMap;
-pub use crate::model::evidence::*;
+use crate::model::evidence::*;
 use crate::model::{Slot, Slots};
 use legal_pdf_core::{dominant_face, regex, CitationSpan, ITALIC};
 use crate::tables::PageItems;
 
-pub fn page_rows(page: &Page) -> Rows {
+pub(crate) fn page_rows(page: &Page) -> Rows {
     let lines = &page.lines;
     let mut order: Vec<usize> = (0..lines.len())
         .filter(|&slot| {
@@ -64,16 +65,16 @@ pub fn page_rows(page: &Page) -> Rows {
 
 /// What normalizing leaves to be measured: which lines are a transcript's line numbers, by slot,
 /// and each page's words as text items.
-pub struct Normalized {
-    pub line_numbers: Vec<bool>,
-    pub items: Vec<PageItems>,
+pub(crate) struct Normalized {
+    pub(crate) line_numbers: Vec<bool>,
+    pub(crate) items: Vec<PageItems>,
 }
 
 /// The pages normalized, the only change to their text before the runs are read: a transcript's
 /// line numbers parted from the lines they were read into and held out of the body
 /// (`split_line_numbers`, so no page's items offer them), a table's rulings cleared from under its
 /// words (`clear_table_underlines`), and every line's slot.
-pub fn normalize(pages: &mut [Page]) -> (Slots, Normalized) {
+pub(crate) fn normalize(pages: &mut [Page]) -> (Slots, Normalized) {
     let numbers = crate::text::line_numbers::split_line_numbers(pages);
     let mut items: Vec<PageItems> = pages.iter().map(crate::tables::page_items).collect();
     for (page, items) in pages.iter_mut().zip(&mut items) {
@@ -195,7 +196,7 @@ fn glued_re() -> &'static Regex {
 
 /// A line's spans of figures or note symbols set as references, its type set at `size`: each span's
 /// text and how it is set (`REFERENCE_SUPERSCRIPT`, or `REFERENCE_RAISED`: smaller or raised).
-pub fn reference_marks(line: &Line, size: f64) -> impl Iterator<Item = (&str, u8)> {
+pub(crate) fn reference_marks(line: &Line, size: f64) -> impl Iterator<Item = (&str, u8)> {
     let height = line.bbox[3] - line.bbox[1];
     line.spans.iter().filter_map(move |span| {
         let text = span.text.trim();
@@ -217,7 +218,7 @@ pub fn reference_marks(line: &Line, size: f64) -> impl Iterator<Item = (&str, u8
 /// (0 for a note symbol) and its first and past-last UTF-16 code unit. A mark is found by its span's text,
 /// spans read in order along the line; one whose text the line does not hold there is left out. A
 /// detached reference stands where it says.
-pub fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
+pub(crate) fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
     let value = |text: &str| text.trim().parse().unwrap_or(0);
     let chars: Vec<char> = line.text.chars().collect();
     let marks: Vec<&str> = reference_marks(line, size).map(|(text, _)| text).collect();
@@ -285,7 +286,7 @@ fn closed_up(text: &str) -> std::borrow::Cow<'_, str> {
 /// Every reading of a line's opening token by the numbering grammar: read alone and, where a single
 /// letter is also a roman numeral, as the letter after the letter before it ("(i)" as 1 and after
 /// "(h)"); and, where `division` says the line opens on a division word, the number after the word.
-pub fn marker_readings(text: &str, division: bool) -> Vec<MarkerReading> {
+pub(crate) fn marker_readings(text: &str, division: bool) -> Vec<MarkerReading> {
     let grammar = layout_analysis();
     let text = closed_up(text);
     let mut tokens = text.split_whitespace();
@@ -344,7 +345,7 @@ fn opening_marker(line: &Line, families: &mut Names) -> Option<Marker> {
 
 /// The page's line at `slot` opening with a note label (`NoteLabel`), the page's lines' type sizes
 /// `sizes`.
-pub fn note_label(page: &Page, sizes: &[f64], slot: usize) -> Option<NoteLabel> {
+pub(crate) fn note_label(page: &Page, sizes: &[f64], slot: usize) -> Option<NoteLabel> {
     let line = &page.lines[slot];
     // A label glued to its note's first word ("27Ibid", "1\u{201c}significant") is one where its figures
     // are set as a label's: raised, or smaller than the line's type.
@@ -406,7 +407,7 @@ fn operative_words(text: &str) -> (usize, usize) {
 /// Every page, line and the document measured once: `separators` holds each page's note
 /// separator as the extraction found it, `outline` the document's bookmarks, and `instrument`
 /// whether its caller knows it for an instrument.
-pub fn measure(pages: &[Page],
+pub(crate) fn measure(pages: &[Page],
     slots: &Slots,
     normalized: Normalized,
     separators: &[Option<f64>],
@@ -504,7 +505,7 @@ pub fn measure(pages: &[Page],
 /// reference, which a citation holding it protects), or shaped as a title, and every line of the
 /// first two pages, each with the line either side of it; then which of the first two pages'
 /// lines name the case by its citation.
-pub fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Slots, line_numbers: &[bool]) {
+pub(crate) fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Slots, line_numbers: &[bool]) {
     let count = slots.len();
     let mut wanted: Vec<bool> = (0..count)
         .map(|slot| {
@@ -620,7 +621,7 @@ pub fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Slots, li
 /// Reads again what a line's text says of it, for the lines whose opening marker the runs'
 /// repair rewrote (`repaired`: each slot with its text before): its marker, note label, shape and
 /// lexicon, and its citations moved with the words after the marker.
-pub fn reread(evidence: &mut Evidence, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]) {
+pub(crate) fn reread(evidence: &mut Evidence, pages: &[Page], slots: &Slots, repaired: &[(Slot, String)]) {
     if repaired.is_empty() {
         return;
     }

@@ -6,8 +6,7 @@ use legal_pdf_core::model::{Line, Page};
 use legal_pdf_core::profile::measure;
 use legal_pdf_core::{line_font_size, quantile, regex};
 use crate::layout::{aligned_note_body, aligned_note_body_among, line_center_x, standalone_note_label};
-pub use crate::model::Edge;
-use crate::model::{PageView, Rows, Rule, Slot};
+use crate::model::{Edge, PageView, Rows, Rule, Slot};
 use crate::text::text::{arabic_page_number, heading_standalone_re, scalar_suffix, standalone_paragraph_number};
 use legal_structure_model::text::line_start_label_prefix;
 use std::collections::{HashMap, HashSet};
@@ -25,7 +24,7 @@ fn normalize_furniture(text: &str) -> String {
 }
 
 /// A note's line: a label opens it, and four letters follow.
-pub fn compact_note_line(text: &str) -> bool {
+pub(crate) fn compact_note_line(text: &str) -> bool {
     line_start_label_prefix(text).is_some_and(|prefix| {
         let rest = scalar_suffix(text, prefix.end);
         rest.trim_start_matches(|c: char| c.is_whitespace() || ".)],:;-".contains(c)).chars().filter(|c| c.is_alphabetic()).take(4).count() == 4
@@ -246,7 +245,7 @@ fn section_head(text: &str) -> Option<u32> {
 /// The lines at a page's edges (the head's and foot's bands, or its first and last rows) that name
 /// the sections on their page (`section_head`): each line's slot, its edge, and the first section
 /// it names. They are furniture where the statute's own sections bear them out.
-pub fn section_heads(views: &[PageView], rows: &[&Rows]) -> Vec<(Slot, Edge, u32)> {
+pub(crate) fn section_heads(views: &[PageView], rows: &[&Rows]) -> Vec<(Slot, Edge, u32)> {
     let mut heads = Vec::new();
     for (view, rows) in views.iter().zip(rows) {
         let height = view.page.height;
@@ -277,7 +276,7 @@ pub fn section_heads(views: &[PageView], rows: &[&Rows]) -> Vec<(Slot, Edge, u32
 /// heading alone on its line ("PART 50") whose text no other line prints, and on a row of no other
 /// furniture, is no running head. Lines `line_label` holds are a transcript's line numbers, never
 /// furniture. Each line read as furniture, with its edge and the rule that read it.
-pub fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot) -> bool) -> Vec<(Slot, Edge, Rule)> {
+pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot) -> bool) -> Vec<(Slot, Edge, Rule)> {
     // LEGALPDF_ABLATE=furniture leaves the repeated-furniture reader out, for its measure under the tagger.
     if legal_structure_model::ablated("furniture") {
         return Vec::new();
@@ -554,7 +553,7 @@ fn extend_running_heads(
     }
 }
 
-pub fn printed_label(value: &str) -> Option<String> {
+pub(crate) fn printed_label(value: &str) -> Option<String> {
     regex!(r"(?i)^(?:(?:page\s+)?(\d{1,6}|[ivxlcdm]{1,12})(?:\s*(?:of|/|of\s*/\s*de|de|sur)\s*\d{1,6})?|-\s*(\d{1,6})\s*-)$")
         .captures(value.trim())
         .and_then(|capture| capture.get(1).or_else(|| capture.get(2)))
@@ -607,7 +606,7 @@ fn footer_page_number(value: &str) -> bool {
 /// The printed labels a page's furniture (`furniture`: line slots on the page, each with its edge)
 /// prints, each with the slot of the line printing it: the folios its running head and foot print
 /// (`printed_label`), the foot's first, then in reading order.
-pub fn page_labels_among(page: &Page, furniture: impl Iterator<Item = (usize, Edge)>) -> Vec<(String, usize)> {
+pub(crate) fn page_labels_among(page: &Page, furniture: impl Iterator<Item = (usize, Edge)>) -> Vec<(String, usize)> {
     let mut candidates: Vec<(String, usize, bool)> =
         furniture.filter_map(|(index, edge)| Some((printed_label(&page.lines[index].text)?, index, edge == Edge::Bottom))).collect();
     candidates.sort_by_key(|&(_, index, foot)| (!foot, page.lines[index].reading_order));

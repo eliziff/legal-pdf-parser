@@ -18,9 +18,10 @@
 
 use legal_pdf_core::model::{Line, LineZone, Page, PdfOutlineEntry};
 use crate::layout::opens_turn;
-use crate::decide::{Decision, Geometry, Heard, Notes};
+use crate::decide::{Decision, Heard, Notes};
+use crate::layout::Geometry;
 use crate::fences::Fences;
-use crate::graph as graph;
+use crate::graph;
 use crate::machine::lines::LineTable;
 use crate::machine::machine::{LineView, Move, State};
 use crate::model::regions::{region_of, CONTENTS, HEADING, MARGINAL_NOTE, NOTE, TEXT, TITLE};
@@ -168,7 +169,7 @@ fn settle(fences: &Fences, runs: &Runs, views: &[LineView], decision: &mut Decis
 /// other line stands alone; a body unit's depth is the walk's to read (`emit`). A unit's first line's move carries the
 /// run member the unit opens on, a marker the decision lets open its unit (`opens_units`), and the further markers the
 /// line opens on, a unit each.
-pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, views: &[LineView], decision: &Decision, regions: &[Vec<Slot>], notes: &[StructureNode]) -> Vec<Move> {
+pub(crate) fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, views: &[LineView], decision: &Decision, regions: &[Vec<Slot>], notes: &[StructureNode]) -> Vec<Move> {
     let place = |id: &str| slots.of_id(id).map(|slot| fences.place[slot.index()] as usize);
     let mut moves: Vec<Option<Move>> = vec![None; views.len()];
     // A marker any run gives a unit opens it, where the decision read the line by no run of its own.
@@ -249,7 +250,7 @@ pub fn moves_of(slots: &Slots, fences: &Fences, runs: &Runs, views: &[LineView],
 
 /// The notes and the one decision on each line.
 #[allow(clippy::too_many_arguments)]
-pub fn decide(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry, outline: &[PdfOutlineEntry], table: &LineTable, traced: bool) -> (Notes, Decision) {
+pub(crate) fn decide(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry, outline: &[PdfOutlineEntry], table: &LineTable, traced: bool) -> (Notes, Decision) {
     let notes = Notes::read(pages, slots, evidence, fences, runs);
     let mut decision = Decision::hear(pages, slots, evidence, fences, runs, &notes, outline, geometry, traced);
     settle(fences, runs, &LineView::all(evidence, fences, table), &mut decision);
@@ -261,7 +262,7 @@ pub fn decide(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fence
 /// go on (on a transcript's page, the body's by turns, a turn running from the line that opens it to the next that opens
 /// one; a line label parting none). Each region of the body, a heading or title or a marginal note is read in its
 /// reading contexts, a body's going on over a page in the region it continues.
-pub fn reading_regions(pages: &[Page], slots: &Slots, fences: &Fences, zones: &[LineZone], blocks: &[usize]) -> Vec<Vec<Slot>> {
+pub(crate) fn reading_regions(pages: &[Page], slots: &Slots, fences: &Fences, zones: &[LineZone], blocks: &[usize]) -> Vec<Vec<Slot>> {
     let context = |slot: Slot| (fences.ctx[slot.index()], fences.at(slot.index()).translation);
     let mut regions: Vec<(bool, Vec<Slot>)> = Vec::new();
     let mut tails = HashMap::<_, usize>::new();

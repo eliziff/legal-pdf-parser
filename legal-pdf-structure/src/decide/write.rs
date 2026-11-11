@@ -46,7 +46,7 @@ fn class(role: Role) -> Class {
 }
 
 /// `write`, each page's lines left in their places.
-pub fn write_lines(pages: &mut [Page], slots: &Slots, fences: &Fences, decision: &Decision) {
+pub(crate) fn write_lines(pages: &mut [Page], slots: &Slots, fences: &Fences, decision: &Decision) {
     for (page_slot, page) in pages.iter_mut().enumerate() {
         let range = slots.on(page_slot);
         for (place, &slot) in fences.order[range.start as usize..range.end as usize].iter().enumerate() {
@@ -70,7 +70,7 @@ pub fn write_lines(pages: &mut [Page], slots: &Slots, fences: &Fences, decision:
 
 /// Each line's zone, by slot: its decided role's, a note's in the band of its kind (a page's note lines that go on with
 /// the last note of the page before, its first and those after it up to the next label, a continuation's).
-pub fn zones(slots: &Slots, evidence: &Evidence, fences: &Fences, notes: &Notes, decision: &Decision) -> Vec<LineZone> {
+pub(crate) fn zones(slots: &Slots, evidence: &Evidence, fences: &Fences, notes: &Notes, decision: &Decision) -> Vec<LineZone> {
     let mut continuation = vec![false; slots.len()];
     for segment in notes.segments.iter().filter(|segment| segment.continued) {
         let Some((first, rest)) = segment.lines.split_first() else { continue };
@@ -96,7 +96,7 @@ pub fn zones(slots: &Slots, evidence: &Evidence, fences: &Fences, notes: &Notes,
 /// numbered paragraph (which pairing may overturn), its constituent document and language, and its citations (by line
 /// id).
 #[allow(clippy::too_many_arguments)]
-pub fn note_lines<'a>(
+pub(crate) fn note_lines<'a>(
     pages: &'a [Page],
     slots: &Slots,
     fences: &Fences,
@@ -136,7 +136,7 @@ fn same_row(evidence: &Evidence, slots: &Slots, a: Slot, b: Slot) -> bool {
 
 /// Each line's block, by slot, numbered on each page after the page's own blocks; a line label, folio or furniture keeps
 /// its own.
-pub fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, decision: &Decision) -> Vec<usize> {
+pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, decision: &Decision) -> Vec<usize> {
     let count = slots.len();
     let role = &decision.role;
     let counted = |slot: Slot| matches!(class(role[slot.index()]), Class::Body | Class::Contents | Class::Table);

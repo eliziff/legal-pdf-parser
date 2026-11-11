@@ -35,23 +35,23 @@ use legal_structure_model::text::{is_note_symbol, label_prefix, line_start_label
 use std::collections::BTreeSet;
 
 /// A line the band never reads: a transcript's line number, a line held out of the body.
-pub const BAND_EXCLUDED: u8 = 1;
+pub(crate) const BAND_EXCLUDED: u8 = 1;
 /// A running head or foot, or a folio.
-pub const BAND_FURNITURE: u8 = 1 << 1;
+pub(crate) const BAND_FURNITURE: u8 = 1 << 1;
 /// A table's cell: body, its number no note's label.
-pub const BAND_CELL: u8 = 1 << 2;
+pub(crate) const BAND_CELL: u8 = 1 << 2;
 /// A numbered paragraph's number, unless its page shows it a note's (`paragraph_labels`).
-pub const BAND_PARAGRAPH: u8 = 1 << 3;
+pub(crate) const BAND_PARAGRAPH: u8 = 1 << 3;
 /// Labelled a note by its source.
-pub const BAND_NOTED: u8 = 1 << 4;
+pub(crate) const BAND_NOTED: u8 = 1 << 4;
 /// Labelled a heading by its source.
-pub const BAND_HEADED: u8 = 1 << 5;
+pub(crate) const BAND_HEADED: u8 = 1 << 5;
 /// Labelled by a page layout model.
-pub const BAND_LAYOUT: u8 = 1 << 6;
+pub(crate) const BAND_LAYOUT: u8 = 1 << 6;
 
 /// A note's kind: at its page's foot, or among the notes collected at a part's or the document's end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub enum NoteKind {
+pub(crate) enum NoteKind {
     Footnote,
     Endnote,
 }
@@ -59,22 +59,22 @@ pub enum NoteKind {
 /// What the band reads of a document's lines beside their text and boxes, by slot: each line's type
 /// size (`line_font_size`), the note label it opens with, and its `BAND_*` flags; and the document's
 /// body type size, against which notes are set small (0 where unknown: each page then reads its own).
-pub struct BandLines<'a> {
-    pub sizes: &'a [f64],
-    pub labels: &'a [Option<NoteLabel>],
-    pub flags: &'a [u8],
-    pub body_size: f64,
+pub(crate) struct BandLines<'a> {
+    pub(crate) sizes: &'a [f64],
+    pub(crate) labels: &'a [Option<NoteLabel>],
+    pub(crate) flags: &'a [u8],
+    pub(crate) body_size: f64,
 }
 
 /// A page as the band reads it: the document's lines on it (`view`), the note separator rule the
 /// extraction found on it, its columns read on its words outside its furniture (`Fences::columns`)
 /// and its words' text items, and whether it is a contents page.
-pub struct BandPage<'a> {
-    pub view: PageView<'a>,
-    pub separator: Option<f64>,
-    pub columns: ColumnModel,
-    pub items: &'a crate::tables::PageItems,
-    pub contents: bool,
+pub(crate) struct BandPage<'a> {
+    pub(crate) view: PageView<'a>,
+    pub(crate) separator: Option<f64>,
+    pub(crate) columns: ColumnModel,
+    pub(crate) items: &'a crate::tables::PageItems,
+    pub(crate) contents: bool,
 }
 
 /// What the band reads of a document: each note line and its kind; the lines whose number it read
@@ -82,24 +82,24 @@ pub struct BandPage<'a> {
 /// notes headings; what it read of each page (`BandPageReading`, by the pages' order); and the
 /// warnings of a band drawn on weak geometry.
 #[derive(Debug, Default)]
-pub struct BandReading {
-    pub notes: Vec<(Slot, NoteKind)>,
-    pub paragraph_labels: Vec<Slot>,
-    pub suppressed: Vec<Slot>,
-    pub running_heads: Vec<Slot>,
-    pub headings: Vec<Slot>,
-    pub pages: Vec<BandPageReading>,
-    pub diagnostics: Vec<Diagnostic>,
+pub(crate) struct BandReading {
+    pub(crate) notes: Vec<(Slot, NoteKind)>,
+    pub(crate) paragraph_labels: Vec<Slot>,
+    pub(crate) suppressed: Vec<Slot>,
+    pub(crate) running_heads: Vec<Slot>,
+    pub(crate) headings: Vec<Slot>,
+    pub(crate) pages: Vec<BandPageReading>,
+    pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
 /// What the band read of a page: whether it read a note there (once the endnote runs the body
 /// never refers to are given back), where its band begins across the page, and the label the
 /// document's next note takes by the notes read before the page.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct BandPageReading {
-    pub noted: bool,
-    pub cut: Option<f64>,
-    pub next_label: u32,
+pub(crate) struct BandPageReading {
+    pub(crate) noted: bool,
+    pub(crate) cut: Option<f64>,
+    pub(crate) next_label: u32,
 }
 
 /// A page with its lines' measures, each by its line's place on the page: the document's lines on it
@@ -222,10 +222,10 @@ fn page_reading(sheet: &Sheet, separator: Option<f64>, document_body: f64) -> Pa
 }
 
 /// How far from a page's note separator a line still stands at it.
-pub fn separator_tolerance(page: &Page) -> f64 { (page.height * 0.004).max(1.0) }
+pub(crate) fn separator_tolerance(page: &Page) -> f64 { (page.height * 0.004).max(1.0) }
 
 /// The page's note separator rule, unless it runs through the band its table cells (`cells`) fill.
-pub fn separator_beside_tables<'a>(page: &Page, separator: Option<f64>, cells: impl Iterator<Item = &'a Line>) -> Option<f64> {
+pub(crate) fn separator_beside_tables<'a>(page: &Page, separator: Option<f64>, cells: impl Iterator<Item = &'a Line>) -> Option<f64> {
     let tolerance = separator_tolerance(page);
     let table_band = cells.fold(None, |band, line| {
         Some(band.map_or((line.bbox[1], line.bbox[3]), |(top, bottom): (f64, f64)| {
@@ -707,7 +707,7 @@ fn verify_endnotes(sheets: &[Sheet], notes: &mut [Vec<(usize, NoteKind)>]) {
 }
 
 /// Every page's note band, in order, then the endnote runs the body never refers to given back.
-pub fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
+pub(crate) fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
     let mut found = BandReading::default();
     let sheets: Vec<Sheet> = pages.iter().map(|page| Sheet::of(page, lines)).collect();
     let mut notes: Vec<Vec<(usize, NoteKind)>> = Vec::with_capacity(sheets.len());
@@ -774,7 +774,7 @@ pub fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
 /// The endnote runs among a document's notes (`notes`: each page's note lines by place, with their
 /// kind, by the pages' order) that the body never refers to, given back (`verify_endnotes`): the
 /// notes kept.
-pub fn verified_endnotes(pages: &[BandPage], lines: &BandLines, notes: &mut [Vec<(usize, NoteKind)>]) {
+pub(crate) fn verified_endnotes(pages: &[BandPage], lines: &BandLines, notes: &mut [Vec<(usize, NoteKind)>]) {
     let sheets: Vec<Sheet> = pages.iter().map(|page| Sheet::of(page, lines)).collect();
     verify_endnotes(&sheets, notes);
 }

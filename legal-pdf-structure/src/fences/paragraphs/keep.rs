@@ -7,7 +7,7 @@ const FOLIO_MARKS: usize = 4;
 
 impl Reading<'_> {
     /// The lines of one count of one stream that are its words.
-    pub fn kept(&self, document: u16, stream: Stream) -> Vec<Slot> {
+    pub(crate) fn kept(&self, document: u16, stream: Stream) -> Vec<Slot> {
         let (fences, pages, slots, evidence) = (self.fences, self.pages, self.slots, self.evidence);
         let mut kept = Vec::<Slot>::new();
         let mut notes = NoteWalk::default();

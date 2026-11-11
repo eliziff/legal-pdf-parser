@@ -6,7 +6,7 @@ use crate::model::Held;
 use legal_structure_model::{DocumentStructure, SourceFragment};
 
 /// Write the numbered paragraphs the reading decided. A document it read none in keeps what its pages read.
-pub fn read_judgment_paragraphs(structure: &mut DocumentStructure, pages: &[Page], decided: &Decided, apart: &HashSet<&str>) {
+pub(crate) fn read_judgment_paragraphs(structure: &mut DocumentStructure, pages: &[Page], decided: &Decided, apart: &HashSet<&str>) {
     // A line's span is of its text; where the structure's text of the line differs in length, the whole line.
     let lengths: HashMap<&str, usize> = pages.iter().flat_map(|page| &page.lines).map(|line| (line.id.as_str(), line.text.encode_utf16().count())).collect();
     let mut printed: [BTreeMap<usize, Vec<ScalarRange>>; 2] = Default::default();

@@ -11,31 +11,30 @@
 use super::*;
 use crate::text::heading_ladder::HeadingLadderStatus;
 use legal_structure_model::{CandidateGrammar, CandidateObservationV2, UnitRole};
-pub use crate::layout::Geometry;
 
 /// A unit a line opens: its run (an index into the document's runs) and its kind.
-pub type Opening = (u32, UnitRole);
+pub(crate) type Opening = (u32, UnitRole);
 
 /// Lines a confirmed or found bookmark or contents entry names: its lines, its level, and whether
 /// its title is found whole.
 #[derive(Debug)]
-pub struct OutlineAnchor {
-    pub lines: Vec<Slot>,
-    pub level: u16,
-    pub confirmed: bool,
+pub(crate) struct OutlineAnchor {
+    pub(crate) lines: Vec<Slot>,
+    pub(crate) level: u16,
+    pub(crate) confirmed: bool,
 }
 
 /// Each reading context's lines in reading order, its line labels, folios, furniture and contents
 /// left out; and each line's place among its context's lines (`u32::MAX` for a line left out).
 #[derive(Debug, Default)]
-pub struct Sequences {
-    pub lines: Vec<Vec<Slot>>,
-    pub at: Vec<u32>,
+pub(crate) struct Sequences {
+    pub(crate) lines: Vec<Vec<Slot>>,
+    pub(crate) at: Vec<u32>,
 }
 
 impl Sequences {
     /// The line `step` places after (or before, negative) the slot's line in its context.
-    pub fn beside(&self, fences: &Fences, slot: Slot, step: isize) -> Option<Slot> {
+    pub(crate) fn beside(&self, fences: &Fences, slot: Slot, step: isize) -> Option<Slot> {
         let at = self.at[slot.index()];
         if at == u32::MAX {
             return None;
@@ -48,12 +47,12 @@ impl Sequences {
 /// A reading a rule gives a line, for the one decision on it (`transition::tier0`): the role, the rule, what the rule
 /// weighs it at where it weighs (the residual's score), and whether the line goes on with the one above it.
 #[derive(Clone, Copy, Debug)]
-pub struct Heard {
-    pub slot: Slot,
-    pub role: Role,
-    pub rule: Rule,
-    pub weight: f32,
-    pub joined: bool,
+pub(crate) struct Heard {
+    pub(crate) slot: Slot,
+    pub(crate) role: Role,
+    pub(crate) rule: Rule,
+    pub(crate) weight: f32,
+    pub(crate) joined: bool,
 }
 
 /// What each line is, by slot: its role, the rule that gave it, the reading of its opening marker
@@ -63,31 +62,31 @@ pub struct Heard {
 /// and, where the decision is traced, each residual candidate as the residual weighed it. A trace
 /// holds its readings of the lines.
 #[derive(Debug, Default, serde::Serialize)]
-pub struct Decision {
-    pub role: Vec<Role>,
-    pub rule: Vec<Rule>,
+pub(crate) struct Decision {
+    pub(crate) role: Vec<Role>,
+    pub(crate) rule: Vec<Rule>,
     #[serde(skip)]
-    pub reading: Vec<Option<(u32, u32)>>,
-    pub unit: Vec<Option<Opening>>,
-    pub joined: Vec<bool>,
-    pub given: Vec<u8>,
-    pub level: Vec<u8>,
-    pub anchor: Vec<u32>,
+    pub(crate) reading: Vec<Option<(u32, u32)>>,
+    pub(crate) unit: Vec<Option<Opening>>,
+    pub(crate) joined: Vec<bool>,
+    pub(crate) given: Vec<u8>,
+    pub(crate) level: Vec<u8>,
+    pub(crate) anchor: Vec<u32>,
     #[serde(skip)]
-    pub anchors: Vec<OutlineAnchor>,
+    pub(crate) anchors: Vec<OutlineAnchor>,
     #[serde(skip)]
-    pub residual: Vec<ResidualRecord>,
+    pub(crate) residual: Vec<ResidualRecord>,
     #[serde(skip)]
-    pub sequences: Sequences,
+    pub(crate) sequences: Sequences,
     /// While the rules are heard (`hear`): no rule's claim keeps another from a line, every line no fence took (`free`)
     /// is open to each rule, and what each says stands in `heard`. `role` and `rule` hold the first reading of each line
     /// meanwhile, what a rule asks of the lines around it.
     #[serde(skip)]
-    pub hearing: bool,
+    pub(crate) hearing: bool,
     #[serde(skip)]
     free: Vec<bool>,
     #[serde(skip)]
-    pub heard: Vec<Heard>,
+    pub(crate) heard: Vec<Heard>,
 }
 
 /// The one reading of each line's opening marker that may open its unit, as (run, member) indexes,
@@ -111,7 +110,7 @@ fn readings(runs: &Runs, count: usize) -> Vec<Option<(u32, u32)>> {
 }
 
 /// Body text, a list's item or a quotation: what the residual reads as prose.
-pub fn body_like(role: Role) -> bool {
+pub(crate) fn body_like(role: Role) -> bool {
     matches!(role, Role::Open | Role::Body | Role::ListItem | Role::Quote)
 }
 
@@ -175,14 +174,14 @@ impl Decision {
     }
 
     /// The residual's reading of a line, at its score.
-    pub fn hear_weighed(&mut self, slot: Slot, heading: bool, weight: f32, joined: bool) {
+    pub(crate) fn hear_weighed(&mut self, slot: Slot, heading: bool, weight: f32, joined: bool) {
         let role = if heading { Role::Heading } else { Role::Open };
         self.heard.push(Heard { slot, role, rule: Rule::Residual, weight, joined });
     }
 
     /// The one decision on a line: `winner` its reading, the unit, level and anchor only its rule gave standing. No winner
     /// leaves it open.
-    pub fn settle_line(&mut self, slot: Slot, winner: Option<Heard>) {
+    pub(crate) fn settle_line(&mut self, slot: Slot, winner: Option<Heard>) {
         let at = slot.index();
         let rule = winner.map_or(Rule::None, |heard| heard.rule);
         self.role[at] = winner.map_or(Role::Open, |heard| heard.role);
@@ -202,7 +201,7 @@ impl Decision {
     /// The rules heard, none deciding: every reading each gives a line no fence took, in `heard`, for the one decision on
     /// each line; `finish` follows it.
     #[allow(clippy::too_many_arguments)]
-    pub fn hear(pages: &[Page],
+    pub(crate) fn hear(pages: &[Page],
         slots: &Slots,
         evidence: &Evidence,
         fences: &Fences,
@@ -348,7 +347,7 @@ impl Decision {
 
     /// What follows the rules: the title among the headings, the counted markers no rule settled, the rest body, the
     /// headings' levels and the disagreements.
-    pub fn finish(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry) {
+    pub(crate) fn finish(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs, geometry: &Geometry) {
         let sequences = std::mem::take(&mut self.sequences);
         self.title(pages, slots, evidence, fences, &sequences, geometry);
         // A counted marker no rule settled opens the unit its reading reads, the line carrying its

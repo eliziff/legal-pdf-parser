@@ -6,8 +6,9 @@
 
 use legal_pdf_core::model::{Line, Page};
 use legal_pdf_core::{flag_share, line_font_size, off_grid_sizes, BOLD};
+use legal_pdf_core::model::sentence_ended;
 use crate::text::text::{
-    bracket_excess, closes_before_opening, dangling_end, enumerated, hyphen_continuation, hyphen_fragment_tail, sentence_ended,
+    bracket_excess, closes_before_opening, dangling_end, enumerated, hyphen_continuation, hyphen_fragment_tail,
     starts_note_or_list,
 };
 use legal_pdf_core::regex;
@@ -19,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 /// reading order puts there, so a scan's overlapping boxes never stand another line in for it: one
 /// whose box reaches over a quarter of the line's height into it is none. The page's body lines,
 /// those `body` names, give the column's measure (`prior` and `slot` are slots of the page's lines).
-pub fn continues_prose_from(page: &Page, prior: usize, slot: usize, body: impl Fn(usize) -> bool) -> bool {
+pub(crate) fn continues_prose_from(page: &Page, prior: usize, slot: usize, body: impl Fn(usize) -> bool) -> bool {
     let (prior, line) = (&page.lines[prior], &page.lines[slot]);
     let height = line.bbox[3] - line.bbox[1];
     if prior.exclude_from_body
@@ -53,7 +54,7 @@ fn runs_the_column(page: &Page, line: &Line, body: impl Fn(usize) -> bool) -> bo
 /// finishes ("1. IAEA, Safety Standards Series, Geological Disposal Facilities for" /
 /// "Radioactive Waste, Vienna, 2011.") opens a paragraph or an entry, not a heading: the line at
 /// `slot` onto the line `next` (slots of the page's lines), the page's body lines those `body` names.
-pub fn carries_a_sentence_onto(page: &Page, slot: usize, next: usize, body: impl Fn(usize) -> bool) -> bool {
+pub(crate) fn carries_a_sentence_onto(page: &Page, slot: usize, next: usize, body: impl Fn(usize) -> bool) -> bool {
     let line = &page.lines[slot];
     let height = line.bbox[3] - line.bbox[1];
     let followed_by_body = body(next);
@@ -74,7 +75,7 @@ pub fn carries_a_sentence_onto(page: &Page, slot: usize, next: usize, body: impl
 }
 
 /// The share of a line's characters its face sets bold.
-pub fn bold_char_share(line: &Line) -> f64 {
+pub(crate) fn bold_char_share(line: &Line) -> f64 {
     flag_share(line, BOLD).unwrap_or(0.0)
 }
 
@@ -83,7 +84,7 @@ pub fn bold_char_share(line: &Line) -> f64 {
 /// continued"), whatever the line goes on with, unless the line opens something of its own: an
 /// item's marker, a speaker's turn, a judge's name after "delivered by", or a smaller or bolder
 /// type. Or a bracket the line closes.
-pub fn body_flow_edge(previous: &Line, current: &Line) -> bool {
+pub(crate) fn body_flow_edge(previous: &Line, current: &Line) -> bool {
     let previous_text = previous.text.trim();
     let current_text = current.text.trim();
     if previous_text.is_empty() || current_text.is_empty() {
@@ -157,7 +158,7 @@ fn opens_after_dangling(previous: &Line, current: &Line) -> bool {
 }
 
 /// A line that is only a date: "10 JUNE 2026", "DATED 11 JUNE 2026", "June 29, 2020", "1/4/2025".
-pub fn date_line(text: &str) -> bool {
+pub(crate) fn date_line(text: &str) -> bool {
     const MONTH: &str = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|janvier|f[ée]vrier|mars|avril|mai|juin|juillet|ao[uû]t|septembre|octobre|novembre|d[ée]cembre)";
     regex!(&format!(
         r"(?i)^(?:dated\s+(?:this\s+)?|le\s+)?(?:\d{{1,2}}(?:st|nd|rd|th|er)?\s+(?:day\s+of\s+)?{MONTH}\.?,?\s+\d{{4}}|{MONTH}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}|\d{{1,2}}[/.-]\d{{1,2}}[/.-]\d{{2,4}})$"
@@ -168,7 +169,7 @@ pub fn date_line(text: &str) -> bool {
 /// A page whose text was recognized from its image: lines with recognition evidence or no spans,
 /// or a text layer set in one face throughout with no bold or italic (a recognizer writes one
 /// generic face and sizes its boxes; a typeset page changes face or weight somewhere).
-pub fn recognized_page(page: &Page) -> bool {
+pub(crate) fn recognized_page(page: &Page) -> bool {
     let body: Vec<&Line> = page.lines.iter().filter(|line| !line.exclude_from_body).collect();
     if body.is_empty() {
         return false;
@@ -191,7 +192,7 @@ pub fn recognized_page(page: &Page) -> bool {
 /// numbered paragraph tagged H2), as pdf-inspector reads them
 /// (`detect_overused_struct_heading_levels`: a level on over 15% of 20 tagged lines or more): each
 /// line's tag (`role`, by page slot and line slot) read on the pages' items (`page_items`).
-pub fn overused_tags<'a>(
+pub(crate) fn overused_tags<'a>(
     pages: &[Page],
     items: &[crate::tables::PageItems],
     role: impl Fn(usize, usize) -> Option<&'a str>,

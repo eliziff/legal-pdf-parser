@@ -47,13 +47,13 @@ fn paragraph_range(text: &str) -> bool {
 /// A page's or a list's own title: the parser's contents titles ("TABLE OF CONTENTS", "TABLE OF
 /// PROVISIONS"), the same continued ("CONTENTS (cont'd)"), and an index's or a summary's ("INDEX
 /// OF EXHIBITS", "I N D E X", "SOMMAIRE").
-pub fn contents_title(text: &str) -> bool {
+pub(crate) fn contents_title(text: &str) -> bool {
     crate::text::text::contents_heading(text)
         || regex!(r"(?i)^\s*(?:(?:table\s+of\s+)?contents|table\s+des\s+mati[eÃ¨]res|index(?:\s+of\s+\w+)?|sommaire|i\s*n\s*d\s*e\s*x)\b").is_match(text)
 }
 
 /// A word index's letter: "< A >", "- B -"; a heading over its entries, not an entry.
-pub fn index_letter(text: &str) -> bool {
+pub(crate) fn index_letter(text: &str) -> bool {
     regex!(r"^\s*(?:<\s*[A-Z0-9]\s*>|-\s*[A-Z]\s*-)\s*$").is_match(text)
 }
 
@@ -71,18 +71,18 @@ fn citation(text: &str) -> bool {
 
 /// One row of a page: its lines left to right, its text, its title (the text its locator aside),
 /// and the locator it closes on (value, right edge, as printed).
-pub struct Row<'a> {
-    pub lines: Vec<&'a Line>,
-    pub text: String,
-    pub title: String,
-    pub locator: Option<(u32, f64, String)>,
+pub(crate) struct Row<'a> {
+    pub(crate) lines: Vec<&'a Line>,
+    pub(crate) text: String,
+    pub(crate) title: String,
+    pub(crate) locator: Option<(u32, f64, String)>,
     /// Its locator was printed alone on the row below it (`paragraph_range`).
-    pub stacked: bool,
+    pub(crate) stacked: bool,
 }
 
 /// A row read from the lines sharing its baseline band, left to right: its locator alone in the
 /// row's last cell, after a leader or a wide space, or set apart by a gap of three line heights.
-pub fn row_of(lines: Vec<&Line>) -> Row<'_> {
+pub(crate) fn row_of(lines: Vec<&Line>) -> Row<'_> {
     let text = lines.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" ");
     let last = lines[lines.len() - 1];
     let join = |part: &[&Line]| part.iter().map(|line| line.text.trim()).collect::<Vec<_>>().join(" ");
@@ -122,7 +122,7 @@ fn own_title<'a>(row: &'a Row) -> &'a str {
 
 /// Lines in one baseline band are one row: the bands of `lines` (each line's box by `bbox`) in their
 /// order, each read left to right.
-pub fn row_bands<T: Copy>(lines: &[T], bbox: impl Fn(T) -> [f64; 4]) -> Vec<Vec<T>> {
+pub(crate) fn row_bands<T: Copy>(lines: &[T], bbox: impl Fn(T) -> [f64; 4]) -> Vec<Vec<T>> {
     let mut bands: Vec<Vec<T>> = Vec::new();
     for &line in lines {
         let [_, top, _, bottom] = bbox(line);
@@ -197,7 +197,7 @@ fn recurrences(views: &[PageView], input: &ListInput) -> HashMap<String, Vec<(us
 }
 
 /// A page label's number: its figures, or its roman numeral's value.
-pub fn page_numeral(label: &str) -> Option<u32> {
+pub(crate) fn page_numeral(label: &str) -> Option<u32> {
     let label = label.trim();
     (label.chars().all(|c| c.is_ascii_digit()) || legal_pdf_core::roman_value(label).is_some())
         .then(|| value(label))
@@ -282,34 +282,34 @@ fn echoed(titles: &[&str], list_slot: usize, recurrences: &HashMap<String, Vec<(
 /// One entry of a contents list as the heading outline reads it: its title (the rows it wraps over
 /// joined), the locator it prints, where it starts, and the page it is on.
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct Entry {
-    pub title: String,
-    pub locator: Option<String>,
-    pub left: f64,
-    pub page_index: usize,
+pub(crate) struct Entry {
+    pub(crate) title: String,
+    pub(crate) locator: Option<String>,
+    pub(crate) left: f64,
+    pub(crate) page_index: usize,
 }
 
 /// The lists a document prints: its contents (and word index), the pages wholly contents, the
 /// entries of its contents lists, its tables of authorities, and the rows naming a list above it.
 #[derive(Default)]
-pub struct Lists {
-    pub contents: Vec<Slot>,
-    pub pages: HashSet<usize>,
-    pub entries: Vec<Entry>,
+pub(crate) struct Lists {
+    pub(crate) contents: Vec<Slot>,
+    pub(crate) pages: HashSet<usize>,
+    pub(crate) entries: Vec<Entry>,
     /// A list whose entries are mostly citations: the authorities a factum or a judgment relies on.
-    pub authorities: Vec<Slot>,
+    pub(crate) authorities: Vec<Slot>,
     /// The row naming a list above its entries ("TABLE OF CONTENTS"): the list's title.
-    pub titles: Vec<Slot>,
+    pub(crate) titles: Vec<Slot>,
 }
 
 /// What the lists are read against, by slot: each line's role so far (a transcript's line number, the page's
 /// furniture: running heads and feet, folios), the source's tag (a heading already), whether a table holds it; and
 /// each view's page number (the label the PDF declares for it, else its folio's).
-pub struct ListInput<'a> {
-    pub role: &'a [Role],
-    pub tag: &'a [SourceTag],
-    pub in_table: &'a [bool],
-    pub numbers: &'a [Option<u32>],
+pub(crate) struct ListInput<'a> {
+    pub(crate) role: &'a [Role],
+    pub(crate) tag: &'a [SourceTag],
+    pub(crate) in_table: &'a [bool],
+    pub(crate) numbers: &'a [Option<u32>],
 }
 
 impl ListInput<'_> {
@@ -337,7 +337,7 @@ fn row_slots(view: &PageView, rows: &[Row]) -> Vec<Slot> {
 }
 
 /// Every contents list and table of authorities the document prints, page by page (`views`).
-pub fn read(views: &[PageView], input: &ListInput) -> Lists {
+pub(crate) fn read(views: &[PageView], input: &ListInput) -> Lists {
     let mut lists = Lists::default();
     let index = index_pages(views);
     let recurrences = recurrences(views, input);
@@ -463,7 +463,7 @@ pub fn read(views: &[PageView], input: &ListInput) -> Lists {
 
 /// Word-index and concordance pages: short headwords in alphabetical order, each
 /// followed by an occurrence count or `page:line` / `page/line` locators.
-pub fn index_pages(views: &[PageView]) -> HashSet<usize> {
+pub(crate) fn index_pages(views: &[PageView]) -> HashSet<usize> {
     let counted = regex!(r"\[\d{1,3}\]\s+\d{1,4}[:/]\d{1,3}");
     let headword = regex!(r"^\s*(\S+(?:\s\S+){0,2}?)\s+(?:[\[(]\d{1,3}[\])]\s*$|(?:[\[(]\d{1,3}[\])]\s+)?\d{1,4}[:/]\d{1,3}(?:[\s,;]|$))");
     let index = |view: &PageView| {

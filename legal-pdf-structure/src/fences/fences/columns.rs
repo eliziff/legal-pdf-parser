@@ -3,7 +3,7 @@ use super::*;
 
 impl Fences {
     /// Each page's words outside its line numbers and furniture, and its columns read on them.
-    pub fn read_columns(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) -> Vec<PageItems> {
+    pub(crate) fn read_columns(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) -> Vec<PageItems> {
         let starts: Vec<usize> = (0..pages.len()).map(|page_slot| slots.on(page_slot).start as usize).collect();
         let items: Vec<PageItems> = evidence
             .items
@@ -24,7 +24,7 @@ impl Fences {
     }
 
     /// The parallel translation, on the pages' columns.
-    pub fn read_translation(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, views: &[PageView]) {
+    pub(crate) fn read_translation(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, views: &[PageView]) {
         for slot in translation_lines(views, &self.columns, |slot| self.role[slot.index()] != Role::Open) {
             self.recontext(slot, |context| context.translation = true);
         }

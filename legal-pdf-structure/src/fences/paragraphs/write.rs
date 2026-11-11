@@ -8,11 +8,11 @@ const CLOSING_LINES: usize = 4;
 /// A stream's text, and each of its UTF-16 units' line and place in that line's text (none for what the stream adds:
 /// breaks, a margin number set before the other language's row).
 #[derive(Default)]
-pub struct Written {
-    pub text: Vec<u16>,
-    pub place: Vec<Option<(Slot, u32)>>,
+pub(crate) struct Written {
+    pub(crate) text: Vec<u16>,
+    pub(crate) place: Vec<Option<(Slot, u32)>>,
     /// Each number alone on its line and the line of words it opens.
-    pub led: Vec<(Slot, Slot)>,
+    pub(crate) led: Vec<(Slot, Slot)>,
 }
 
 impl Written {
@@ -145,7 +145,7 @@ impl Reading<'_> {
         joined
     }
 
-    pub fn written(&self, kept: &[Slot], stream: Stream) -> Written {
+    pub(crate) fn written(&self, kept: &[Slot], stream: Stream) -> Written {
         let (pages, slots) = (self.pages, self.slots);
         let flow = self.flow(kept, stream);
         let mut written = Written::default();

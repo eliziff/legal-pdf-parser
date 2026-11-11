@@ -4,11 +4,10 @@
 use legal_pdf_core::regex;
 use regex::Regex;
 use std::sync::OnceLock;
-pub use legal_pdf_core::model::sentence_ended;
 
 /// A heading's enumerator, alone on its line ("IV.", "(a)" aside, "b)", "12."), or a decimal
 /// section number ("1.1", "2.3.1") with or without a period after it.
-pub fn heading_standalone_re() -> &'static Regex {
+pub(crate) fn heading_standalone_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
@@ -20,7 +19,7 @@ pub fn heading_standalone_re() -> &'static Regex {
 
 /// A heading's enumerator with its title on the line: as [`heading_standalone_re`], the title after
 /// it ("IV. Analysis", "1.1 Definitions").
-pub fn heading_inline_re() -> &'static Regex {
+pub(crate) fn heading_inline_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
@@ -31,7 +30,7 @@ pub fn heading_inline_re() -> &'static Regex {
 }
 
 /// (value, punctuation, title) of a heading enumerator match from either lenient regex.
-pub fn heading_enumerator<'t>(capture: &regex::Captures<'t>) -> (&'t str, &'t str, &'t str) {
+pub(crate) fn heading_enumerator<'t>(capture: &regex::Captures<'t>) -> (&'t str, &'t str, &'t str) {
     let (value, punct) = match (capture.get(1), capture.get(3)) {
         (Some(value), _) => (value.as_str(), capture.get(2).map_or("", |m| m.as_str())),
         (None, Some(value)) => (value.as_str(), capture.get(4).map_or("", |m| m.as_str())),
@@ -42,7 +41,7 @@ pub fn heading_enumerator<'t>(capture: &regex::Captures<'t>) -> (&'t str, &'t st
 
 /// A party's role set as a label, on its own line or past a column gap after the party's name ("—
 /// Respondent", "ACME LTD.      Plaintiff", "First and Second Defendants").
-pub fn party_label() -> &'static Regex {
+pub(crate) fn party_label() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         let ordinal = r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|\d+(?:st|nd|rd|th))";
@@ -56,12 +55,12 @@ pub fn party_label() -> &'static Regex {
 }
 
 /// Whether a line opens on a heading's enumerator, alone or before its title.
-pub fn enumerated(text: &str) -> bool {
+pub(crate) fn enumerated(text: &str) -> bool {
     heading_inline_re().is_match(text) || heading_standalone_re().is_match(text)
 }
 
 /// "[12]" alone on its line; four digits would be a bracketed year.
-pub fn standalone_paragraph_number(text: &str) -> bool {
+pub(crate) fn standalone_paragraph_number(text: &str) -> bool {
     text.trim()
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
@@ -71,7 +70,7 @@ pub fn standalone_paragraph_number(text: &str) -> bool {
         })
 }
 
-pub fn all_caps(text: &str) -> bool {
+pub(crate) fn all_caps(text: &str) -> bool {
     let mut letters = text.chars().filter(|character| character.is_alphabetic());
     letters.next().is_some_and(|first| {
         first.is_uppercase() && letters.all(|character| character.is_uppercase())
@@ -83,7 +82,7 @@ pub fn all_caps(text: &str) -> bool {
 /// conjunction, pronoun or auxiliary, English or French ("of the", "à la", "and"), a citation's
 /// abbreviation its number completes ("s.", "para.", "R. v."), or a title its name completes ("Mr.",
 /// "Mme").
-pub fn dangling_end(text: &str) -> bool {
+pub(crate) fn dangling_end(text: &str) -> bool {
     const WORDS: &[&str] = &[
         "the", "a", "an", "of", "to", "in", "on", "at", "by", "for", "with", "from", "into", "onto", "upon", "and", "or",
         "nor", "but", "that", "which", "who", "whom", "whose", "is", "are", "was", "were", "be", "been", "being", "as",
@@ -105,7 +104,7 @@ pub fn dangling_end(text: &str) -> bool {
     WORDS.contains(&last.as_str()) || ABBREVIATIONS.contains(&last.as_str())
 }
 
-pub fn bracket_excess(text: &str) -> usize {
+pub(crate) fn bracket_excess(text: &str) -> usize {
     let mut stack = Vec::new();
     for character in text.chars() {
         match character {
@@ -122,7 +121,7 @@ pub fn bracket_excess(text: &str) -> usize {
     stack.len()
 }
 
-pub fn closes_before_opening(text: &str) -> bool {
+pub(crate) fn closes_before_opening(text: &str) -> bool {
     text.chars()
         .take(48)
         .find_map(|character| match character {
@@ -133,7 +132,7 @@ pub fn closes_before_opening(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn starts_note_or_list(text: &str) -> bool {
+pub(crate) fn starts_note_or_list(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
@@ -144,7 +143,7 @@ pub fn starts_note_or_list(text: &str) -> bool {
     .is_match(text)
 }
 
-pub fn contents_heading(text: &str) -> bool {
+pub(crate) fn contents_heading(text: &str) -> bool {
     matches!(
         text.trim().to_lowercase().as_str(),
         "contents"
@@ -156,7 +155,7 @@ pub fn contents_heading(text: &str) -> bool {
 }
 
 /// A bare page number: digits alone on the line, a dash on either side at most ("- 12 -").
-pub fn arabic_page_number(value: &str) -> Option<u32> {
+pub(crate) fn arabic_page_number(value: &str) -> Option<u32> {
     regex!(r"^\s*-?\s*(\d{1,4})\s*-?\s*$")
         .captures(value)
         .and_then(|capture| capture.get(1))
@@ -164,18 +163,18 @@ pub fn arabic_page_number(value: &str) -> Option<u32> {
 }
 
 /// A line ending on a word broken by a hyphen.
-pub fn hyphen_fragment_tail(text: &str) -> bool {
+pub(crate) fn hyphen_fragment_tail(text: &str) -> bool {
     regex!(r"[A-Za-z]{2,}[-\u{00ac}\u{00ad}]$")
         .is_match(text.trim_end())
 }
 
 /// A line opening on the rest of a broken word.
-pub fn hyphen_continuation(text: &str) -> bool {
+pub(crate) fn hyphen_continuation(text: &str) -> bool {
     regex!(r"^[A-Za-z]{2,}")
         .is_match(text.trim_start())
 }
 
-pub fn scalar_suffix(value: &str, start: usize) -> &str {
+pub(crate) fn scalar_suffix(value: &str, start: usize) -> &str {
     if value.is_ascii() {
         return &value[start.min(value.len())..];
     }

@@ -117,7 +117,7 @@ impl Reading<'_> {
     }
 
     /// The paragraph's held lines, its tail cut or taken back.
-    pub fn settle(&self, spans: &mut BTreeMap<Slot, (u32, u32)>, kept: &[Slot], opens: &HashSet<Slot>, kept_at: &HashMap<Slot, usize>) {
+    pub(crate) fn settle(&self, spans: &mut BTreeMap<Slot, (u32, u32)>, kept: &[Slot], opens: &HashSet<Slot>, kept_at: &HashMap<Slot, usize>) {
         let held_lines: Vec<Slot> = spans.keys().copied().collect();
         let heading = self.heading_above(&held_lines);
         if let Some(heading) = heading {

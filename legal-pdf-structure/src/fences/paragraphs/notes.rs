@@ -25,7 +25,7 @@ struct LastNote {
 
 /// The walk over a stream's lines, noting which are notes.
 #[derive(Default)]
-pub struct NoteWalk {
+pub(crate) struct NoteWalk {
     state: NoteState,
     last: Option<LastNote>,
     /// The note the labels have counted to.
@@ -37,25 +37,25 @@ pub struct NoteWalk {
 impl NoteWalk {
     /// The note a labelled line leaves the count at: a figure opening a line of a note is its words unless it counts on, whatever
     /// stopped the line above ("[2008]" / "1 S.C.R. 372", "532 A.R." / "312 (arrest then search)"). What is set as a label passes the count.
-    pub fn counted(&self, value: u32, set_as_label: bool, page: usize) -> u32 {
+    pub(crate) fn counted(&self, value: u32, set_as_label: bool, page: usize) -> u32 {
         let first = value == 1 && !self.last.is_some_and(|last| !last.finished && last.page == page);
         if set_as_label || first || (self.count + 1..=self.count + NOTE_LOST).contains(&value) { value } else { self.count }
     }
 
-    pub fn counts_on(&self, value: u32) -> bool {
+    pub(crate) fn counts_on(&self, value: u32) -> bool {
         value == 1 || (self.count + 1..=self.count + NOTE_LOST).contains(&value)
     }
 
-    pub fn inside(&self) -> bool {
+    pub(crate) fn inside(&self) -> bool {
         matches!(self.state, NoteState::Inside { .. })
     }
 
     /// A line ending above the labels the walk has passed on its page: a layer may read a page's labels before its text.
-    pub fn above_labels(&self, bottom: f64) -> bool {
+    pub(crate) fn above_labels(&self, bottom: f64) -> bool {
         matches!(self.state, NoteState::Inside { top, .. } if bottom < top)
     }
 
-    pub fn turn_to(&mut self, page: usize) {
+    pub(crate) fn turn_to(&mut self, page: usize) {
         if !matches!(self.state, NoteState::Inside { page: at, .. } if at == page) {
             self.state = NoteState::Text;
         }
@@ -63,31 +63,31 @@ impl NoteWalk {
 
     /// A note a page's foot left unfinished goes on at the next page's, with no label, in its own type: a quotation stands
     /// smaller than the body too, "Immunity waived".
-    pub fn carries_on(&self, size: f64, page: usize) -> bool {
+    pub(crate) fn carries_on(&self, size: f64, page: usize) -> bool {
         self.last.is_some_and(|last| !last.finished && (size - last.size).abs() <= 0.5 && last.page + 1 == page)
     }
 
     /// The page before held a note.
-    pub fn noted_before(&self, page: usize) -> bool {
+    pub(crate) fn noted_before(&self, page: usize) -> bool {
         self.last.is_some_and(|last| last.page + 1 == page)
     }
 
-    pub fn opens_quoted_list(&mut self, page: usize, size: f64) {
+    pub(crate) fn opens_quoted_list(&mut self, page: usize, size: f64) {
         self.quoted_list = Some((page, size));
     }
 
-    pub fn in_quoted_list(&self, page: usize, size: f64) -> bool {
+    pub(crate) fn in_quoted_list(&self, page: usize, size: f64) -> bool {
         self.quoted_list.is_some_and(|(at, list)| at == page && (size - list).abs() <= 0.5)
     }
 
     /// A note a fence took: it keeps the count, and may go on onto the next page.
-    pub fn fenced(&mut self, label: Option<(u32, bool)>, text: &str, size: f64, page: usize) {
+    pub(crate) fn fenced(&mut self, label: Option<(u32, bool)>, text: &str, size: f64, page: usize) {
         self.count = label.map_or(self.count, |(value, set_as_label)| self.counted(value, set_as_label, page));
         self.last = Some(LastNote { size, page, finished: sentence_ended(text) });
     }
 
     /// A line the walk read as a note's.
-    pub fn took(&mut self, label: Option<(u32, bool)>, text: &str, top: f64, size: f64, page: usize) {
+    pub(crate) fn took(&mut self, label: Option<(u32, bool)>, text: &str, top: f64, size: f64, page: usize) {
         self.count = label.map_or(self.count, |(value, set_as_label)| self.counted(value, set_as_label, page));
         // (A note's line stopping on "s." goes on.)
         let stopped = [" s.", " ss.", " para.", " paras.", " p.", " pp."].iter().any(|shortened| text.trim_end().ends_with(shortened));
@@ -99,7 +99,7 @@ impl NoteWalk {
     }
 
     /// A line the walk kept as the text's.
-    pub fn left(&mut self) {
+    pub(crate) fn left(&mut self) {
         self.state = NoteState::Text;
     }
 }
@@ -110,7 +110,7 @@ impl Reading<'_> {
     // or carrying such a note on, its next line or the lines below the body after it (a label standing alone
     // on its line, its words on the next). A quotation is set small too, among the body's lines, and is the
     // paragraph's.
-    pub fn in_note(&self, slot: Slot, reading_place: usize, stream: Stream, kept: &[Slot], notes: &mut NoteWalk) -> bool {
+    pub(crate) fn in_note(&self, slot: Slot, reading_place: usize, stream: Stream, kept: &[Slot], notes: &mut NoteWalk) -> bool {
         let (fences, pages, slots, evidence) = (self.fences, self.pages, self.slots, self.evidence);
         let (at, line) = (slot.index(), &slots.line(pages, slot).text);
         let (top, language) = (slots.line(pages, slot).bbox[1], stream.index());

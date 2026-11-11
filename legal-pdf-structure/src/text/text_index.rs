@@ -6,12 +6,12 @@ use legal_structure_model::{utf16_len, ScalarRange, SourceFragment};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
-pub struct PdfTextIndex {
-    pub text: String,
+pub(crate) struct PdfTextIndex {
+    pub(crate) text: String,
     /// Each line's place in the text, in the text's order: the structure's source fragments.
-    pub lines: Vec<SourceFragment>,
-    pub line_slots: HashMap<String, usize>,
-    pub page_ranges: HashMap<usize, ScalarRange>,
+    pub(crate) lines: Vec<SourceFragment>,
+    pub(crate) line_slots: HashMap<String, usize>,
+    pub(crate) page_ranges: HashMap<usize, ScalarRange>,
 }
 
 /// The range covering both ranges.
@@ -22,7 +22,7 @@ fn cover(range: ScalarRange, other: ScalarRange) -> ScalarRange {
 impl PdfTextIndex {
     /// The index of pages as the structure stage leaves them: in order, each page's lines in reading order; a line
     /// joins the one before it on its printed line where it stands `beside` it.
-    pub fn from_pages(pages: &[Page], beside: impl Fn(&Line, &Line) -> bool) -> Self {
+    pub(crate) fn from_pages(pages: &[Page], beside: impl Fn(&Line, &Line) -> bool) -> Self {
         let mut index = Self { text: String::new(), lines: Vec::new(), line_slots: HashMap::new(), page_ranges: HashMap::new() };
         let mut cursor = 0;
         for page in pages {
@@ -54,43 +54,43 @@ impl PdfTextIndex {
         index
     }
 
-    pub fn text(&self) -> &str {
+    pub(crate) fn text(&self) -> &str {
         &self.text
     }
 
-    pub fn line(&self, line_id: &str) -> Option<&SourceFragment> {
+    pub(crate) fn line(&self, line_id: &str) -> Option<&SourceFragment> {
         self.line_slots.get(line_id).and_then(|slot| self.lines.get(*slot))
     }
 
     /// The places among the index's lines of the lines a range overlaps.
-    pub fn overlapping(&self, range: ScalarRange) -> std::ops::Range<usize> {
+    pub(crate) fn overlapping(&self, range: ScalarRange) -> std::ops::Range<usize> {
         let start = self.lines.partition_point(|line| line.range.end <= range.start);
         let end = self.lines.partition_point(|line| line.range.start < range.end);
         start.min(end)..end
     }
 
-    pub fn overlapping_lines(&self, range: ScalarRange) -> &[SourceFragment] {
+    pub(crate) fn overlapping_lines(&self, range: ScalarRange) -> &[SourceFragment] {
         &self.lines[self.overlapping(range)]
     }
 
-    pub fn page_range(&self, page_index: usize) -> Option<ScalarRange> {
+    pub(crate) fn page_range(&self, page_index: usize) -> Option<ScalarRange> {
         self.page_ranges.get(&page_index).copied()
     }
 
-    pub fn global_range(&self, line_id: &str, start: usize, end: usize) -> Option<ScalarRange> {
+    pub(crate) fn global_range(&self, line_id: &str, start: usize, end: usize) -> Option<ScalarRange> {
         let line = self.line(line_id)?;
         (start <= end && end <= line.range.end - line.range.start).then_some(ScalarRange { start: line.range.start + start, end: line.range.start + end })
     }
 
-    pub fn line_ids(&self, range: ScalarRange) -> Vec<String> {
+    pub(crate) fn line_ids(&self, range: ScalarRange) -> Vec<String> {
         self.overlapping_lines(range).iter().map(|line| line.id.clone()).collect()
     }
 
-    pub fn range_for_line_ids<'a>(&self, line_ids: impl IntoIterator<Item = &'a String>) -> Option<ScalarRange> {
+    pub(crate) fn range_for_line_ids<'a>(&self, line_ids: impl IntoIterator<Item = &'a String>) -> Option<ScalarRange> {
         line_ids.into_iter().filter_map(|line_id| self.line(line_id)).map(|line| line.range).reduce(cover)
     }
 
-    pub fn page_indexes_for_line_ids<'a>(&self, line_ids: impl IntoIterator<Item = &'a String>) -> Vec<usize> {
+    pub(crate) fn page_indexes_for_line_ids<'a>(&self, line_ids: impl IntoIterator<Item = &'a String>) -> Vec<usize> {
         let mut pages = Vec::new();
         for page_index in line_ids.into_iter().filter_map(|line_id| self.line(line_id).map(|line| line.page_index)) {
             if !pages.contains(&page_index) {
@@ -101,7 +101,7 @@ impl PdfTextIndex {
     }
 }
 
-pub fn source_membership(mut ranges: Vec<ScalarRange>) -> Vec<ScalarRange> {
+pub(crate) fn source_membership(mut ranges: Vec<ScalarRange>) -> Vec<ScalarRange> {
     ranges.sort_by_key(|range| (range.start, range.end));
     let mut merged: Vec<ScalarRange> = Vec::new();
     for range in ranges {

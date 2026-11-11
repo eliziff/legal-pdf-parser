@@ -35,7 +35,7 @@ use super::*;
 const BODY: [u8; 7] = RANKED_BODY;
 /// A heading's or body unit's gap under its parent is one of 1..=GAPS levels.
 #[cfg(feature = "encoder")]
-pub const GAPS: usize = 4;
+pub(crate) const GAPS: usize = 4;
 
 /// What the line heads say, as the decoding reads it: each line's role (`region * 2 + opens`), whether it
 /// opens a unit on its printed marker, whether it opens a constituent document, and the line it links to as
@@ -169,7 +169,7 @@ fn insert(parent: &[f32], sibling: &[f32], gaps: &[usize], n: usize, resets: &[b
 /// A note's number: its label's where the label reader found one, else an arabic reading's, else the figures
 /// its text opens on ("27" of "27 Ibid", as the gold's notes are numbered), else 0 for a note symbol, as a reference
 /// mark's value is (`reference_spans`).
-pub fn note_number(line: &LineView, text: &str) -> Option<u32> {
+pub(crate) fn note_number(line: &LineView, text: &str) -> Option<u32> {
     line.label()
         .or_else(|| line.readings().iter().find(|r| r.family.chars().all(|c| !c.is_alphabetic())).map(|r| r.value))
         .or_else(|| super::emit::leading_figures(text).map(|(figures, _)| figures))
@@ -241,15 +241,15 @@ fn resets(firsts: &[usize], starts: &[bool]) -> Vec<bool> {
 /// The parser's stylesheet as the DOC reader reads it: each line's template and outline anchor, and each template's
 /// measured row (`ROW` a row, `Stylesheet::rows`).
 #[cfg(feature = "encoder")]
-pub struct Style<'a> {
-    pub templates: &'a [u32],
-    pub anchors: &'a [u16],
-    pub rows: Vec<f32>,
+pub(crate) struct Style<'a> {
+    pub(crate) templates: &'a [u32],
+    pub(crate) anchors: &'a [u16],
+    pub(crate) rows: Vec<f32>,
 }
 
 #[cfg(feature = "encoder")]
 impl<'a> Style<'a> {
-    pub fn of(sheet: &'a Stylesheet, table: &LineTable, measures: &Measures) -> Self {
+    pub(crate) fn of(sheet: &'a Stylesheet, table: &LineTable, measures: &Measures) -> Self {
         let rows = sheet.rows(table, measures);
         let rows = if rows.is_empty() { vec![0.0; ROW] } else { rows.iter().flatten().map(|&v| if v.is_finite() { v.clamp(-8.0, 8.0) } else { 0.0 }).collect() };
         Self { templates: &sheet.template, anchors: &sheet.anchor, rows }
@@ -267,7 +267,7 @@ fn gold_region(g: &[i64; 8]) -> i64 {
 /// part, its tree (each node under the nearest open node of a smaller level, the left sibling that parent's
 /// last child), its gap, and a note's region the region before it (two pages back at most) holding a mark of
 /// its number the gold pairs; read through the same `insert` and `moves_of` as the model's.
-pub fn oracle(gold: &[[i64; 8]], ranks: &[i64], views: &[LineView], texts: &[&str], pages: &[usize]) -> Vec<Move> {
+pub(crate) fn oracle(gold: &[[i64; 8]], ranks: &[i64], views: &[LineView], texts: &[&str], pages: &[usize]) -> Vec<Move> {
     let n = gold.len();
     // Each line's unit, as the gold's decoder reads its rows (`docparse.gold_units`).
     let mut unit = vec![usize::MAX; n];
@@ -375,7 +375,7 @@ fn read_in(moves: &mut [Move], ranks: &[i64], pages: &[usize]) {
 
 // ------------------------------------------------------------------------------------------------- the model
 #[cfg(feature = "encoder")]
-pub use model::Reader;
+pub(crate) use model::Reader;
 
 #[cfg(feature = "encoder")]
 mod model {
@@ -423,7 +423,7 @@ mod model {
         }
     }
 
-    pub struct Reader {
+    pub(crate) struct Reader {
         dir: PathBuf,
         sessions: Mutex<Vec<Sessions>>,
         /// Whether each tree's graph gives its nodes' gaps (`gap`).
@@ -463,7 +463,7 @@ mod model {
     impl Reader {
         /// The stages under `dir`, their ONNX Runtime the one LEGALPDF_ONNX_RUNTIME or LEGALPDF_ONNXRUNTIME
         /// names; the text model's reading checked against Python's on `parity.json`'s texts.
-        pub fn load(dir: &Path, reorder: bool, times: bool) -> std::result::Result<Self, String> {
+        pub(crate) fn load(dir: &Path, reorder: bool, times: bool) -> std::result::Result<Self, String> {
             let read = |name: &str| std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"));
             let meta: Meta = serde_json::from_str(&read("docparse.json")?).map_err(|e| format!("docparse.json: {e}"))?;
             if meta.width != ALL || meta.classes != CLASSES || meta.mean.len() != ALL || meta.std.len() != ALL {
@@ -511,7 +511,7 @@ mod model {
 
         /// The document's moves, a line each in reading order: `texts` and `pages` each line's; read with a set of
         /// sessions of the reader's own, given back after.
-        pub fn read(&self, table: &LineTable, measures: &Measures, views: &[LineView], texts: &[&str], pages: &[usize], style: &Style) -> std::result::Result<Vec<Move>, String> {
+        pub(crate) fn read(&self, table: &LineTable, measures: &Measures, views: &[LineView], texts: &[&str], pages: &[usize], style: &Style) -> std::result::Result<Vec<Move>, String> {
             let mut sessions = self.sessions.lock().ok().and_then(|mut pool| pool.pop()).map_or_else(|| Sessions::load(&self.dir), Ok)?;
             let moves = self.read_with(&mut sessions, table, measures, views, texts, pages, style);
             if let Ok(mut pool) = self.sessions.lock() { pool.push(sessions); }

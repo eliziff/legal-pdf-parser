@@ -6,14 +6,14 @@ use super::*;
 
 /// The stream of a page a line reads in: its running head, its body, its note band or its foot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stream {
+pub(crate) enum Stream {
     Header,
     Body,
     Note,
     Footer,
 }
 
-pub fn geometry_order(lines: &[Line], members: &mut [usize]) {
+pub(crate) fn geometry_order(lines: &[Line], members: &mut [usize]) {
     members.sort_by(|&left, &right| {
         let (left, right) = (&lines[left], &lines[right]);
         line_center_y(left)
@@ -26,7 +26,7 @@ pub fn geometry_order(lines: &[Line], members: &mut [usize]) {
 
 /// Two columns' lines read column by column down the page, band by band: a line spanning both columns (over 55% of
 /// the page's width) stands as a band of its own between the columns it parts.
-pub fn column_geometry_order(lines: &[Line], members: &[usize], model: ColumnModel, page_width: f64) -> Vec<usize> {
+pub(crate) fn column_geometry_order(lines: &[Line], members: &[usize], model: ColumnModel, page_width: f64) -> Vec<usize> {
     let mut sorted = members.to_vec();
     geometry_order(lines, &mut sorted);
     let (mut ordered, mut left, mut right) = (Vec::with_capacity(sorted.len()), Vec::new(), Vec::new());
@@ -49,7 +49,7 @@ pub fn column_geometry_order(lines: &[Line], members: &[usize], model: ColumnMod
 
 /// The lines ending on a hyphen after two letters or more, and of them those the next line goes on
 /// from with two letters or more.
-pub fn hyphen_join_score(lines: &[Line], members: &[usize]) -> (usize, usize) {
+pub(crate) fn hyphen_join_score(lines: &[Line], members: &[usize]) -> (usize, usize) {
     let letters = |text: &mut dyn Iterator<Item = char>| text.take_while(char::is_ascii_alphabetic).count();
     let (mut candidates, mut satisfied) = (0, 0);
     for (index, &slot) in members.iter().enumerate() {
@@ -66,7 +66,7 @@ pub fn hyphen_join_score(lines: &[Line], members: &[usize]) -> (usize, usize) {
     (candidates, satisfied)
 }
 
-pub fn y_regressions(lines: &[Line], members: &[usize]) -> usize {
+pub(crate) fn y_regressions(lines: &[Line], members: &[usize]) -> usize {
     let boxed: Vec<&Line> = members.iter().map(|&slot| &lines[slot]).filter(|line| has_valid_bbox(line)).collect();
     let tolerance = median(boxed.iter().map(|line| (line.bbox[3] - line.bbox[1]).max(0.0)).collect());
     boxed.windows(2).filter(|pair| line_center_y(pair[1]) < line_center_y(pair[0]) - tolerance).count()
@@ -76,7 +76,7 @@ pub fn y_regressions(lines: &[Line], members: &[usize]) -> usize {
 /// (`columns`) read interleaved where pdf-inspector's order of the page's `items` reads them
 /// through, or a single column's lines run up the page where their geometry reads down it. Whether the order is
 /// uncertain: the source's kept on two columns it crosses more than twice.
-pub fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &crate::tables::PageItems, model: ColumnModel) -> bool {
+pub(crate) fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &crate::tables::PageItems, model: ColumnModel) -> bool {
     let (lines, page_width, page_height) = (&page.lines, page.width, page.height);
     let boxed = body.iter().filter(|&&slot| has_valid_bbox(&lines[slot])).count();
     if body.len() < 8 || boxed * 5 < body.len() * 4 || page_width <= 0.0 || page_height <= 0.0 {
@@ -143,7 +143,7 @@ pub fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &crate::t
 
 /// A drop cap (a single large letter beside the start of its paragraph) moved to before the line it
 /// begins; `members` are slots of `lines`.
-pub fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
+pub(crate) fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
     let body_size = median(members.iter().map(|&slot| line_font_size(&lines[slot])).filter(|size| (4.0..=24.0).contains(size)).collect());
     if body_size <= 0.0 {
         return;
@@ -182,7 +182,7 @@ pub fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
 /// top to bottom. `stream` places each line; `items` are the page's words (`page_items`) and
 /// `columns` its column model. `table_page`: a table holds some of its lines; `contents`: the page
 /// is a contents list's (contents_lists).
-pub fn page_order(
+pub(crate) fn page_order(
     page: &Page,
     stream: impl Fn(usize) -> Stream,
     line_label: impl Fn(usize) -> bool,
@@ -233,7 +233,7 @@ pub fn page_order(
 
 /// Whether a transcript's line opens a unit of its own: a speaker's turn, or a line in capitals
 /// (an examination's "BY MR. JONES:", "EXHIBIT NO. 3", "--- Upon resuming").
-pub fn opens_turn(line: &Line) -> bool {
+pub(crate) fn opens_turn(line: &Line) -> bool {
     let text = line.text.trim_start();
     legal_pdf_core::layout_analysis().speaker_label(text).is_some()
         || text.starts_with("--")

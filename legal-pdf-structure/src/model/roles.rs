@@ -2,7 +2,7 @@
 
 /// What a line is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
-pub enum Role {
+pub(crate) enum Role {
     /// Nothing has decided it yet.
     #[default]
     Open,
@@ -22,7 +22,7 @@ pub enum Role {
 
 /// The rule that gave a line its role.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
-pub enum Rule {
+pub(crate) enum Rule {
     #[default]
     None,
     /// A transcript's line number (`split_line_numbers`).
@@ -91,7 +91,7 @@ pub enum Rule {
 
 /// The edge of its page a line of furniture stands at: the running head's or the foot's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum Edge {
+pub(crate) enum Edge {
     Top,
     Bottom,
 }

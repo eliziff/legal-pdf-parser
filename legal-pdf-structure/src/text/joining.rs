@@ -2,14 +2,14 @@
 
 use legal_pdf_core::model::Page;
 use std::collections::HashSet;
+use pdf_inspector::markdown::Join;
 
-pub use pdf_inspector::markdown::Join;
 
 /// A document's own dictionary for rejoining words its lines break: its words and its hyphenated
 /// compounds (pdf-inspector's `document_vocabulary`).
-pub type Vocabulary = (HashSet<String>, HashSet<String>);
+pub(crate) type Vocabulary = (HashSet<String>, HashSet<String>);
 
-pub fn vocabulary(pages: &[Page]) -> Vocabulary {
+pub(crate) fn vocabulary(pages: &[Page]) -> Vocabulary {
     let text: Vec<&str> = pages.iter().flat_map(|page| &page.lines).map(|line| line.text.trim()).collect();
     pdf_inspector::markdown::document_vocabulary(&text.join(" "))
 }
@@ -19,7 +19,7 @@ pub fn vocabulary(pages: &[Page]) -> Vocabulary {
 /// it writes the compound or the continuation is capitalized ("six- month", "Third- Party"), and otherwise plain before a
 /// lowercase continuation ("judg- ment"), the unit's lines being one column's; a soft hyphen always joins. `Plain` drops
 /// `before`'s last character, `Hyphen` keeps it with no space, `Keep` is a space.
-pub fn seam(before: &str, after: &str, vocabulary: &Vocabulary) -> Join {
+pub(crate) fn seam(before: &str, after: &str, vocabulary: &Vocabulary) -> Join {
     use pdf_inspector::markdown::join_decision;
     let first: &str = after.split(|c: char| !c.is_alphabetic()).next().unwrap_or("");
     match before.chars().next_back() {
@@ -47,7 +47,7 @@ pub fn seam(before: &str, after: &str, vocabulary: &Vocabulary) -> Join {
 /// pdf-inspector's `join_decision` reads the two parts as one word, the document writing it whole elsewhere. A compound
 /// whose second part opens with a capital or a digit ("Non-Renewable", "C-36"), or that the document never writes whole,
 /// keeps it.
-pub fn split_words(text: &str, vocabulary: &Vocabulary) -> Vec<usize> {
+pub(crate) fn split_words(text: &str, vocabulary: &Vocabulary) -> Vec<usize> {
     use pdf_inspector::markdown::join_decision;
     let characters: Vec<char> = text.chars().collect();
     let mut hyphens = Vec::new();

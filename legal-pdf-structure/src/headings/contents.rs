@@ -28,7 +28,7 @@ const MAX_LEVEL: usize = 6;
 /// reading order) `listed` names as contents: a printed marker or a completed locator starts the
 /// next entry, a row without one goes on with the entry its locator left open, and a row holding
 /// another line closes it.
-pub fn entry_rows(width: f64, lines: &[&Line], listed: impl Fn(usize) -> bool) -> Vec<Option<usize>> {
+pub(crate) fn entry_rows(width: f64, lines: &[&Line], listed: impl Fn(usize) -> bool) -> Vec<Option<usize>> {
     let mut entries = vec![None; lines.len()];
     let mut next: Option<usize> = None;
     let mut open = false;
@@ -135,7 +135,7 @@ fn titles_by_text(pages: &[Page], outside: &impl Fn(usize, usize) -> bool) -> Ha
 /// The contents lists' `entries` as the document's outline, each local run of entries placed by
 /// its own confirmed destinations and pagination, a title found only on the lines `outside` holds
 /// (by page slot and line slot): no line label, furniture, or contents list's line or page.
-pub fn contents_outline_among(
+pub(crate) fn contents_outline_among(
     pages: &[Page],
     entries: &[Entry],
     outside: impl Fn(usize, usize) -> bool,

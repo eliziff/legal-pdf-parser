@@ -10,42 +10,42 @@ use super::*;
 /// measures they were read from, the vetoes that bar it (`VETO_*`), its look's signs (`LOOK`, in
 /// order) and members, and the scores and outcome.
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct ResidualRecord {
-    pub lines: Vec<u32>,
-    pub context: u32,
-    pub look: u32,
-    pub terms: [bool; OWN.len()],
-    pub alone: bool,
-    pub above: f64,
-    pub below: Option<f64>,
-    pub words: u32,
-    pub caps: bool,
-    pub body: bool,
-    pub larger: bool,
-    pub numbered: bool,
-    pub vetoes: u16,
-    pub signs: [bool; LOOK.len()],
-    pub members: u32,
-    pub own: f64,
-    pub score: f64,
-    pub heading: bool,
+pub(crate) struct ResidualRecord {
+    pub(crate) lines: Vec<u32>,
+    pub(crate) context: u32,
+    pub(crate) look: u32,
+    pub(crate) terms: [bool; OWN.len()],
+    pub(crate) alone: bool,
+    pub(crate) above: f64,
+    pub(crate) below: Option<f64>,
+    pub(crate) words: u32,
+    pub(crate) caps: bool,
+    pub(crate) body: bool,
+    pub(crate) larger: bool,
+    pub(crate) numbered: bool,
+    pub(crate) vetoes: u16,
+    pub(crate) signs: [bool; LOOK.len()],
+    pub(crate) members: u32,
+    pub(crate) own: f64,
+    pub(crate) score: f64,
+    pub(crate) heading: bool,
 }
 
 /// A testimony's line, or a transcript's on a page of speakers' turns or a turn or event itself.
-pub const VETO_TESTIMONY: u16 = 1;
+pub(crate) const VETO_TESTIMONY: u16 = 1;
 /// A marker alone whose text goes on into the next line, or ends a sentence.
-pub const VETO_RUNS_ON: u16 = 1 << 1;
+pub(crate) const VETO_RUNS_ON: u16 = 1 << 1;
 /// An editorial line (`numbered_paragraphs::editorial_line`).
-pub const VETO_EDITORIAL: u16 = 1 << 2;
+pub(crate) const VETO_EDITORIAL: u16 = 1 << 2;
 /// Ending on a period, comma or semicolon.
-pub const VETO_ENDS: u16 = 1 << 3;
+pub(crate) const VETO_ENDS: u16 = 1 << 3;
 /// A label (`rules::label`) or a date alone.
-pub const VETO_LABEL: u16 = 1 << 4;
+pub(crate) const VETO_LABEL: u16 = 1 << 4;
 /// Over twenty words.
-pub const VETO_WORDS: u16 = 1 << 5;
+pub(crate) const VETO_WORDS: u16 = 1 << 5;
 /// Tagged a heading by its source, but no numbered one, of several lines, in the body's type in
 /// capitals, or not larger with more space under it than over it.
-pub const VETO_TAGGED: u16 = 1 << 6;
+pub(crate) const VETO_TAGGED: u16 = 1 << 6;
 
 /// A line as a decoder fitted on the trace reads it: its text; its opening marker's readings as the parse reads them
 /// (family, value and dotted prefix: `LineTable::readings`); and its reference marks' values (0 for a note symbol:
@@ -75,7 +75,7 @@ struct Trace<'a> {
 /// (`readings`, `references`: by place in reading order); a trace that cannot be written is reported on stderr and the
 /// parse goes on.
 #[allow(clippy::too_many_arguments)]
-pub fn write_trace(
+pub(crate) fn write_trace(
     folder: &std::path::Path,
     source_sha256: &str,
     pages: &[Page],

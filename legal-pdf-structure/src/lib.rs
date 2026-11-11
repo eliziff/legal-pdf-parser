@@ -40,14 +40,14 @@ mod text;
 mod tier0;
 mod transition;
 
-pub use model::StructureIdentity;
-use evidence::{normalize, Evidence};
+use evidence::normalize;
+use model::Evidence;
 use fences::{decided, Fences};
 use model::{Runs, Slots};
-pub(crate) use decide::*;
-pub use graph::PdfTextIndex;
-use notes::note_context;
-use note_context::*;
+use decide::{blocks, note_lines, write_lines, write_trace, zones};
+use text::text_index::PdfTextIndex;
+use notes::note_context::unmatched_reference_diagnostics;
+
 use emit::Settled;
 use machine::lines::LineTable;
 use machine::machine::LineView;
@@ -58,6 +58,20 @@ use legal_structure_model::StructureNode;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::DocumentStructure;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructureIdentity {
+    pub profile: Option<legal_structure_model::DetectionProfile>,
+    pub source_sha256: String,
+    /// The page labels the PDF declares (`/PageLabels`), by page index; empty where it has none.
+    pub page_labels: Vec<Option<String>>,
+}
+
+impl StructureIdentity {
+    /// The document's id: its source's hash, named.
+    pub(crate) fn document_id(&self) -> String {
+        format!("doc-{}", &self.source_sha256[..20])
+    }
+}
 pub struct StructureOutput {
     /// The authority units, read off the rendered text (`emit`).
     pub authority_text_units: Vec<legal_pdf_core::AuthorityTextUnit>,
@@ -97,7 +111,7 @@ pub fn derive(pages: &mut [Page],
     let instrument = identity.profile == Some(legal_structure_model::DetectionProfile::Instrument);
     let (mut slots, normalized) = measure("derive.normalize", || normalize(pages));
     // Each page's measures and columns, read once for every stage that reads the pages before they are written.
-    let geometry = decide::Geometry::of(pages);
+    let geometry = layout::Geometry::of(pages);
     let mut evidence = measure("derive.measure", || {
         crate::evidence::measure(pages, &slots, normalized, separators, outline, instrument)
     });
@@ -115,7 +129,7 @@ fn output(pages: &mut [Page],
     evidence: &Evidence,
     mut fences: Fences,
     runs: &Runs,
-    geometry: &decide::Geometry,
+    geometry: &layout::Geometry,
     outline: &[PdfOutlineEntry],
     identity: &StructureIdentity,
     trace: Option<&Path>,

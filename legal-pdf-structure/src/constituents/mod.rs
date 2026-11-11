@@ -11,7 +11,7 @@
 
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use legal_pdf_core::regex;
-use crate::headings as headings;
+use crate::headings;
 use crate::model::{PageView, Slot};
 use crate::text::text::{arabic_page_number, party_label};
 use crate::text::text_index::PdfTextIndex;
@@ -22,20 +22,20 @@ use std::collections::{HashMap, HashSet};
 const ORIGIN: &str = "legalpdf.pdf-structure.v2";
 
 /// The grammar of a constituent's section; its kind follows ("constituent_exhibit").
-pub const GRAMMAR: &str = "constituent_";
+pub(crate) const GRAMMAR: &str = "constituent_";
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct Start {
-    pub line_id: String,
+pub(crate) struct Start {
+    pub(crate) line_id: String,
     kind: String,
 }
 
 impl Start {
-    pub fn new(line_id: String, kind: &str) -> Self {
+    pub(crate) fn new(line_id: String, kind: &str) -> Self {
         Self { line_id, kind: kind.to_owned() }
     }
 
-    pub fn kind(&self) -> &str {
+    pub(crate) fn kind(&self) -> &str {
         &self.kind
     }
 }
@@ -58,7 +58,7 @@ fn header_field(text: &str) -> Option<String> {
 }
 
 /// A page headed by its own title as another document: "SCHEDULE", "ANNEX B".
-pub fn appended_title(text: &str) -> Option<&'static str> {
+pub(crate) fn appended_title(text: &str) -> Option<&'static str> {
     let captures = regex!(r#"^\s*(SCHEDULE|ANNEX|APPENDIX|ATTACHMENT|Schedule|Annex|Appendix|Attachment)(?:\s+["“]?[A-Z0-9]{1,4}["”]?)?\s*$"#).captures(text)?;
     Some(if captures[1].eq_ignore_ascii_case("schedule") { "schedule" } else { "annex" })
 }
@@ -76,7 +76,7 @@ fn content(line: &Line) -> bool {
 
 /// Where each constituent document opens, read over the pages' lines (`views`) that `set_aside`
 /// leaves as body.
-pub fn starts(views: &[PageView], set_aside: impl Fn(Slot) -> bool) -> Vec<Start> {
+pub(crate) fn starts(views: &[PageView], set_aside: impl Fn(Slot) -> bool) -> Vec<Start> {
     let mut ordered = views.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|view| view.page.index);
     // Each body line, with its page, its place on that page and the page's count of them.
@@ -149,7 +149,7 @@ pub fn starts(views: &[PageView], set_aside: impl Fn(Slot) -> bool) -> Vec<Start
 
 /// Package bookmarks supply opening pages before the readers calibrate each document; a line
 /// `set_aside` holds (a transcript's line number, furniture, a note) opens none.
-pub fn bookmarked_starts(views: &[PageView], outline: &[PdfOutlineEntry], set_aside: impl Fn(Slot) -> bool) -> Vec<Start> {
+pub(crate) fn bookmarked_starts(views: &[PageView], outline: &[PdfOutlineEntry], set_aside: impl Fn(Slot) -> bool) -> Vec<Start> {
     let by_index = views.iter().map(|view| (view.page.index, view)).collect::<HashMap<_, _>>();
     // Version stamps contain letters but supply no word of an opening.
     let worded = |line: &Line| line.text.split(|c: char| !c.is_alphanumeric()).any(|word| !word.is_empty() && word.chars().all(char::is_alphabetic));
@@ -163,7 +163,7 @@ pub fn bookmarked_starts(views: &[PageView], outline: &[PdfOutlineEntry], set_as
 }
 
 /// A visible opening wins over a bookmark, including an exhibit's preceding certificate page.
-pub fn reconcile_starts(views: &[PageView], bookmarked: &mut Vec<Start>, set_aside: impl Fn(Slot) -> bool) {
+pub(crate) fn reconcile_starts(views: &[PageView], bookmarked: &mut Vec<Start>, set_aside: impl Fn(Slot) -> bool) {
     let mut lexical = starts(views, set_aside);
     if bookmarked.is_empty() {
         *bookmarked = lexical;
@@ -187,7 +187,7 @@ pub fn reconcile_starts(views: &[PageView], bookmarked: &mut Vec<Start>, set_asi
 /// The constituent document each line reads in (1 for the first opening `starts` names, 0 for the
 /// packet's own, which is left out), page by page in reading order: a line of the page's furniture
 /// (`furniture`) or its folio before the opening still belongs to the document on that page.
-pub fn documents(views: &[PageView], starts: &[Start], furniture: impl Fn(Slot) -> bool) -> Vec<(Slot, usize)> {
+pub(crate) fn documents(views: &[PageView], starts: &[Start], furniture: impl Fn(Slot) -> bool) -> Vec<(Slot, usize)> {
     if starts.is_empty() {
         return Vec::new();
     }
@@ -216,7 +216,7 @@ pub fn documents(views: &[PageView], starts: &[Start], furniture: impl Fn(Slot) 
     documents
 }
 
-pub fn constituents(index: &PdfTextIndex, pages: &[Page], starts: &[Start]) -> Vec<StructureNode> {
+pub(crate) fn constituents(index: &PdfTextIndex, pages: &[Page], starts: &[Start]) -> Vec<StructureNode> {
     let starts = starts.iter().filter_map(|start| Some((index.line(&start.line_id)?.range.start, start.kind.as_str()))).collect::<Vec<_>>();
     let end = legal_structure_model::utf16_len(index.text());
     let page_of = pages.iter().flat_map(|page| page.lines.iter().map(move |line| (line.id.as_str(), page.index))).collect::<HashMap<_, _>>();

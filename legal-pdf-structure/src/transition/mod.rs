@@ -20,11 +20,11 @@ use crate::fences::Fences;
 use crate::model::{Evidence, Slots};
 use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::OnceLock};
 
-pub use crate::machine::lines::*;
-pub use crate::machine::machine::*;
-use crate::emit as emit;
+use crate::emit;
+use crate::machine::{lines::*, machine::*};
+use crate::model::regions::*;
 mod stylesheet;
-pub use stylesheet::*;
+pub(crate) use stylesheet::*;
 #[cfg(feature = "encoder")]
 #[macro_use]
 mod onnx;
@@ -41,13 +41,13 @@ const UNMARKED_BODY: i64 = 101;
 type GoldLabels = (HashMap<String, HashMap<String, [i64; 8]>>, HashMap<String, HashMap<String, i64>>, HashMap<String, Vec<String>>);
 
 /// What tier 1 is given: DOC's stages, the gold where it is measured, and what it writes.
-pub struct Settings {
+pub(crate) struct Settings {
     gold: Option<GoldLabels>,
     dump: Option<PathBuf>,
     #[cfg(feature = "encoder")]
     doc: Option<doc::Reader>,
     doc_oracle: bool,
-    pub confusions: HashMap<char, Vec<(char, f32)>>,
+    pub(crate) confusions: HashMap<char, Vec<(char, f32)>>,
 }
 
 /// The harnesses' settings, read once: the entry points' only source of them.
@@ -76,7 +76,7 @@ impl Settings {
 
 /// How recognition misreads the characters of a line's opening marker (LEGALPDF_TRANSITION_CONFUSIONS), for the line
 /// table both tiers read; none where it is not given.
-pub fn confusions() -> &'static HashMap<char, Vec<(char, f32)>> {
+pub(crate) fn confusions() -> &'static HashMap<char, Vec<(char, f32)>> {
     &settings().confusions
 }
 
@@ -128,7 +128,7 @@ fn read_gold(path: &Path) -> GoldLabels {
 /// where its reader or its oracle is given, each move's `reading` naming one of the line's readings in `table`; and the
 /// dump DOC is fitted on, where it is asked. None where neither reads: the output is tier 0's.
 #[allow(clippy::too_many_arguments)]
-pub fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &crate::decide::Geometry, outline: &[PdfOutlineEntry], sha256: &str,
+pub(crate) fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &crate::layout::Geometry, outline: &[PdfOutlineEntry], sha256: &str,
     notes: &Notes, decision: &Decision, table: &LineTable) -> Option<Vec<Move>> {
     let s = settings();
     let gold = s.gold.as_ref().and_then(|g| g.0.get(sha256));

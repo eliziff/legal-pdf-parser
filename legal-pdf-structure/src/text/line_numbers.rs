@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use legal_pdf_core::model::Word;
 
 /// A line's transcript line number, printed apart or read into the line it numbers.
-pub fn line_number(line: &Line) -> Option<(f64, u32)> {
+pub(crate) fn line_number(line: &Line) -> Option<(f64, u32)> {
     arabic_page_number(&line.text).map(|number| (line.bbox[0], number)).or_else(|| fused_line_number(line))
 }
 
@@ -16,7 +16,7 @@ pub fn line_number(line: &Line) -> Option<(f64, u32)> {
 /// there that count up are its line numbers too (a short last page, numbers every fifth line).
 /// A number the extraction read into its line is split off as a line of its own, and each is held
 /// out of the body. Returns each page's line numbers, as slots of its lines once split.
-pub fn split_line_numbers(pages: &mut [Page]) -> Vec<Vec<usize>> {
+pub(crate) fn split_line_numbers(pages: &mut [Page]) -> Vec<Vec<usize>> {
     let mut numbers = vec![Vec::new(); pages.len()];
     let lefts: Vec<f64> = pages
         .iter()
@@ -71,7 +71,7 @@ pub fn split_line_numbers(pages: &mut [Page]) -> Vec<Vec<usize>> {
 /// A line's printed transcript line number where the extraction read it into the line it numbers
 /// ("4        Q.   What is"): its left edge and value. A number whose next word stands at least two
 /// line heights away is set in the margin, not in the text.
-pub fn fused_line_number(line: &Line) -> Option<(f64, u32)> {
+pub(crate) fn fused_line_number(line: &Line) -> Option<(f64, u32)> {
     let [first, second, ..] = line.words.as_slice() else {
         return None;
     };
@@ -85,7 +85,7 @@ pub fn fused_line_number(line: &Line) -> Option<(f64, u32)> {
 
 /// The line's leading number as a line label of its own, the line keeping its words from the
 /// next on.
-pub fn split_line_number(line: &mut Line) -> Line {
+pub(crate) fn split_line_number(line: &mut Line) -> Line {
     let first = line.words[0].clone();
     let cut = line.words[1].start;
     let chars = line.text.chars().collect::<Vec<_>>();
@@ -129,7 +129,7 @@ pub fn split_line_number(line: &mut Line) -> Line {
 
 /// A column of small numbers counting at least 1 to 15 down the page, as `number` reads each
 /// line's (left edge, value). Returns the column's line slots, or none.
-pub fn number_column(page: &Page, number: impl Fn(&Line) -> Option<(f64, u32)>) -> Vec<usize> {
+pub(crate) fn number_column(page: &Page, number: impl Fn(&Line) -> Option<(f64, u32)>) -> Vec<usize> {
     const MIN_LINE_NUMBERS: u32 = 15;
     if page.width <= 0.0 {
         return Vec::new();

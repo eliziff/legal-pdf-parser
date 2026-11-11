@@ -4,7 +4,7 @@ use super::*;
 
 /// Settle each node's exact membership and role, and give the context its outline lives in: the
 /// constituent document holding it, and its quotation, note, table cell or parallel text.
-pub fn outline_contexts(
+pub(crate) fn outline_contexts(
     nodes: &mut [legal_structure_model::StructureNode], document_id: &str,
     index: &PdfTextIndex,
     decided: &Decided,

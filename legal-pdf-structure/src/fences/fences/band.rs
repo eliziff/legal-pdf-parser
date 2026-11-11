@@ -7,7 +7,7 @@ impl Fences {
     /// A table cannot claim a referenced footer note: a symbol after the table, or the words
     /// under a physical separator that opens on a referenced label. Free these before deciding
     /// whether the table crosses the separator, otherwise its mistaken claim hides the band.
-    pub fn free_referenced_note_cells(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) -> bool {
+    pub(crate) fn free_referenced_note_cells(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) -> bool {
         let mut freed = Vec::new();
         for (page_slot, page) in pages.iter().enumerate() {
             let referenced = slots.on(page_slot).map(Slot).filter_map(|slot| {
@@ -32,7 +32,7 @@ impl Fences {
     }
 
     /// The note band: under the page's separator, clear of its tables.
-    pub fn read_note_band(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
+    pub(crate) fn read_note_band(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
         for (page_slot, page) in pages.iter().enumerate() {
             let range = slots.on(page_slot);
             let cells = range.clone().filter(|&slot| self.cell[slot as usize] != 0).map(|slot| slots.line(pages, Slot(slot)));
@@ -50,7 +50,7 @@ impl Fences {
     }
 
     /// The body's type, of the lines no fence took, the note band aside.
-    pub fn read_body_type(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
+    pub(crate) fn read_body_type(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
         let mut mass: HashMap<(u16, u16), usize> = HashMap::new();
         for slot in (0..slots.len()).filter(|&slot| self.role[slot] == Role::Open && !self.band[slot] && evidence.face[slot] != u16::MAX) {
             *mass.entry((evidence.face[slot], evidence.half_points[slot])).or_default() +=
@@ -69,7 +69,7 @@ impl Fences {
     /// A rule drawn across a page's running text is no note separator ("Cette disposition est r\u{e9}dig\u{e9}e ainsi:" under it,
     /// an enactment's small type below): a page's notes open on a label, or hold no words in the body's type. (A margin's
     /// figure opens nothing.)
-    pub fn clear_false_bands(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
+    pub(crate) fn clear_false_bands(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
         for page_slot in 0..pages.len() {
             let worded = |slot: &usize| slots.line(pages, Slot(*slot as u32)).text.chars().any(char::is_alphabetic);
             let band: Vec<usize> = slots.on(page_slot).map(|slot| slot as usize).filter(|&slot| self.band[slot]).collect();
@@ -88,7 +88,7 @@ impl Fences {
     }
 
     /// A band holding a note label is the page's notes, its table cells among them. Whether any cell was freed.
-    pub fn free_noted_cells(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) -> bool {
+    pub(crate) fn free_noted_cells(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) -> bool {
         self.noted = (0..pages.len())
             .map(|page_slot| {
                 slots.on(page_slot).map(|slot| slot as usize).any(|slot| {

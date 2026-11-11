@@ -13,7 +13,7 @@
 //! ladder, the layout prior over every page whose notes end their band, and the bridge from one
 //! page's unfinished note to the next page's band.
 
-use super::sentence_ended;
+use legal_pdf_core::model::sentence_ended;
 use legal_pdf_core::{
     line_font_size,
     model::{Line, Page},
@@ -29,7 +29,7 @@ const CLOSURE_MIN_PRIOR_RATIO: f64 = 0.5;
 const CLOSURE_MAX_TAIL_LINES: usize = 12;
 
 /// A line, by its page and its place among the page's lines.
-pub type LineRef = (usize, usize);
+pub(crate) type LineRef = (usize, usize);
 
 /// The line as marker evidence judges it: superscript labels ("²² See") read as plain digits.
 fn folded(text: &str) -> String {
@@ -128,23 +128,23 @@ fn dense(labels: &[i64]) -> bool {
 }
 
 /// A note's line: the note band's.
-pub const LANE_NOTE: u8 = 1;
+pub(crate) const LANE_NOTE: u8 = 1;
 /// A body line whose role may still change: no heading, running head, folio, table's cell, or line
 /// the reading holds out of the body.
-pub const LANE_BODY: u8 = 1 << 1;
+pub(crate) const LANE_BODY: u8 = 1 << 1;
 /// A running head or foot, or a folio.
-pub const LANE_FURNITURE: u8 = 1 << 2;
+pub(crate) const LANE_FURNITURE: u8 = 1 << 2;
 /// A numbered paragraph's label, as the note band read it.
-pub const LANE_PARAGRAPH: u8 = 1 << 3;
+pub(crate) const LANE_PARAGRAPH: u8 = 1 << 3;
 
 /// A document's lines as the lanes read them: its pages, each page's lines of the document in
 /// reading order (page slot, the lines' places on the page), each page's first slot, and each
 /// line's `LANE_*` flags by slot.
-pub struct LaneLines<'a> {
-    pub pages: &'a [Page],
-    pub order: &'a [(usize, Vec<usize>)],
-    pub starts: &'a [usize],
-    pub flags: &'a [u8],
+pub(crate) struct LaneLines<'a> {
+    pub(crate) pages: &'a [Page],
+    pub(crate) order: &'a [(usize, Vec<usize>)],
+    pub(crate) starts: &'a [usize],
+    pub(crate) flags: &'a [u8],
 }
 
 struct DocumentLines<'a> {
@@ -246,7 +246,7 @@ fn note_type_sizes(lines: &DocumentLines<'_>) -> [Option<f64>; 2] {
 
 /// The lines one logical document's lanes take for notes, beside the note band's (`lines`), with
 /// separators aligned to its page slots: each by its page slot and its place on the page, in order.
-pub fn note_promotions(lines: LaneLines<'_>, separators: &[Option<f64>]) -> Vec<LineRef> {
+pub(crate) fn note_promotions(lines: LaneLines<'_>, separators: &[Option<f64>]) -> Vec<LineRef> {
     let lines = DocumentLines::new(lines);
     let rerouted = post_footnote_reroute(&lines);
     let mut claims = band_closure(&lines, &rerouted).into_iter().chain(rerouted).collect::<BTreeSet<_>>();

@@ -13,30 +13,32 @@
 use crate::model::{Member, PageView, Role, Rule, Run, Runs, Slot, Slots};
 use legal_pdf_core::model::{Diagnostic, Line, Page, PdfOutlineEntry};
 use crate::headings::native::date_line;
-use crate::headings as headings;
+use crate::headings;
 use crate::layout::layout_labelled;
 use crate::notes::{
     endnote_heading, read_band, separator_tolerance, verified_endnotes, BandLines, BandPage, NoteKind, BAND_CELL, BAND_EXCLUDED, BAND_FURNITURE, BAND_HEADED,
     BAND_LAYOUT, BAND_NOTED, BAND_PARAGRAPH,
 };
 use crate::text::heading_ladder::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
-use crate::text::text::{all_caps, enumerated, sentence_ended};
+use crate::text::text::{all_caps, enumerated};
+use legal_pdf_core::model::sentence_ended;
 use legal_structure_model::text::{label_prefix, line_start_label_prefix, normalize_label};
-use pdf_inspector::markdown::has_dot_leaders as has_dot_leader;
+use pdf_inspector::markdown::has_dot_leaders;
 use legal_pdf_core::regex;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::evidence::*;
+use crate::model::*;
+use crate::layout::Geometry;
 use crate::fences::*;
-pub mod notes;
-pub use notes::*;
-pub mod rules;
-pub use rules::*;
-pub mod residual;
-pub use residual::*;
-pub mod levels;
-pub use levels::*;
-pub mod write;
-pub use write::*;
-pub mod trace;
-pub use trace::*;
+pub(crate) mod notes;
+pub(crate) use notes::*;
+pub(crate) mod rules;
+pub(crate) use rules::*;
+pub(crate) mod residual;
+pub(crate) use residual::*;
+pub(crate) mod levels;
+pub(crate) use levels::*;
+pub(crate) mod write;
+pub(crate) use write::*;
+pub(crate) mod trace;
+pub(crate) use trace::*;

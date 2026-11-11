@@ -3,7 +3,7 @@ use super::*;
 
 impl Fences {
     /// The document's tables, the lines any of them holds, and the lines a contents list read as one holds.
-    pub fn find_tables(&self, pages: &[Page], slots: &Slots, items: &[PageItems]) -> (Vec<crate::tables::PdfTable>, Vec<bool>, HashSet<String>) {
+    pub(crate) fn find_tables(&self, pages: &[Page], slots: &Slots, items: &[PageItems]) -> (Vec<crate::tables::PdfTable>, Vec<bool>, HashSet<String>) {
         let (tables, listed) = legal_pdf_core::profile::measure("classify.tables", || {
             crate::tables::document_tables(
                 pages,
@@ -20,7 +20,7 @@ impl Fences {
 
     /// The tables a contents list does not hold for the most part, and their cells (`cell`); a cell
     /// no fence took is the table's.
-    pub fn read_tables(&mut self, slots: &Slots, tables: Vec<crate::tables::PdfTable>, listed: &[bool]) {
+    pub(crate) fn read_tables(&mut self, slots: &Slots, tables: Vec<crate::tables::PdfTable>, listed: &[bool]) {
         self.tables = tables
             .into_iter()
             .filter(|table| {
@@ -40,7 +40,7 @@ impl Fences {
     /// A transcript's testimony beside its number column, read as a grid (a speaker's turn in
     /// one of its cells), is no table's; a table the transcript sets among its numbered lines
     /// stays one. Whether any cell was freed.
-    pub fn free_spoken_cells(&mut self, slots: &Slots, evidence: &Evidence) -> bool {
+    pub(crate) fn free_spoken_cells(&mut self, slots: &Slots, evidence: &Evidence) -> bool {
         let count = slots.len();
         let mut spoken = vec![false; count];
         for table in &self.tables {
@@ -60,7 +60,7 @@ impl Fences {
     }
 
     /// Gives a table's cell back to the lines no fence took.
-    pub fn free_cell(&mut self, slot: usize) {
+    pub(crate) fn free_cell(&mut self, slot: usize) {
         self.role[slot] = Role::Open;
         self.rule[slot] = Rule::None;
         self.cell[slot] = 0;
@@ -68,7 +68,7 @@ impl Fences {
 
     /// The tables without the lines freed of their cells: a cell's parts on those lines dropped, and
     /// a row or table left with no part dropped; each line's cell numbered again.
-    pub fn prune_tables(&mut self, slots: &Slots) {
+    pub(crate) fn prune_tables(&mut self, slots: &Slots) {
         let cell = &self.cell;
         let kept = |part: &crate::tables::CellPart| slots.of_id(&part.line_id).is_some_and(|slot| cell[slot.index()] != 0);
         for table in &mut self.tables {

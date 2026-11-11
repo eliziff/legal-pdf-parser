@@ -10,18 +10,18 @@ use std::sync::OnceLock;
 
 /// "Notes", "Footnotes", "Endnotes": a heading, capitalized; a lowercase "note" alone on its line
 /// is a sentence's word wrapped ("... on the information or indictment, / note").
-pub fn endnote_heading(text: &str) -> bool {
+pub(crate) fn endnote_heading(text: &str) -> bool {
     let text = text.trim();
     text.starts_with(char::is_uppercase)
         && regex!(r"(?i)^(?:end|foot)?notes?$").is_match(text)
 }
 
-pub fn continuing_note_heading(text: &str) -> bool {
+pub(crate) fn continuing_note_heading(text: &str) -> bool {
     regex!(r"(?i)^(?:endnotes?|footnotes?|notes?)(?:\s*\(?(?:continued|cont'd)\)?)?$")
     .is_match(text.trim())
 }
 
-pub fn structural_reset_heading(text: &str) -> bool {
+pub(crate) fn structural_reset_heading(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
@@ -32,13 +32,13 @@ pub fn structural_reset_heading(text: &str) -> bool {
     .is_match(text.trim())
 }
 
-pub fn citation_shaped_candidate(page: &Page, candidate: &(usize, LabelPrefix, bool)) -> bool {
+pub(crate) fn citation_shaped_candidate(page: &Page, candidate: &(usize, LabelPrefix, bool)) -> bool {
     let line = &page.lines[candidate.0];
     let tail = scalar_suffix(&line.text, candidate.1.end);
     legal_structure_model::structure_analysis().is_citation_shaped_tail(tail)
 }
 
-pub fn longest_label_run(values: &[u32]) -> usize {
+pub(crate) fn longest_label_run(values: &[u32]) -> usize {
     let mut runs = vec![1; values.len()];
     for index in 0..values.len() {
         for prior in 0..index {
@@ -52,7 +52,7 @@ pub fn longest_label_run(values: &[u32]) -> usize {
 
 /// Whether one of `lines` above `label_y` refers to `label`: a raised number, a reference read apart
 /// from its line, or the symbol ending a word.
-pub fn has_prior_reference<'a>(lines: impl IntoIterator<Item = &'a Line>, label: &str, label_y: f64) -> bool {
+pub(crate) fn has_prior_reference<'a>(lines: impl IntoIterator<Item = &'a Line>, label: &str, label_y: f64) -> bool {
     let matches_label = |value: &str| {
         let value = value.trim();
         value == label || normalize_label(value) == label
@@ -77,14 +77,14 @@ pub fn has_prior_reference<'a>(lines: impl IntoIterator<Item = &'a Line>, label:
     })
 }
 
-pub fn label_spans<'a>(line: &'a Line, prefix: &'a LabelPrefix) -> impl Iterator<Item = &'a Span> {
+pub(crate) fn label_spans<'a>(line: &'a Line, prefix: &'a LabelPrefix) -> impl Iterator<Item = &'a Span> {
     line.spans
         .iter()
         .filter(|span| span.start < prefix.end && span.end > prefix.start)
 }
 
 /// A label set above or smaller than the rest of its own line, as a note label is.
-pub fn label_is_raised(line: &Line, prefix: &LabelPrefix, line_size: f64) -> bool {
+pub(crate) fn label_is_raised(line: &Line, prefix: &LabelPrefix, line_size: f64) -> bool {
     let height = line.bbox[3] - line.bbox[1];
     label_spans(line, prefix).any(|span| {
         span.superscript
@@ -99,7 +99,7 @@ pub fn label_is_raised(line: &Line, prefix: &LabelPrefix, line_size: f64) -> boo
 
 /// Whether the line just above `index`, in its type and at its leading, ends on a counted
 /// enactment's noun ("s", "c", "art") still waiting for its number.
-pub fn reference_wrapped_onto(lines: &[Line], sizes: &[f64], index: usize) -> bool {
+pub(crate) fn reference_wrapped_onto(lines: &[Line], sizes: &[f64], index: usize) -> bool {
     let line = &lines[index];
     let height = line.bbox[3] - line.bbox[1];
     lines

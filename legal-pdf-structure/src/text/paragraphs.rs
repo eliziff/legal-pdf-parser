@@ -34,12 +34,12 @@ fn enumerator_re() -> &'static Regex {
 }
 
 /// A line that is nothing but a bullet or an enumerator.
-pub fn marker_only_re() -> &'static Regex {
+pub(crate) fn marker_only_re() -> &'static Regex {
     regex!(&format!(r"^\s*([{BULLETS}o]|{ENUMERATOR})\s*$"))
 }
 
 /// A line opening with a bullet or an enumerator, or nothing but one: an item's first line.
-pub fn opens_item(text: &str) -> bool {
+pub(crate) fn opens_item(text: &str) -> bool {
     bullet_re().is_match(text) || enumerator_re().is_match(text) || marker_only_re().is_match(text)
 }
 
@@ -59,7 +59,7 @@ fn opens_sentence(line: &Line) -> bool {
 
 /// A contents entry's leader: dots running to the line's end or to the locator that ends it (dots
 /// inside a line are an ellipsis), or a rule before a locator (alone it is a form's blank).
-pub fn contents_leader_re() -> &'static Regex {
+pub(crate) fn contents_leader_re() -> &'static Regex {
     regex!(r"(?:(?:\. ){3,}|\.{4,})\s*\S{0,6}\s*$|_{4,}\s*\d{1,4}\s*$")
 }
 
@@ -114,7 +114,7 @@ fn first_word_width(line: &Line) -> f64 {
 
 /// A form's or a signature block's field label ("Per:", "Name:", "Title:", "Email:"): the value
 /// set beside or under it belongs with it, whatever the layout says.
-pub fn field_label(line: &Line) -> bool {
+pub(crate) fn field_label(line: &Line) -> bool {
     let text = line.text.trim();
     let Some(name) = text.strip_suffix(':') else {
         return false;
@@ -122,7 +122,7 @@ pub fn field_label(line: &Line) -> bool {
     text.chars().count() <= 24 && text.split_whitespace().count() <= 3 && !name.contains([':', ';']) && !name.trim_end_matches('.').contains('.')
 }
 
-pub fn same_row(a: &Line, b: &Line) -> bool {
+pub(crate) fn same_row(a: &Line, b: &Line) -> bool {
     let overlap = a.bbox[3].min(b.bbox[3]) - a.bbox[1].max(b.bbox[1]);
     overlap > 0.5 * height(a).min(height(b))
 }
@@ -164,7 +164,7 @@ struct Pitch {
 
 /// The document's measure, and its scans' leading.
 #[derive(Clone, Copy, Default)]
-pub struct Measure {
+pub(crate) struct Measure {
     /// The ninth decile of its counted lines' widths over every page. A two-column statute's
     /// column, not its full-width title; a brief's text measure, not the short lines of its page
     /// of counsel.
@@ -182,7 +182,7 @@ pub struct Measure {
 
 /// The measures a document's counted lines show (`pages`: each page's, in their order on it): the
 /// width most of them reach, and on a scan its line height, paragraph gap and line pitch.
-pub fn measure_of(pages: &[Vec<&Line>]) -> Measure {
+pub(crate) fn measure_of(pages: &[Vec<&Line>]) -> Measure {
     let width = quantile(pages.iter().flatten().map(|line| width(line)).collect(), 0.9);
     let scans = || pages.iter().map(|lines| lines.iter().copied().filter(|line| scanned(line) && height(line) > 0.0).collect::<Vec<_>>());
     let line_height = median(scans().flatten().map(height).collect());
@@ -422,7 +422,7 @@ fn goes_on(line: &Line) -> bool {
 /// Does the next page's first paragraph go on with this page's last one? It does when the
 /// last line ran to the measure, ending no sentence or with the next page going on in
 /// lower case, and the next page starts no indented first line, item or change of type.
-pub fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
+pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
     let (Some(a), Some(b)) = (previous.last(), next.first()) else {
         return false;
     };
@@ -451,7 +451,7 @@ pub fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
 
 /// Each of a page's `lines` (in reading order) `counted` holds numbered by its printed paragraph,
 /// from 0 in order; none for the others, which part the runs of counted lines.
-pub fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure) -> Vec<Option<usize>> {
+pub(crate) fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure) -> Vec<Option<usize>> {
     let body: Vec<&Line> = lines.iter().zip(counted).filter(|(_, counted)| **counted).map(|(line, _)| *line).collect();
     let pitch = Pitch::of(&body, measure);
     let (mut assigned, mut next, mut start) = (vec![None; lines.len()], 0, 0);

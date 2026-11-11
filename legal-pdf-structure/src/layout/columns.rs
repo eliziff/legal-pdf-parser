@@ -4,7 +4,7 @@ use super::*;
 
 /// The text items of the page's lines `keep` holds, taken from the page's items (`page_items`),
 /// each carrying its line's slot on the page (as its `mcid`).
-pub fn kept_items(items: &crate::tables::PageItems, keep: impl Fn(usize) -> bool) -> Vec<pdf_inspector::TextItem> {
+pub(crate) fn kept_items(items: &crate::tables::PageItems, keep: impl Fn(usize) -> bool) -> Vec<pdf_inspector::TextItem> {
     items
         .items
         .iter()
@@ -20,7 +20,7 @@ pub fn kept_items(items: &crate::tables::PageItems, keep: impl Fn(usize) -> bool
 /// gutter between them, a pair whose narrower is under half the wider's width being a body and its
 /// margin column (pdf-inspector's sidebar); more than two, a multi-column page. A lane whose lines are all bare
 /// numbers is no column: a report's paragraph numbers printed in its margin.
-pub fn columns_of(lines: &[Line], members: impl Iterator<Item = usize>, items: &[pdf_inspector::TextItem], number: u32) -> ColumnModel {
+pub(crate) fn columns_of(lines: &[Line], members: impl Iterator<Item = usize>, items: &[pdf_inspector::TextItem], number: u32) -> ColumnModel {
     let members: Vec<&Line> = members.map(|slot| &lines[slot]).filter(|line| has_valid_bbox(line) && !line.exclude_from_body).collect();
     let regions: Vec<_> = pdf_inspector::extractor::detect_columns(items, number, false)
         .into_iter()
@@ -46,7 +46,7 @@ pub fn columns_of(lines: &[Line], members: impl Iterator<Item = usize>, items: &
 }
 
 /// A number standing alone on its line ("24", "[24]"): a report's paragraph number when it stands in the margin.
-pub fn bare_number(line: &Line) -> bool {
+pub(crate) fn bare_number(line: &Line) -> bool {
     let text = line.text.trim();
     let text = text.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')).unwrap_or(text);
     !text.is_empty() && text.len() <= 4 && text.bytes().all(|byte| byte.is_ascii_digit())
@@ -54,7 +54,7 @@ pub fn bare_number(line: &Line) -> bool {
 
 /// The body lines (`body`, slots of `lines`) that are bare numbers clear of the body's prose on either side: a law
 /// report's margin numbers, a lane of their own that is no column of the page's text.
-pub fn margin_lane(lines: &[Line], body: &[usize], page_width: f64) -> Vec<usize> {
+pub(crate) fn margin_lane(lines: &[Line], body: &[usize], page_width: f64) -> Vec<usize> {
     let prose: Vec<&Line> = body
         .iter()
         .map(|&slot| &lines[slot])
@@ -72,7 +72,7 @@ pub fn margin_lane(lines: &[Line], body: &[usize], page_width: f64) -> Vec<usize
 /// their words' items (`group_into_lines_preserving_all_text`: column by column, banded where the
 /// columns change down the page, a newspaper's columns read through); a line it was not offered
 /// stays after the line it followed.
-pub fn inspected_order(members: &[usize], items: Vec<pdf_inspector::TextItem>, count: usize) -> Vec<usize> {
+pub(crate) fn inspected_order(members: &[usize], items: Vec<pdf_inspector::TextItem>, count: usize) -> Vec<usize> {
     let mut place = vec![usize::MAX; count];
     for (at, &slot) in members.iter().enumerate() {
         place[slot] = at;
@@ -101,7 +101,7 @@ fn grow(area: [f64; 4], bbox: [f64; 4]) -> [f64; 4] {
 /// The margin column a page's note labels (`labels`, slots of `lines`) stand in beside its prose:
 /// at least `minimum_labels` of them on one side, apart from the body lines of `members` on their
 /// rows that `set_aside` leaves (running heads and feet, lines held out of the body).
-pub fn margin_note_model(
+pub(crate) fn margin_note_model(
     lines: &[Line],
     members: &[usize],
     set_aside: impl Fn(usize) -> bool,
@@ -163,7 +163,7 @@ pub fn margin_note_model(
 
 /// The columns of a page's note band (`members`, slots of `lines`), read on the page's `items`
 /// (on page `number`): two columns a line of prose runs across are a body and its margin.
-pub fn note_column_model(lines: &[Line], members: &[usize], items: &crate::tables::PageItems, number: u32) -> ColumnModel {
+pub(crate) fn note_column_model(lines: &[Line], members: &[usize], items: &crate::tables::PageItems, number: u32) -> ColumnModel {
     let mut kept = vec![false; lines.len()];
     for &slot in members {
         kept[slot] = true;
@@ -189,11 +189,11 @@ fn column_sides(lines: &[Line], members: &[usize], model: ColumnModel, page_widt
         .collect()
 }
 
-pub fn column_switches(lines: &[Line], members: &[usize], model: ColumnModel, page_width: f64) -> usize {
+pub(crate) fn column_switches(lines: &[Line], members: &[usize], model: ColumnModel, page_width: f64) -> usize {
     column_sides(lines, members, model, page_width).windows(2).filter(|pair| pair[0] != pair[1]).count()
 }
 
-pub fn median_column_run(lines: &[Line], members: &[usize], model: ColumnModel, page_width: f64) -> usize {
+pub(crate) fn median_column_run(lines: &[Line], members: &[usize], model: ColumnModel, page_width: f64) -> usize {
     let sides = column_sides(lines, members, model, page_width);
     let mut runs: Vec<usize> = sides.chunk_by(|left, right| left == right).map(<[bool]>::len).collect();
     runs.sort_unstable();

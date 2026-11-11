@@ -29,9 +29,9 @@ fn continued_note(text: &str) -> bool {
 /// A page's note lines in one document and language, in reading order, and whether the first opens
 /// with no label of its own and so goes on with the last note of the page before.
 #[derive(Debug)]
-pub struct NoteSegment {
-    pub lines: Vec<Slot>,
-    pub continued: bool,
+pub(crate) struct NoteSegment {
+    pub(crate) lines: Vec<Slot>,
+    pub(crate) continued: bool,
 }
 
 /// What the note band and its lanes read of a document, by slot: each note line's kind; the lines
@@ -39,16 +39,16 @@ pub struct NoteSegment {
 /// endnote page's running heads; the notes headings; each page's note segments; and the warnings
 /// of a band drawn on weak geometry. A trace holds its readings of the lines.
 #[derive(Debug, Default, serde::Serialize)]
-pub struct Notes {
-    pub note: Vec<Option<NoteKind>>,
-    pub paragraph_label: Vec<bool>,
-    pub suppressed: Vec<bool>,
-    pub running_head: Vec<bool>,
-    pub heading: Vec<bool>,
+pub(crate) struct Notes {
+    pub(crate) note: Vec<Option<NoteKind>>,
+    pub(crate) paragraph_label: Vec<bool>,
+    pub(crate) suppressed: Vec<bool>,
+    pub(crate) running_head: Vec<bool>,
+    pub(crate) heading: Vec<bool>,
     #[serde(skip)]
-    pub segments: Vec<NoteSegment>,
+    pub(crate) segments: Vec<NoteSegment>,
     #[serde(skip)]
-    pub diagnostics: Vec<Diagnostic>,
+    pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
 /// The body's type size in a document and language (`lines`): the largest size (`line_font_size`,
@@ -98,7 +98,7 @@ impl EndnoteRun {
 impl Notes {
     /// The notes of the document's pages, measured (`evidence`), fenced and ordered (`fences`), its
     /// numbering runs read (`runs`).
-    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs) -> Self {
+    pub(crate) fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, runs: &Runs) -> Self {
         let count = slots.len();
         let separators = &fences.separators;
         let starts: Vec<usize> = (0..pages.len()).map(|page| slots.on(page).start as usize).collect();

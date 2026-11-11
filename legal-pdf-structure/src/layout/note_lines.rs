@@ -3,14 +3,14 @@
 
 use super::*;
 
-pub fn band_geometry_top(line: &Line) -> f64 {
+pub(crate) fn band_geometry_top(line: &Line) -> f64 {
     line.words.iter().map(|word| word.bbox[1]).min_by(f64::total_cmp).unwrap_or(line.bbox[1])
 }
 
 /// Lines (`members`, slots of `lines`) in rows, top to bottom, each row left to right: taken by
 /// `top`, a line joins the row whose middle its own sits within half the lines' median height of,
 /// so a skewed scan's row (each word a line, the tops rising across the page) reads left to right.
-pub fn read_rows(lines: &[Line], members: &mut Vec<usize>, top: impl Fn(usize) -> f64) {
+pub(crate) fn read_rows(lines: &[Line], members: &mut Vec<usize>, top: impl Fn(usize) -> f64) {
     let height = |slot: usize| (lines[slot].bbox[3] - lines[slot].bbox[1]).max(0.0);
     let half = median(members.iter().map(|&slot| height(slot)).collect()) / 2.0;
     let mut keyed: Vec<(usize, f64)> = members.iter().map(|&slot| (slot, top(slot))).collect();
@@ -33,14 +33,14 @@ pub fn read_rows(lines: &[Line], members: &mut Vec<usize>, top: impl Fn(usize) -
     *members = rows.into_iter().flat_map(row).collect();
 }
 
-pub fn standalone_note_label(line: &Line) -> bool {
+pub(crate) fn standalone_note_label(line: &Line) -> bool {
     let text = line.text.trim();
     let length = text.chars().count();
     ((1..=MAX_SYMBOL_LABEL_LEN).contains(&length) && text.chars().all(is_note_symbol))
         || ((1..=4).contains(&length) && text.chars().all(|character| character.is_ascii_digit()))
 }
 
-pub fn aligned_note_body(label: &Line, body: &Line) -> bool {
+pub(crate) fn aligned_note_body(label: &Line, body: &Line) -> bool {
     if standalone_note_label(body) || body.bbox[0] < label.bbox[0] {
         return false;
     }
@@ -51,7 +51,7 @@ pub fn aligned_note_body(label: &Line, body: &Line) -> bool {
 
 /// The line among the lines `among` names (slots of `lines`) that a label printed apart from its
 /// note's text stands beside: on the label's row, at or right of it, nearest it.
-pub fn aligned_note_body_among(lines: &[Line], among: impl IntoIterator<Item = usize>, label_index: usize) -> Option<usize> {
+pub(crate) fn aligned_note_body_among(lines: &[Line], among: impl IntoIterator<Item = usize>, label_index: usize) -> Option<usize> {
     let label = &lines[label_index];
     let (gap, drop) = (|body: &Line| (body.bbox[0] - label.bbox[2]).max(0.0), |body: &Line| (body.bbox[1] - label.bbox[1]).abs());
     among
@@ -64,7 +64,7 @@ pub fn aligned_note_body_among(lines: &[Line], among: impl IntoIterator<Item = u
 
 /// A page's note band (`note`, slots of `lines`) in reading order: column by column, row by row
 /// (`read_rows`), a label set apart on its note's first line. `items` are the page's (on page `number`).
-pub fn order_note_lines(lines: &[Line], note: &mut Vec<usize>, items: &crate::tables::PageItems, number: u32) {
+pub(crate) fn order_note_lines(lines: &[Line], note: &mut Vec<usize>, items: &crate::tables::PageItems, number: u32) {
     let mut tops: HashMap<usize, f64> = note.iter().map(|&slot| (slot, band_geometry_top(&lines[slot]))).collect();
     for &label in note.iter() {
         if !standalone_note_label(&lines[label]) {
@@ -85,7 +85,7 @@ pub fn order_note_lines(lines: &[Line], note: &mut Vec<usize>, items: &crate::ta
 
 /// A page's body and note band (slots of `lines`) read together: on a page of two columns, each
 /// column's notes after that column's body. `items` are the page's (on page `number`).
-pub fn weave_note_columns(lines: &[Line], mut body: Vec<usize>, note: Vec<usize>, items: &crate::tables::PageItems, page_width: f64, number: u32) -> Vec<usize> {
+pub(crate) fn weave_note_columns(lines: &[Line], mut body: Vec<usize>, note: Vec<usize>, items: &crate::tables::PageItems, page_width: f64, number: u32) -> Vec<usize> {
     if note.is_empty() {
         return body;
     }

@@ -38,27 +38,27 @@ use std::cmp::Reverse;
 /// half points, bold, italic, capitals, underlined, its place on the line (0 flush, 1 indented, 2
 /// centred in its column) and its numbering family (an index into `Families`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Look {
-    pub face: u16,
-    pub size: u16,
-    pub bold: bool,
-    pub italic: bool,
-    pub caps: bool,
-    pub underlined: bool,
-    pub place: u8,
-    pub family: u16,
+pub(crate) struct Look {
+    pub(crate) face: u16,
+    pub(crate) size: u16,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) caps: bool,
+    pub(crate) underlined: bool,
+    pub(crate) place: u8,
+    pub(crate) family: u16,
 }
 
 impl Look {
     /// The order of heading looks by rank: larger type first, then capitals, bold, centred, underlined.
-    pub fn rank(&self) -> (Reverse<u16>, bool, bool, bool, bool) {
+    pub(crate) fn rank(&self) -> (Reverse<u16>, bool, bool, bool, bool) {
         (Reverse(self.size), !self.caps, !self.bold, self.place != 2, !self.underlined)
     }
 }
 
 /// The numbering families looks are set in, each by its index.
 #[derive(Default)]
-pub struct Families(Vec<String>);
+pub(crate) struct Families(Vec<String>);
 
 impl Families {
     fn id(&mut self, family: String) -> u16 {
@@ -90,10 +90,10 @@ fn family(value: &str, punctuation: &str) -> String {
 /// smaller size or another face alone sets nothing apart: a quotation's, a note's or a running
 /// head's type is no heading's.
 #[derive(Clone, Copy, Debug)]
-pub struct Typeset {
-    pub body: bool,
-    pub larger: bool,
-    pub set_apart: bool,
+pub(crate) struct Typeset {
+    pub(crate) body: bool,
+    pub(crate) larger: bool,
+    pub(crate) set_apart: bool,
 }
 
 /// The median of the positive values.
@@ -111,7 +111,7 @@ fn positive_median(mut values: Vec<f64>) -> f64 {
 /// (a scan's recognition) is set in the body's type unless it measures otherwise: larger where its
 /// height reads a size 1.1 times its page's, bold where its strokes are 1.2 times as thick as its
 /// page's.
-pub fn look_of(
+pub(crate) fn look_of(
     pages: &[Page],
     slots: &Slots,
     evidence: &Evidence,
@@ -173,14 +173,14 @@ pub fn look_of(
 
 /// A marker standing alone on its line: a number and nothing else ("III.", "12", "(b)"), or a
 /// division's word and its number ("ARTICLE 31", "PART IV").
-pub fn marker_alone(evidence: &Evidence, slot: Slot, text: &str) -> bool {
+pub(crate) fn marker_alone(evidence: &Evidence, slot: Slot, text: &str) -> bool {
     headings::rules::bare_number(text)
         || evidence.marker[slot.index()].is_some_and(|marker| marker.only)
         || evidence.words[slot.index()] & WORD_DIVISION != 0 && text.trim_end_matches('.').split_whitespace().count() == 2
 }
 
 /// Two lines a blank of most of a line parts, or on two pages: two blocks.
-pub fn apart(pages: &[Page], slots: &Slots, geometry: &Geometry, upper: Slot, lower: Slot) -> bool {
+pub(crate) fn apart(pages: &[Page], slots: &Slots, geometry: &Geometry, upper: Slot, lower: Slot) -> bool {
     slots.page(upper) != slots.page(lower)
         || slots.line(pages, lower).bbox[1] - slots.line(pages, upper).bbox[3] > 0.8 * geometry.page(pages, slots.page(lower)).0.height
 }
@@ -192,14 +192,14 @@ pub fn apart(pages: &[Page], slots: &Slots, geometry: &Geometry, upper: Slot, lo
 /// not in the body's type; prose or a unit follows it; fields follow it; a blank of 0.8 of a line or
 /// more stands above it; it ends on a colon; it runs over twelve words; it wraps over more lines than
 /// its marker with no enumerator.
-pub const OWN_BASE: f64 = -1.5;
-pub const OWN: [f64; 11] = [2.5, 1.0, -1.5, 1.5, 0.75, 1.0, -0.75, 0.5, -1.0, -1.0, -0.5];
+pub(crate) const OWN_BASE: f64 = -1.5;
+pub(crate) const OWN: [f64; 11] = [2.5, 1.0, -1.5, 1.5, 0.75, 1.0, -0.75, 0.5, -1.0, -1.0, -0.5];
 /// A look's signs, each weighed where it holds, in order: its candidates stand on two pages or more;
 /// half or more are tagged headings by their source; it has over forty, under a fifth set apart.
-pub const LOOK: [f64; 3] = [0.5, 0.5, -1.0];
+pub(crate) const LOOK: [f64; 3] = [0.5, 0.5, -1.0];
 /// A candidate's own evidence's share of its score where its look holds others, the look's mean
 /// taking the rest.
-pub const OWN_SHARE: f64 = 0.5;
+pub(crate) const OWN_SHARE: f64 = 0.5;
 
 /// A candidate: its lines (places in its context's lines), its look, its own evidence as log-odds,
 /// whether a word or its place bars it, whether its source tags it a heading, whether its type is
@@ -220,7 +220,7 @@ struct Candidate {
 /// and examinations), its anchors' and its contents' title, never the residual's: throughout a
 /// transcript that is testimony throughout (`Fences::testimony`), and on a transcript's pages of
 /// speakers' turns. `unnamed` holds the lines bookmarks naming every heading leave unnamed.
-pub fn weigh(pages: &[Page],
+pub(crate) fn weigh(pages: &[Page],
     slots: &Slots,
     evidence: &Evidence,
     fences: &Fences,

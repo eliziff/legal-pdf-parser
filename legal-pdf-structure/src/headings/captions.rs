@@ -7,7 +7,7 @@ use legal_pdf_core::{CitationSpan, Line};
 
 /// A caption's labelled field.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Field {
+pub(crate) enum Field {
     File,
     Court,
     Place,
@@ -22,7 +22,7 @@ pub enum Field {
     Bench,
 }
 
-pub fn field(text: &str) -> Option<Field> {
+pub(crate) fn field(text: &str) -> Option<Field> {
     let labelled = text.contains(':');
     let key = text.split_once(':').map_or(text, |(key, _)| key);
     let key = key.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -51,7 +51,7 @@ pub fn field(text: &str) -> Option<Field> {
     })
 }
 
-pub fn closing(text: &str) -> bool {
+pub(crate) fn closing(text: &str) -> bool {
     let text = text.trim().to_ascii_lowercase();
     let key = text.split_once(':').map_or(text.as_str(), |(key, _)| key);
     matches!(
@@ -72,7 +72,7 @@ fn numbered_start(marker: &str) -> bool {
         .is_some_and(|marker| marker.ordinal == 1)
 }
 
-pub fn reasons(line: &Line) -> bool {
+pub(crate) fn reasons(line: &Line) -> bool {
     let value = line.text.trim();
     if value.starts_with('[') && value.ends_with(']') && numbered_start(value) {
         return true;
@@ -86,7 +86,7 @@ pub fn reasons(line: &Line) -> bool {
 /// A dedicated citation line can name the case; a reference inside another field cannot.
 /// `citations` reads the citations in the line's text after its field's label, given that text and
 /// where it starts in the line's (in bytes).
-pub fn citation_title(line: &Line, citations: impl FnOnce(&str, usize) -> Vec<CitationSpan>) -> Option<bool> {
+pub(crate) fn citation_title(line: &Line, citations: impl FnOnce(&str, usize) -> Vec<CitationSpan>) -> Option<bool> {
     let key = field(&line.text);
     if key.is_some() && key != Some(Field::Citation) {
         return None;

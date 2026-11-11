@@ -14,7 +14,7 @@
 //! place in its text.
 
 use legal_pdf_core::model::{Line, LineZone, NoteMode, Page};
-use crate::model::regions as zones;
+use crate::model::regions;
 use legal_pdf_core::{layout_analysis, Error, Result};
 use crate::fences::{Continuation, Fences};
 use crate::layout::Geometry;
@@ -49,7 +49,7 @@ fn repair_markers(pages: &mut [Page], fences: &Fences) -> Vec<(Slot, String)> {
             let at = slot.index();
             // (The repair asks only whether a line is the page's head or foot, or a note's.)
             let zone = match fences.role[at] {
-                role @ (Role::LineLabel | Role::Furniture | Role::PageLabel) => zones::zone_of(role, fences.edge[at], NoteMode::Footnote),
+                role @ (Role::LineLabel | Role::Furniture | Role::PageLabel) => regions::zone_of(role, fences.edge[at], NoteMode::Footnote),
                 _ if fences.band[at] => LineZone::Note(Some(NoteMode::Footnote)),
                 _ => LineZone::Body,
             };
@@ -389,7 +389,7 @@ fn aligned_siblings(pages: &[Page], slots: &Slots, view: &View, run: &StructureC
 /// and ordered (`fences`), each marker resolved to the unit it opens; and, once the statute's
 /// spine is read, its running heads naming its sections fenced (`confirm_section_heads`). The pages' `geometry` is read
 /// once their markers are restored.
-pub fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences, geometry: &Geometry) -> Result<Runs> {
+pub(crate) fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences, geometry: &Geometry) -> Result<Runs> {
     let repaired = legal_pdf_core::profile::measure("runs.repair", || repair_markers(pages, fences));
     let pages: &[Page] = pages;
     crate::evidence::reread(evidence, pages, slots, &repaired);

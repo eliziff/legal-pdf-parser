@@ -3,11 +3,11 @@
 
 use super::*;
 
-pub mod ends;
-pub mod keep;
-pub mod measures;
-pub mod notes;
-pub mod write;
+pub(crate) mod ends;
+pub(crate) mod keep;
+pub(crate) mod measures;
+pub(crate) mod notes;
+pub(crate) mod write;
 
 use measures::{Counts, Numbers, PageMeasures};
 use notes::NoteWalk;
@@ -16,7 +16,7 @@ use write::Written;
 /// The stream a line is read in, apart from the column it stands in (`Fences::translation`): a judgment in one language
 /// reads a statute quoted in two columns in its one stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Stream {
+pub(crate) enum Stream {
     Text,
     Translation,
 }
@@ -217,7 +217,7 @@ impl Fences {
     /// decision's text (`judgment_paragraphs`) reads it, and its paragraphs come back to the lines as `paragraphs`.
     /// Each judgment's numbered paragraphs: which lines each number holds, and the line each opens on. Reading and
     /// storing are apart: only the margin's small figures are cleared before it, and the answer is stored once after.
-    pub fn read_paragraphs(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
+    pub(crate) fn read_paragraphs(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
         for at in 0..slots.len() {
             if self.note_label(evidence, at, self.margin_number[at]) {
                 self.margin_number[at] = None;

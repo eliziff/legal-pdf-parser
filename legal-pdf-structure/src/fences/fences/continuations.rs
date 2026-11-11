@@ -4,7 +4,7 @@ use super::*;
 impl Fences {
     /// How each line no fence took goes on with the line before it, in its reading context and
     /// stream, in reading order: on one page by any continuation, across a page by the text's flow.
-    pub fn read_continuations(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
+    pub(crate) fn read_continuations(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
         self.continues = vec![None; slots.len()];
         let mut last: Vec<Option<Slot>> = vec![None; self.contexts.len() * 2];
         for &slot in &self.order {
@@ -44,7 +44,7 @@ impl Fences {
     /// The statute's running heads naming their page's sections, where its spine bears them out
     /// (`spine`: a section numbered so opens on that page slot), on their page or the one before;
     /// and the lines on their rows. The lines' continuations are read again without them.
-    pub fn confirm_section_heads(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, spine: impl Fn(usize, u32) -> bool) {
+    pub(crate) fn confirm_section_heads(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, spine: impl Fn(usize, u32) -> bool) {
         let mut fenced = false;
         for (slot, edge, number) in std::mem::take(&mut self.section_heads) {
             let page = slots.page(slot);

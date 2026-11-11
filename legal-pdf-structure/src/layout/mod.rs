@@ -10,18 +10,18 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-pub mod columns;
-pub use columns::*;
-pub mod language;
-pub use language::*;
-pub mod order;
-pub use order::*;
-pub mod note_lines;
-pub use note_lines::*;
+pub(crate) mod columns;
+pub(crate) use columns::*;
+pub(crate) mod language;
+pub(crate) use language::*;
+pub(crate) mod order;
+pub(crate) use order::*;
+pub(crate) mod note_lines;
+pub(crate) use note_lines::*;
 
 /// What a page's columns are: one, two of like width, a body beside a narrower margin's, or more than two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum ColumnKind {
+pub(crate) enum ColumnKind {
     Single,
     Two,
     Margin,
@@ -30,25 +30,25 @@ pub enum ColumnKind {
 
 /// A page's columns: their kind, where they split, and the lines on either side.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct ColumnModel {
-    pub kind: ColumnKind,
-    pub split_x: f64,
-    pub left_count: usize,
-    pub right_count: usize,
+pub(crate) struct ColumnModel {
+    pub(crate) kind: ColumnKind,
+    pub(crate) split_x: f64,
+    pub(crate) left_count: usize,
+    pub(crate) right_count: usize,
 }
 
-pub fn line_width(line: &Line) -> f64 {
+pub(crate) fn line_width(line: &Line) -> f64 {
     line.bbox[2] - line.bbox[0]
 }
 
-pub fn has_valid_bbox(line: &Line) -> bool {
+pub(crate) fn has_valid_bbox(line: &Line) -> bool {
     line.bbox.iter().all(|value| value.is_finite())
         && line.bbox[2] > line.bbox[0]
         // (A PDF's font may give its lines no height: 2001 SCC 79's every line stands on one y.)
         && line.bbox[3] >= line.bbox[1]
 }
 
-pub fn line_center_x(line: &Line) -> f64 {
+pub(crate) fn line_center_x(line: &Line) -> f64 {
     (line.bbox[0] + line.bbox[2]) / 2.0
 }
 
@@ -57,24 +57,24 @@ pub(crate) fn line_center_y(line: &Line) -> f64 {
 }
 
 /// Whether a page layout model labelled the line: its region is one of the model's.
-pub fn layout_labelled(line: &Line) -> bool {
+pub(crate) fn layout_labelled(line: &Line) -> bool {
     line.region_id.contains("-ppdoc-r")
 }
 
 /// Each page's measures and columns, read once, when a stage first asks for them, and kept for every stage that reads
 /// the pages after (the document's, made once where its stages are called, `legal_pdf_structure`): what they measure
 /// (the lines' boxes, sizes and text) stands until the lines are written.
-pub struct Geometry {
+pub(crate) struct Geometry {
     read: Vec<OnceCell<(PageMeasure, Columns)>>,
 }
 
 impl Geometry {
-    pub fn of(pages: &[Page]) -> Self {
+    pub(crate) fn of(pages: &[Page]) -> Self {
         Self { read: (0..pages.len()).map(|_| OnceCell::new()).collect() }
     }
 
     /// The page's measures (`PageMeasure`) and columns (`Columns`), by page slot: `pages[page]`'s.
-    pub fn page(&self, pages: &[Page], page: usize) -> &(PageMeasure, Columns) {
+    pub(crate) fn page(&self, pages: &[Page], page: usize) -> &(PageMeasure, Columns) {
         self.read[page].get_or_init(|| (PageMeasure::of(&pages[page]), Columns::of(&pages[page])))
     }
 }

@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use crate::layout::{column_language, language_votes};
 
 mod grid;
-pub use grid::has_table_caption;
+pub(crate) use grid::has_table_caption;
 use grid::white_space;
 
 /// Points within which rule positions coincide and rule ends meet.
@@ -30,21 +30,21 @@ const TOLERANCE: f64 = 2.0;
 /// A line of a cell, or the part of it that stands in the cell when the line runs on
 /// across a column into the next cell.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct CellPart {
-    pub line_id: String,
+pub(crate) struct CellPart {
+    pub(crate) line_id: String,
     /// The part's UTF-16 offsets within its line's text.
-    pub chars: Option<(usize, usize)>,
+    pub(crate) chars: Option<(usize, usize)>,
     text: String,
     bbox: [f64; 4],
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct TableCell {
-    pub column: usize,
-    pub row_span: usize,
-    pub column_span: usize,
+pub(crate) struct TableCell {
+    pub(crate) column: usize,
+    pub(crate) row_span: usize,
+    pub(crate) column_span: usize,
     /// The cell's text in reading order; empty for a blank cell.
-    pub parts: Vec<CellPart>,
+    pub(crate) parts: Vec<CellPart>,
 }
 
 impl TableCell {
@@ -52,7 +52,7 @@ impl TableCell {
         self.parts.iter().map(|part| part.text.trim()).collect::<Vec<_>>().join(" ")
     }
 
-    pub fn line_ids(&self) -> Vec<String> {
+    pub(crate) fn line_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
         for part in &self.parts {
             if ids.last() != Some(&part.line_id) {
@@ -64,15 +64,15 @@ impl TableCell {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct TableRow {
-    pub header: bool,
+pub(crate) struct TableRow {
+    pub(crate) header: bool,
     /// The cells whose top-left corner is in this row, by column.
-    pub cells: Vec<TableCell>,
+    pub(crate) cells: Vec<TableCell>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct PdfTable {
-    pub rows: Vec<TableRow>,
+pub(crate) struct PdfTable {
+    pub(crate) rows: Vec<TableRow>,
     page_index: usize,
     xs: Vec<f64>,
     top: f64,
@@ -81,7 +81,7 @@ pub struct PdfTable {
 
 impl PdfTable {
     /// The table's lines, each once, in reading order.
-    pub fn line_ids(&self) -> Vec<&String> {
+    pub(crate) fn line_ids(&self) -> Vec<&String> {
         let mut seen = HashSet::new();
         self.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.parts).map(|part| &part.line_id).filter(|id| seen.insert(*id)).collect()
     }
@@ -123,26 +123,26 @@ fn cell_of(page: &Page, column: usize, mut pieces: Vec<Piece>) -> TableCell {
 }
 
 /// A word no word of the line stands for: the line read whole.
-pub const WHOLE: usize = usize::MAX;
+pub(crate) const WHOLE: usize = usize::MAX;
 
 /// Lines' words as pdf-inspector's text items, with the (line, word) each was read from.
 #[derive(Debug)]
-pub struct PageItems {
-    pub items: Vec<TextItem>,
+pub(crate) struct PageItems {
+    pub(crate) items: Vec<TextItem>,
     /// The line's slot and the word's index for each item; `WHOLE` for a line read whole.
-    pub origin: Vec<(usize, usize)>,
+    pub(crate) origin: Vec<(usize, usize)>,
 }
 
 /// A page's words as text items on the page's own number (its index + 1), the number its rules
 /// and filled rectangles are read on: the one reading of the page its table readers share.
-pub fn page_items(page: &Page) -> PageItems {
+pub(crate) fn page_items(page: &Page) -> PageItems {
     line_items(&page.lines, page.index as u32 + 1, page.height)
 }
 
 /// Lines' words as pdf-inspector's text items (points, y up, on page `number`), with the (line,
 /// word) each was read from, so its readers read our pages, recognized ones too. Lines the parser
 /// holds out of the body (a transcript's line numbers) are not offered.
-pub fn line_items(lines: &[Line], number: u32, height: f64) -> PageItems {
+pub(crate) fn line_items(lines: &[Line], number: u32, height: f64) -> PageItems {
     let (mut items, mut origin) = (Vec::new(), Vec::new());
     // Each word as its span sets it: face, weight, slant and pitch; a recognized line's by its
     // strokes alone.
@@ -203,7 +203,7 @@ pub fn line_items(lines: &[Line], number: u32, height: f64) -> PageItems {
 /// Clears the underline and strike read under the words of a table drawn with rules or filled
 /// cells, as pdf-inspector clears them (suppress_table_underlines): the table's rulings, not the
 /// words'. The page's items (`page_items`) are cleared with its words.
-pub fn clear_table_underlines(page: &mut Page, items: &mut PageItems) {
+pub(crate) fn clear_table_underlines(page: &mut Page, items: &mut PageItems) {
     if !items.items.iter().any(|item| item.is_underline || item.is_strikeout) {
         return;
     }
@@ -497,7 +497,7 @@ fn regrid(table: &mut PdfTable, xs: &[f64]) {
 /// in reading order; and the lines of the contents lists pdf-inspector read as tables. Each page
 /// is read on its items (`page_items`, one per page) and its own rules and filled rectangles. A
 /// table holding a line `translated` names (by id) is a text beside its translation.
-pub fn document_tables(pages: &[Page], items: &[PageItems], translated: &dyn Fn(&str) -> bool) -> (Vec<PdfTable>, HashSet<String>) {
+pub(crate) fn document_tables(pages: &[Page], items: &[PageItems], translated: &dyn Fn(&str) -> bool) -> (Vec<PdfTable>, HashSet<String>) {
     let (mut tables, mut contents, mut previous_last) = (Vec::<PdfTable>::new(), HashSet::new(), None::<usize>);
     for (page, items) in pages.iter().zip(items) {
         let (found, listed) = page_tables(page, items, translated);

@@ -7,7 +7,7 @@ impl Fences {
     /// count takes at another line (a number nothing else prints is the count's own, however it broke the count: a
     /// misread digit), with the lines its block goes on into (`continues`) and the editorial lines under it ("[Emphasis
     /// added]"), each a quotation of its own. Whether it found any.
-    pub fn read_quotations(&mut self, pages: &[Page], slots: &Slots) -> bool {
+    pub(crate) fn read_quotations(&mut self, pages: &[Page], slots: &Slots) -> bool {
         // LEGALPDF_ABLATE=sequence leaves the quotations out, for their measure under the tagger.
         if legal_structure_model::ablated("sequence") {
             return false;

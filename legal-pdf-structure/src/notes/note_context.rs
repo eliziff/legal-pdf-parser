@@ -21,7 +21,7 @@ fn read(units: &[u16]) -> String {
 
 /// Each sentence's end in `units` (a text's UTF-16 code units): its stop and the quotes or brackets
 /// closing it, where a space, a note's marker or the text's end follows.
-pub fn sentence_boundaries(units: &[u16]) -> Vec<(usize, usize)> {
+pub(crate) fn sentence_boundaries(units: &[u16]) -> Vec<(usize, usize)> {
     fn is(unit: Option<&u16>, characters: &[char]) -> bool {
         unit.is_some_and(|&unit| characters.iter().any(|&c| u32::from(unit) == u32::from(c)))
     }
@@ -45,7 +45,7 @@ pub fn sentence_boundaries(units: &[u16]) -> Vec<(usize, usize)> {
     boundaries
 }
 
-pub fn sentence_at_boundaries(units: &[u16], boundaries: &[(usize, usize)], offset: usize) -> String {
+pub(crate) fn sentence_at_boundaries(units: &[u16], boundaries: &[(usize, usize)], offset: usize) -> String {
     let previous = &boundaries[..boundaries.partition_point(|(_, end)| *end <= offset)];
     let (start, end) = match previous.last() {
         // A reference after a sentence's stop is that sentence's.
@@ -63,7 +63,7 @@ pub fn sentence_at_boundaries(units: &[u16], boundaries: &[(usize, usize)], offs
 /// Each note's sentence and the passage since the note before it, read off the body authority units: their text, their
 /// notes' marks left out, and where each mark stood (`footnote_refs`, each a note's ordinal and a UTF-16 offset). Each is
 /// a property of the note's node ("sentence", "passage").
-pub fn attach_propositions(structure: &mut DocumentStructure, units: &[AuthorityTextUnit], decided: &Decided) {
+pub(crate) fn attach_propositions(structure: &mut DocumentStructure, units: &[AuthorityTextUnit], decided: &Decided) {
     let ordered: Vec<usize> = structure.nodes.iter().enumerate()
         .filter(|(_, node)| matches!(node.kind, NodeKind::Footnote | NodeKind::Endnote)).map(|(at, _)| at).collect();
     let mut tails = HashMap::<DocumentContext, String>::new();
@@ -91,7 +91,7 @@ pub fn attach_propositions(structure: &mut DocumentStructure, units: &[Authority
 
 /// A detached superscript no note's call stands on, and a body superscript that reads as a known note's label but no
 /// call stands on.
-pub fn unmatched_reference_diagnostics<'a>(lines: impl Iterator<Item = (&'a Line, LineZone)>, notes: &[StructureNode], index: &PdfTextIndex, decided: &Decided) -> Vec<Diagnostic> {
+pub(crate) fn unmatched_reference_diagnostics<'a>(lines: impl Iterator<Item = (&'a Line, LineZone)>, notes: &[StructureNode], index: &PdfTextIndex, decided: &Decided) -> Vec<Diagnostic> {
     let context_of = |note: &StructureNode| note.line_ids.first().map_or((0, false), |id| decided.document_context(id));
     let labels: HashSet<_> = notes.iter().map(|note| (context_of(note), note.label.as_deref().unwrap_or(""))).collect();
     let calls: HashSet<(usize, usize)> = notes.iter().flat_map(|note| &note.calls).map(|call| (call.start, call.end)).collect();

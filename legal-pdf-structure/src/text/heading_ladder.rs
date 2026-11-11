@@ -9,9 +9,9 @@ const MAX_COUNTER_VALUE: u32 = 200;
 const MAX_OUTLINE_DEPTH: usize = 6;
 const FOOTNOTE_SUSPECT_MIN_VALUE: u32 = 15;
 
-pub type EnumeratorInterpretation = (String, u32, usize);
+pub(crate) type EnumeratorInterpretation = (String, u32, usize);
 
-pub fn enumerator_interpretations(value: &str, punct: &str) -> Vec<EnumeratorInterpretation> {
+pub(crate) fn enumerator_interpretations(value: &str, punct: &str) -> Vec<EnumeratorInterpretation> {
     let counted = |number: &u32| (1..=MAX_COUNTER_VALUE).contains(number);
     if regex!(r"^\d{1,2}(?:\.\d{1,2}){1,3}$").is_match(value) {
         let parts = value.split('.').collect::<Vec<_>>();
@@ -46,17 +46,17 @@ struct Frame<'a> {
 }
 
 #[derive(Debug, Default)]
-pub struct HeadingFamilyStats {
-    pub count: usize,
-    pub max_value: u32,
-    pub level_votes: BTreeMap<usize, usize>,
-    pub violations: usize,
-    pub gaps: usize,
-    pub footnote_suspect: bool,
+pub(crate) struct HeadingFamilyStats {
+    pub(crate) count: usize,
+    pub(crate) max_value: u32,
+    pub(crate) level_votes: BTreeMap<usize, usize>,
+    pub(crate) violations: usize,
+    pub(crate) gaps: usize,
+    pub(crate) footnote_suspect: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HeadingAction {
+pub(crate) enum HeadingAction {
     Increment,
     OpenLevel,
     IllegalRestart,
@@ -66,13 +66,13 @@ pub enum HeadingAction {
 }
 
 #[derive(Debug)]
-pub struct HeadingAssignment {
-    pub level: Option<usize>,
-    pub action: HeadingAction,
+pub(crate) struct HeadingAssignment {
+    pub(crate) level: Option<usize>,
+    pub(crate) action: HeadingAction,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HeadingLadderStatus {
+pub(crate) enum HeadingLadderStatus {
     NoEnumerators,
     ParsedClean,
     ParsedWithViolations,
@@ -80,16 +80,16 @@ pub enum HeadingLadderStatus {
 }
 
 #[derive(Debug)]
-pub struct HeadingLadder<'a> {
-    pub assignments: Vec<HeadingAssignment>,
-    pub families: BTreeMap<&'a str, HeadingFamilyStats>,
-    pub status: HeadingLadderStatus,
+pub(crate) struct HeadingLadder<'a> {
+    pub(crate) assignments: Vec<HeadingAssignment>,
+    pub(crate) families: BTreeMap<&'a str, HeadingFamilyStats>,
+    pub(crate) status: HeadingLadderStatus,
 }
 
 /// [`parse_heading_ladder`] over each run the whole sequence starts over at the top (an illegal
 /// restart to level 1), as the readers split them: each run's first index in `candidates`, with
 /// its own ladder.
-pub fn parse_heading_runs<'a>(candidates: &[&'a [EnumeratorInterpretation]]) -> Vec<(usize, HeadingLadder<'a>)> {
+pub(crate) fn parse_heading_runs<'a>(candidates: &[&'a [EnumeratorInterpretation]]) -> Vec<(usize, HeadingLadder<'a>)> {
     let restarts = parse_heading_ladder(candidates.iter().copied()).assignments.iter().enumerate()
         .filter(|(_, assignment)| assignment.action == HeadingAction::IllegalRestart && assignment.level == Some(1))
         .map(|(index, _)| index)
@@ -99,7 +99,7 @@ pub fn parse_heading_runs<'a>(candidates: &[&'a [EnumeratorInterpretation]]) -> 
     starts.windows(2).map(|run| (run[0], parse_heading_ladder(candidates[run[0]..run[1]].iter().copied()))).collect()
 }
 
-pub fn parse_heading_ladder<'a>(candidates: impl IntoIterator<Item = &'a [EnumeratorInterpretation]>) -> HeadingLadder<'a> {
+pub(crate) fn parse_heading_ladder<'a>(candidates: impl IntoIterator<Item = &'a [EnumeratorInterpretation]>) -> HeadingLadder<'a> {
     let mut stack: Vec<Frame<'a>> = Vec::new();
     let mut assignments = Vec::new();
     let mut families: BTreeMap<&'a str, HeadingFamilyStats> = BTreeMap::new();

@@ -9,30 +9,30 @@
 
 use super::*;
 
-pub struct Stylesheet {
+pub(crate) struct Stylesheet {
     /// Each line's template, in reading order.
-    pub template: Vec<u32>,
-    pub templates: Vec<TemplateView>,
+    pub(crate) template: Vec<u32>,
+    pub(crate) templates: Vec<TemplateView>,
     /// Each line the outline names: its level there (0 for none).
-    pub anchor: Vec<u16>,
+    pub(crate) anchor: Vec<u16>,
 }
 
 /// What the stylesheet measures of a template.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct TemplateView {
-    pub lines: f32,
-    pub pages: f32,
-    pub monotone: f32,
-    pub anchored: f32,
-    pub anchor_level: f32,
-    pub level: f32,
-    pub edge: f32,
+pub(crate) struct TemplateView {
+    pub(crate) lines: f32,
+    pub(crate) pages: f32,
+    pub(crate) monotone: f32,
+    pub(crate) anchored: f32,
+    pub(crate) anchor_level: f32,
+    pub(crate) level: f32,
+    pub(crate) edge: f32,
     /// The share of its lines set beside another line on their row (a marginal note's lane).
-    pub beside: f32,
+    pub(crate) beside: f32,
 }
 
 /// A template row's width (`Stylesheet::rows`), as DOC's stylesheet stage reads it.
-pub const ROW: usize = 20;
+pub(crate) const ROW: usize = 20;
 
 /// A line feature's place among `LINE_FEATURES`.
 pub(crate) fn feature(name: &str) -> usize {
@@ -65,7 +65,7 @@ fn template_ids(table: &LineTable, measures: &Measures) -> Vec<u32> {
 impl Stylesheet {
     /// The stylesheet of the lines `table` reads.
     #[allow(clippy::too_many_arguments)]
-    pub fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &crate::decide::Geometry, outline: &[PdfOutlineEntry], table: &LineTable, measures: &Measures) -> Self {
+    pub(crate) fn read(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &crate::layout::Geometry, outline: &[PdfOutlineEntry], table: &LineTable, measures: &Measures) -> Self {
         let template = template_ids(table, measures);
         let n = table.readings.len();
         let (size, bold, upper, edge, beside) = (feature("size"), feature("bold"), feature("upper"), feature("edge_repeated"), feature("beside"));
@@ -128,7 +128,7 @@ impl Stylesheet {
     /// share of them opening on a marker, and where in the document it first stands. Three cells hold what the export
     /// was fitted on and no reader now gives: the share of its lines the walker's local scores held headings, which
     /// were uniform over the classes (summed as they were), and how the walker's first reading read it, none.
-    pub fn rows(&self, table: &LineTable, measures: &Measures) -> Vec<[f32; ROW]> {
+    pub(crate) fn rows(&self, table: &LineTable, measures: &Measures) -> Vec<[f32; ROW]> {
         let count = self.templates.len();
         let at = ["size", "bold", "upper", "centre", "indent", "length", "width"].map(feature);
         let n = table.readings.len();

@@ -8,81 +8,81 @@
 
 use super::*;
 use crate::machine::lines::LineTable;
+use crate::model::regions::*;
 
-pub use crate::model::regions::*;
 /// Regions whose lines set reference marks notes answer: the body's, and headings' and titles'.
-pub const REFERRING: [u8; 8] = [1, 2, 3, 4, 8, 9, 14, 16];
+pub(crate) const REFERRING: [u8; 8] = [1, 2, 3, 4, 8, 9, 14, 16];
 /// The body regions that take a depth (the tagger's ranked regions, headings aside).
-pub const RANKED_BODY: [u8; 7] = [1, 16, 2, 4, 6, 8, 9];
+pub(crate) const RANKED_BODY: [u8; 7] = [1, 16, 2, 4, 6, 8, 9];
 /// A stack holds at most this many open units; headings run nine levels deep.
 const DEPTH: usize = 8;
 
 /// One line's move: its region, whether it opens a unit, what the unit counts on (one of the line's
 /// grammar readings, `reading`, an index; or a note's number, `note`), and a heading's level.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Move {
-    pub region: u8,
-    pub opens: bool,
-    pub reading: Option<u8>,
-    pub note: Option<u32>,
-    pub level: i8,
+pub(crate) struct Move {
+    pub(crate) region: u8,
+    pub(crate) opens: bool,
+    pub(crate) reading: Option<u8>,
+    pub(crate) note: Option<u32>,
+    pub(crate) level: i8,
     /// A body unit's depth in its document's body (0 for none): the move's own, not its numbering's,
     /// which is evidence for it.
-    pub depth: u8,
+    pub(crate) depth: u8,
     /// Goes on with the unit open in its stream before another region's took the stream (a paragraph
     /// picked up past a block quotation or a page's notes).
-    pub resume: bool,
+    pub(crate) resume: bool,
     /// Goes on with the unit whose first line is this place, whichever unit its stream holds open (two units
     /// read in turn: a form's labels and their values): over `resume`, which goes on with the last unit of its
     /// region in its stream.
-    pub resumes: Option<u32>,
+    pub(crate) resumes: Option<u32>,
     /// The line's place in the reading the parse makes, where it reads the page in another order than the
     /// parser's lines (two columns read one after the other, a form's labels with their values).
-    pub rank: Option<u32>,
+    pub(crate) rank: Option<u32>,
     /// Opens a constituent document of the source (an exhibit, a schedule, a message an email quotes):
     /// its contexts, outline and numbering begin anew.
-    pub starts: bool,
+    pub(crate) starts: bool,
     /// A note's opening: the reference marks it answers, each its line's place and its first and past-last
     /// character, where the reading chose them, wherever they stand (none: the marks of its number the text set
     /// last; a place of `u32::MAX` alone: no mark).
-    pub answers: [Option<(u32, u32, u32)>; 4],
+    pub(crate) answers: [Option<(u32, u32, u32)>; 4],
     /// Tier 0's opening: the run member the unit opens on (a run and its member), and the further markers its line
     /// opens on, each a unit under it ("2(1) The Court has ...": the section and its subsection).
-    pub member: Option<(u32, u32)>,
-    pub within: Vec<(u32, u32)>,
+    pub(crate) member: Option<(u32, u32)>,
+    pub(crate) within: Vec<(u32, u32)>,
 }
 
 impl Move {
     /// A move making nothing but its region and whether it opens.
-    pub fn plain(region: u8, opens: bool) -> Self {
+    pub(crate) fn plain(region: u8, opens: bool) -> Self {
         Self { region, opens, reading: None, note: None, level: 0, depth: 0, resume: false, resumes: None, rank: None, starts: false, answers: [None; 4], member: None, within: Vec::new() }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Frame {
-    pub family: String,
-    pub value: u32,
-    pub region: u8,
+pub(crate) struct Frame {
+    pub(crate) family: String,
+    pub(crate) value: u32,
+    pub(crate) region: u8,
 }
 
 /// What is open in one reading context.
 #[derive(Clone, Debug, Default)]
-pub struct Open {
-    pub stack: Vec<Frame>,
-    pub note: Option<u32>,
+pub(crate) struct Open {
+    pub(crate) stack: Vec<Frame>,
+    pub(crate) note: Option<u32>,
     /// The reference marks the body set that no note has answered: each one's value, the line that set
     /// it, and where it stands in that line (first and past-last character).
-    pub unanswered: Vec<(u32, u32, u32, u32)>,
+    pub(crate) unanswered: Vec<(u32, u32, u32, u32)>,
     /// Whether the context reads a quotation (a quote opened and no paragraph of its own text since),
     /// and the quoted text's own numbering, which the quotation counts on apart from the text's.
-    pub quoting: bool,
-    pub quoted: Vec<Frame>,
+    pub(crate) quoting: bool,
+    pub(crate) quoted: Vec<Frame>,
 }
 
 impl Open {
     /// The numbering the context counts on: a quotation's own while it reads one.
-    pub fn frames(&self) -> &Vec<Frame> {
+    pub(crate) fn frames(&self) -> &Vec<Frame> {
         if self.quoting { &self.quoted } else { &self.stack }
     }
 
@@ -91,7 +91,7 @@ impl Open {
     }
 
     /// A unit opening in `region`: a quote opens a quotation the context reads until a paragraph of the text's own opens.
-    pub fn opens(&mut self, region: u8) {
+    pub(crate) fn opens(&mut self, region: u8) {
         if region == QUOTE {
             if !self.quoting {
                 self.quoted.clear();
@@ -103,7 +103,7 @@ impl Open {
     }
 
     /// The numbering the context counts on, after `reading` counts in `region` (`counted`).
-    pub fn count(&mut self, reading: &MarkerReading, region: u8) {
+    pub(crate) fn count(&mut self, reading: &MarkerReading, region: u8) {
         let frames = counted(self.frames(), reading, region);
         *self.frames_mut() = frames;
     }
@@ -111,24 +111,24 @@ impl Open {
 
 /// The parse so far: the constituent document read and what is open in each of its contexts.
 #[derive(Clone, Debug, Default)]
-pub struct State {
-    pub document: u16,
-    pub streams: HashMap<u16, Open>,
+pub(crate) struct State {
+    pub(crate) document: u16,
+    pub(crate) streams: HashMap<u16, Open>,
 }
 
 /// A line as the state reads it: its place in reading order, and what holds what is read of it, borrowed: the
 /// evidence, the fences and the line table (`LineTable`).
 #[derive(Clone, Copy)]
-pub struct LineView<'a> {
-    pub place: u32,
-    pub evidence: &'a Evidence,
-    pub fences: &'a Fences,
-    pub table: &'a LineTable,
+pub(crate) struct LineView<'a> {
+    pub(crate) place: u32,
+    pub(crate) evidence: &'a Evidence,
+    pub(crate) fences: &'a Fences,
+    pub(crate) table: &'a LineTable,
 }
 
 /// How a move stands to the units of its stream.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Stands {
+pub(crate) enum Stands {
     /// Opens a unit at its line.
     Opens,
     /// Goes on with the unit open in its stream, whose first line this is.
@@ -140,7 +140,7 @@ pub enum Stands {
 /// A document's units as the moves make them, each by its first line: the one open in each context's stream, the last
 /// of each region in each stream, which a line may resume, and each one's region.
 #[derive(Default)]
-pub struct Streams {
+pub(crate) struct Streams {
     open: HashMap<(u16, usize), usize>,
     last_of_region: HashMap<(u16, usize, u8), usize>,
     regions: HashMap<usize, u8>,
@@ -148,7 +148,7 @@ pub struct Streams {
 
 impl Streams {
     /// How `chosen` stands in the stream `key`. A transcript's line number and a page's label are a line each.
-    pub fn stands(&self, key: (u16, usize), chosen: &Move) -> Stands {
+    pub(crate) fn stands(&self, key: (u16, usize), chosen: &Move) -> Stands {
         let single = matches!(chosen.region, LINE_LABEL | PAGE_LABEL);
         match (chosen.resumes, self.open.get(&key)) {
             (Some(first), _) => Stands::Resumes(first as usize),
@@ -159,7 +159,7 @@ impl Streams {
     }
 
     /// The stream after the move at `line`.
-    pub fn step(&mut self, key: (u16, usize), region: u8, stands: Stands, line: usize) {
+    pub(crate) fn step(&mut self, key: (u16, usize), region: u8, stands: Stands, line: usize) {
         match stands {
             Stands::Opens => {
                 self.open.insert(key, line);
@@ -176,14 +176,14 @@ impl Streams {
 
 /// A move's `reading` that counts on the number the margin prints beside the line's row (`LineView::margin`),
 /// not on one of the line's own.
-pub const MARGIN: u8 = u8::MAX;
+pub(crate) const MARGIN: u8 = u8::MAX;
 /// A move's `reading` that opens on the line's marker where no reading makes it out: its opening token, counting on
 /// nothing.
-pub const OPENING: u8 = u8::MAX - 1;
+pub(crate) const OPENING: u8 = u8::MAX - 1;
 
 impl<'a> LineView<'a> {
     /// Every line of the document, in reading order.
-    pub fn all(evidence: &'a Evidence, fences: &'a Fences, table: &'a LineTable) -> Vec<Self> {
+    pub(crate) fn all(evidence: &'a Evidence, fences: &'a Fences, table: &'a LineTable) -> Vec<Self> {
         (0..fences.order.len()).map(|k| Self { place: k as u32, evidence, fences, table }).collect()
     }
 
@@ -192,27 +192,27 @@ impl<'a> LineView<'a> {
     }
 
     /// The line's slot.
-    pub fn slot(&self) -> Slot {
+    pub(crate) fn slot(&self) -> Slot {
         self.fences.order[self.k()]
     }
 
     /// Whether the line reads in a parallel translation's column.
-    pub fn translation(&self) -> bool {
+    pub(crate) fn translation(&self) -> bool {
         self.fences.at(self.slot().index()).translation
     }
 
     /// The line's marker's readings (`LineTable::readings`).
-    pub fn readings(&self) -> &'a [MarkerReading] {
+    pub(crate) fn readings(&self) -> &'a [MarkerReading] {
         &self.table.readings[self.k()]
     }
 
     /// The value of the note label the line opens with.
-    pub fn label(&self) -> Option<u32> {
+    pub(crate) fn label(&self) -> Option<u32> {
         self.evidence.label[self.slot().index()].map(|label| label.value)
     }
 
     /// The reference marks the line sets (`LineTable::references`).
-    pub fn references(&self) -> &'a [(u32, u32, u32)] {
+    pub(crate) fn references(&self) -> &'a [(u32, u32, u32)] {
         &self.table.references[self.k()]
     }
 
@@ -220,19 +220,19 @@ impl<'a> LineView<'a> {
     /// The paragraph number the margin prints beside the line's row, numbering the paragraph the line opens in its
     /// column (`Fences::read_margin_numbers`: in both columns of a parallel report): the margin line's place and its
     /// number's reading. A move counts on it as `MARGIN`.
-    pub fn margin(&self) -> Option<(u32, &'a MarkerReading)> {
+    pub(crate) fn margin(&self) -> Option<(u32, &'a MarkerReading)> {
         let margin = *self.table.margins.get(&self.k())?;
         Some((margin as u32, self.table.readings[margin].first()?))
     }
 
     /// The paragraph number the decide stage's judgment reader reads the line opening (`Fences::paragraphs`): t0's
     /// reading of the document's numbered paragraphs, which DOC's decoding works from.
-    pub fn count(&self) -> Option<u32> {
+    pub(crate) fn count(&self) -> Option<u32> {
         self.fences.paragraphs.count[self.slot().index()]
     }
 
     /// The reading a move's `reading` names: one of the line's own, the margin's number (`MARGIN`), or none (`OPENING`).
-    pub fn reading(&self, reading: Option<u8>) -> Option<&'a MarkerReading> {
+    pub(crate) fn reading(&self, reading: Option<u8>) -> Option<&'a MarkerReading> {
         match reading? {
             OPENING => None,
             MARGIN => self.margin().map(|(_, reading)| reading),
@@ -244,7 +244,7 @@ impl<'a> LineView<'a> {
     /// either column; else the number t0 counts it opening on; else `next`, the reader's own pick among the readings (the
     /// run member's for tier 0, the open stack's next number for DOC); else the line's first; a marker no reading makes
     /// out (a recognizer's "(2]") its opening token.
-    pub fn opening(&self, next: impl FnOnce() -> Option<usize>) -> u8 {
+    pub(crate) fn opening(&self, next: impl FnOnce() -> Option<usize>) -> u8 {
         let readings = self.readings();
         let counted = self.count().and_then(|count| readings.iter().position(|reading| reading.value == count));
         match (self.margin(), counted.or_else(next), readings.is_empty()) {
@@ -258,10 +258,10 @@ impl<'a> LineView<'a> {
 
 /// What a move made of its line: the earlier line whose reference mark its note answered.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Made {
-    pub paired: Option<(u32, u32, u32)>,
+pub(crate) struct Made {
+    pub(crate) paired: Option<(u32, u32, u32)>,
     /// The other marks of the note's number it answered too (a note several places in the text cite).
-    pub also: [Option<(u32, u32, u32)>; 3],
+    pub(crate) also: [Option<(u32, u32, u32)>; 3],
 }
 
 /// The stack after a reading counts: popped to the open frame of its family and replaced, else pushed.
@@ -286,18 +286,18 @@ fn counted(stack: &[Frame], reading: &MarkerReading, region: u8) -> Vec<Frame> {
 impl State {
     /// The context a line reads in: its document and whether it is a translation's (a quotation in it is
     /// read as the parser reads it, not as the fences part it); after `starts`, the next document's.
-    pub fn ctx(&self, line: &LineView, starts: bool) -> u16 {
+    pub(crate) fn ctx(&self, line: &LineView, starts: bool) -> u16 {
         (self.document + u16::from(starts)).saturating_mul(2) + u16::from(line.translation())
     }
 
     /// What is open in the context `line` reads in (after `starts`, the next document's), where anything is.
-    pub fn open(&self, line: &LineView, starts: bool) -> Option<&Open> {
+    pub(crate) fn open(&self, line: &LineView, starts: bool) -> Option<&Open> {
         self.streams.get(&self.ctx(line, starts))
     }
 
     /// The depth a body opening's numbering puts it at: the body units open on its context's stack once
     /// its reading counts (the stack as it stands for an unnumbered one), one at least.
-    pub fn stack_depth(&self, line: &LineView, candidate: &Move) -> usize {
+    pub(crate) fn stack_depth(&self, line: &LineView, candidate: &Move) -> usize {
         let empty = Open::default();
         let stream = self.open(line, candidate.starts).unwrap_or(&empty);
         let body = |frames: &[Frame]| frames.iter().filter(|f| RANKED_BODY.contains(&f.region)).count();
@@ -309,7 +309,7 @@ impl State {
     }
 
     /// The state after `line` makes `chosen`, and what the move made of the line.
-    pub fn apply(&mut self, line: &LineView, chosen: &Move) -> Made {
+    pub(crate) fn apply(&mut self, line: &LineView, chosen: &Move) -> Made {
         let mut made = Made::default();
         if chosen.starts {
             self.document += 1;

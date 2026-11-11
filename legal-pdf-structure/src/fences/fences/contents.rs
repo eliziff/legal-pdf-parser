@@ -8,7 +8,7 @@ impl Fences {
     /// more than half of whose lines they hold is that list). `page_labels`: the labels the PDF
     /// declares, by page index.
     #[allow(clippy::too_many_arguments)]
-    pub fn read_contents(
+    pub(crate) fn read_contents(
         &mut self,
         pages: &[Page],
         slots: &Slots,

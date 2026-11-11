@@ -13,9 +13,9 @@ use crate::headings::bookmarks::{
 
 /// The lines the document's outline names (`OutlineAnchor`), and where each frame entry of it opens,
 /// as (document, parallel translation, place in the reading order).
-pub struct Anchoring {
-    pub anchors: Vec<OutlineAnchor>,
-    pub opened: Vec<(u16, bool, u32)>,
+pub(crate) struct Anchoring {
+    pub(crate) anchors: Vec<OutlineAnchor>,
+    pub(crate) opened: Vec<(u16, bool, u32)>,
 }
 
 /// The document's bookmarks `outline` (where they outline its divisions) and its contents lists'
@@ -30,7 +30,7 @@ pub struct Anchoring {
 /// under the other with no blank of most of a line between them (`apart`). Each found entry's level
 /// is its depth in its document's frame (every bookmark of a full set, a skeleton's chapters), else
 /// one under its nearest levelled ancestor.
-pub fn anchors(
+pub(crate) fn anchors(
     pages: &[Page],
     slots: &Slots,
     evidence: &Evidence,
@@ -81,7 +81,7 @@ pub fn anchors(
     let eligible = |slot: Slot| {
         matches!(role[slot.index()], Role::Open | Role::Heading)
             && fences.at(slot.index()).quotation == 0
-            && !has_dot_leader(&slots.line(pages, slot).text)
+            && !has_dot_leaders(&slots.line(pages, slot).text)
     };
     let heading = |slot: Slot| {
         role[slot.index()] == Role::Heading
@@ -302,7 +302,7 @@ pub fn anchors(
 /// show (the levels the document's own outline gave them, by the offset most of them agree on), or
 /// else under the unnumbered heading that opens the run ("I. Introduction" under "Reasons for
 /// Judgment"). An unnumbered heading takes its reading's step from the heading before it.
-pub fn heading_levels(
+pub(crate) fn heading_levels(
     pages: &[Page],
     slots: &Slots,
     evidence: &Evidence,

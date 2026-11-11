@@ -6,10 +6,10 @@
 
 use super::*;
 use legal_pdf_core::{flag_share, text_shape, BOLD, ITALIC, MONOSPACED, SUPERSCRIPT};
-use crate::decide::Geometry;
+use crate::layout::Geometry;
 
 /// The names of a line's own features, in order.
-pub const LINE_FEATURES: &[&str] = &[
+pub(crate) const LINE_FEATURES: &[&str] = &[
     "x0", "y0", "x1", "y1", "height", "gap_above", "gap_below", "indent", "right_gap", "width", "centre",
     "size", "bold", "italic", "superscript", "monospace", "size_change", "font_change", "underlined",
     "length", "upper", "digits", "punctuation", "spaces", "starts_digit", "starts_upper", "starts_lower",
@@ -26,9 +26,9 @@ pub const LINE_FEATURES: &[&str] = &[
     "wrap_()", "wrap_[]", "wrap_)", "wrap_.", "wrap_",
 ];
 /// The lexicon's word bits (`WORD_*`) and the look's (`LOOK_*`) follow the named features.
-pub const WORD_BITS: usize = 32;
-pub const LOOK_BITS: usize = 4;
-pub const WIDTH: usize = LINE_FEATURES.len() + WORD_BITS + LOOK_BITS;
+pub(crate) const WORD_BITS: usize = 32;
+pub(crate) const LOOK_BITS: usize = 4;
+pub(crate) const WIDTH: usize = LINE_FEATURES.len() + WORD_BITS + LOOK_BITS;
 /// The features read again off the lines around a line (two before, two after): its place and type
 /// (the first twenty) and its marker's.
 const AROUND: std::ops::Range<usize> = 0..20;
@@ -36,11 +36,11 @@ const MARKER: std::ops::Range<usize> = 72..92;
 /// Every feature a line has: its own, those of the two lines before and after it in reading order
 /// (`AROUND` and `MARKER` of each), whether the next and previous are on its page, and the document's
 /// shape.
-pub const ALL: usize = WIDTH + 4 * (20 + 20) + 2 + 4;
+pub(crate) const ALL: usize = WIDTH + 4 * (20 + 20) + 2 + 4;
 /// The roles `Role` names (`docparse.T0`).
 const ROLES: usize = 14;
 /// What t0 decided of a line: its role, one of `ROLES`, twelve flags and its heading's level (`docparse.T0`).
-pub const T0: usize = ROLES + 13;
+pub(crate) const T0: usize = ROLES + 13;
 
 /// How common each look is across the document: a heading's look is rare and set apart, the body's
 /// the commonest. A look is a style (face and half-point size) and its bold, italic and capitals.
@@ -198,37 +198,37 @@ fn marker_variants(text: &str) -> Vec<String> {
 
 /// Each line's readings and features, in reading order (`fences.order`): `WIDTH` own features per
 /// line, then `ALL` with the lines around it and the document's shape.
-pub struct LineTable {
-    pub readings: Vec<Vec<MarkerReading>>,
+pub(crate) struct LineTable {
+    pub(crate) readings: Vec<Vec<MarkerReading>>,
     /// Each line's reference marks: value, first and past-last UTF-16 code unit (`reference_spans`).
-    pub references: Vec<Vec<(u32, u32, u32)>>,
+    pub(crate) references: Vec<Vec<(u32, u32, u32)>>,
     /// Each line's look: its face, half-point size, bold, italic and capitals, as one number.
-    pub looks: Vec<u32>,
+    pub(crate) looks: Vec<u32>,
     /// Each paragraph number the margin prints (`Fences::read_margin_numbers`), by its line's place: the place of
     /// the row's line it numbers, and of its twin's in the other language's column, where it has one.
-    pub margin_rows: HashMap<usize, (usize, Option<usize>)>,
+    pub(crate) margin_rows: HashMap<usize, (usize, Option<usize>)>,
     /// Each line a margin number numbers (a row's or a twin's), and each margin number's own line, by its place: the
     /// margin line's place.
-    pub margins: HashMap<usize, usize>,
+    pub(crate) margins: HashMap<usize, usize>,
 }
 
 /// What the walk measures over the line table, in reading order: each line's features (`ALL` a line) and what t0
 /// decided of it (`T0` a line), the DOC reader's input.
-pub struct Measures {
-    pub features: Vec<f32>,
-    pub t0: Vec<u8>,
+pub(crate) struct Measures {
+    pub(crate) features: Vec<f32>,
+    pub(crate) t0: Vec<u8>,
 }
 
 impl Measures {
     /// The line's features.
-    pub fn row(&self, k: usize) -> &[f32] {
+    pub(crate) fn row(&self, k: usize) -> &[f32] {
         &self.features[k * ALL..(k + 1) * ALL]
     }
 }
 
 impl LineTable {
     /// Each line's features and t0 row, measured over the table both tiers read (`plain`), for the DOC reader.
-    pub fn measure(&self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &Geometry, notes: &Notes, decision: &Decision) -> Measures {
+    pub(crate) fn measure(&self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &Geometry, notes: &Notes, decision: &Decision) -> Measures {
         let (order, readings, margin_rows, margins) = (&fences.order, &self.readings, &self.margin_rows, &self.margins);
         let n = order.len();
         let measures: Vec<(&legal_pdf_core::PageMeasure, &legal_pdf_core::Columns, HashMap<usize, usize>, f64, f64)> = pages.iter().enumerate().map(|(p, page)| {
@@ -400,7 +400,7 @@ impl LineTable {
     /// `confusions`), its reference marks (with the note marks recognition misread, `unmarked_notes`), its look and its
     /// margin number. `before`: the text of each line whose marker the recognition repair rewrote, as recognized; its
     /// markers' readings stand beside the repaired text's, the parser's to choose between.
-    pub fn plain(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, before: &[(Slot, String)], confusions: &HashMap<char, Vec<(char, f32)>>) -> Self {
+    pub(crate) fn plain(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, before: &[(Slot, String)], confusions: &HashMap<char, Vec<(char, f32)>>) -> Self {
         let order = &fences.order;
         let recognized: HashMap<Slot, &str> = before.iter().map(|(slot, text)| (*slot, text.as_str())).collect();
         let readings: Vec<Vec<MarkerReading>> = order.iter().map(|&slot| {

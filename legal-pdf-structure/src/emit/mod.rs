@@ -10,14 +10,17 @@
 //! with their rows and cells. Each page carries its printed label as its alias. Parents are the
 //! outline's (`assemble_outline`), and a provision's path alias follows them.
 
-use crate::constituents as constituents;
+use crate::constituents;
 use legal_pdf_core::model::Page;
 use legal_pdf_core::{Error, Result};
 use crate::fences::Fences;
-use crate::machine::machine::{stream_of, LineView, Move, Stands, State, Streams, MARGIN, OPENING, RANKED_BODY};
-use crate::text::joining::{seam, split_words, Join};
+use crate::machine::machine::{LineView, Move, Stands, State, Streams, MARGIN, OPENING, RANKED_BODY};
+use crate::model::regions::stream_of;
+use crate::text::joining::{seam, split_words};
+use pdf_inspector::markdown::Join;
 use crate::model::regions::{HEADING, LINE_LABEL, NOTE, NOTE_QUOTE, PAGE_LABEL, REGIONS, TABLE};
-use crate::model::{Decided, Evidence, Place, Runs, Slots, StructureIdentity, TRANSITION_ORIGIN as ORIGIN};
+use crate::model::{Decided, Evidence, Place, Runs, Slots, TRANSITION_ORIGIN};
+use crate::StructureIdentity;
 use crate::text::text_index::PdfTextIndex;
 use legal_structure_model::{utf16_len, ContinuationKind, NodeKind, ScalarRange, ScalarText, SourceContinuation, SourceJoin};
 use std::collections::{HashMap, HashSet};
@@ -28,10 +31,10 @@ use legal_structure_model::{Derivation, DocumentStructure, Origin, PrimaryRole, 
 
 /// What tier 0 settled before its moves (`tier0`): its lines are written and their regions built, the text indexed, and
 /// its notes the pairer's: their nodes, the projection's notes, the claims left aside; and the runs its moves open on.
-pub struct Settled<'a> {
-    pub index: &'a PdfTextIndex,
-    pub notes: Vec<StructureNode>,
-    pub runs: &'a Runs,
+pub(crate) struct Settled<'a> {
+    pub(crate) index: &'a PdfTextIndex,
+    pub(crate) notes: Vec<StructureNode>,
+    pub(crate) runs: &'a Runs,
 }
 
 struct Unit {
@@ -65,7 +68,7 @@ fn opening(text: &str, word: bool) -> Option<(usize, usize)> {
 }
 
 /// The figures a line's text opens on: what they read, and their first and past-last UTF-16 code unit.
-pub fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
+pub(crate) fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
     let start = text.find(|c: char| !c.is_whitespace())?;
     let length = text[start..].bytes().take_while(u8::is_ascii_digit).count();
     let at = utf16_len(&text[..start]);
@@ -78,7 +81,7 @@ pub fn leading_figures(text: &str) -> Option<(u32, (usize, usize))> {
 /// line before it (`joining::seam`): a dropped hyphen a manuscript edit, a join with no space a join, a page crossed a
 /// continuation; and each hyphen inside a line that splits a word (`joining::split_words`) an edit. What tier 0 wrote and
 /// paired before its moves (`settled`) stands. With the authority units read off the rendered text, and the notes.
-pub fn structure_graph(pages: &[Page],
+pub(crate) fn structure_graph(pages: &[Page],
     slots: &Slots,
     evidence: &Evidence,
     fences: &Fences,
@@ -234,7 +237,7 @@ pub fn structure_graph(pages: &[Page],
     for page in pages.iter() {
         let range = index.page_range(page.index).unwrap_or(ScalarRange { start: page_end, end: page_end });
         page_end = range.end;
-        let mut node = StructureNode::new(page.id.clone(), NodeKind::Page, range, ORIGIN, Derivation::Native, None);
+        let mut node = StructureNode::new(page.id.clone(), NodeKind::Page, range, TRANSITION_ORIGIN, Derivation::Native, None);
         node.label = Some(page.number.to_string());
         node.aliases = page.printed_label.clone().map(|label| vec![label]);
         node.anchor.clone_from(&page.printed_label_line_id);
@@ -274,7 +277,7 @@ pub fn structure_graph(pages: &[Page],
         };
         // A unit is the document's own, as tier 0's are; a heading is read from its look.
         let derivation = if kind != NodeKind::Heading { Derivation::Native } else { Derivation::Heuristic };
-        let mut node = StructureNode::new(node_id(u), kind, range, ORIGIN, derivation, None);
+        let mut node = StructureNode::new(node_id(u), kind, range, TRANSITION_ORIGIN, derivation, None);
         node.role = role;
         node.ranges = ranges.clone();
         node.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
@@ -348,7 +351,7 @@ pub fn structure_graph(pages: &[Page],
             above.range.end = start;
             above.ranges = above.ranges.iter().filter(|part| part.start < start).map(|part| ScalarRange { start: part.start, end: part.end.min(start) }).collect();
             above.line_ids.truncate(1);
-            let mut own = StructureNode::new(format!("{}-{start}", node_id(u)), kind, ScalarRange { start, end: range.end }, ORIGIN, Derivation::Native, Some(above.id.clone()));
+            let mut own = StructureNode::new(format!("{}-{start}", node_id(u)), kind, ScalarRange { start, end: range.end }, TRANSITION_ORIGIN, Derivation::Native, Some(above.id.clone()));
             own.role = Some(PrimaryRole::Text);
             own.ranges = ranges.iter().filter(|part| part.end > start).map(|part| ScalarRange { start: part.start.max(start), end: part.end }).collect();
             own.line_ids = unit.lines.iter().map(|&k| id_of(k)).collect();
@@ -389,15 +392,15 @@ pub fn structure_graph(pages: &[Page],
         }
     }
     nodes.append(&mut settled.notes);
-    nodes.extend(crate::graph::table_nodes(index, fences.tables.iter().enumerate(), ORIGIN)?);
-    nodes.extend(crate::graph::quotation_nodes(index, decided, ORIGIN)?);
+    nodes.extend(crate::graph::table_nodes(index, fences.tables.iter().enumerate(), TRANSITION_ORIGIN)?);
+    nodes.extend(crate::graph::quotation_nodes(index, decided, TRANSITION_ORIGIN)?);
     // Text the parser read as no region's lies outside the body, as the gold leaves it: furniture.
     for (k, chosen) in moves.iter().enumerate() {
         if chosen.region != 0 || texts[k].trim().is_empty() {
             continue;
         }
         let Some(range) = line_range(k) else { continue };
-        let mut node = StructureNode::new(format!("transition-none-{:06}", k + 1), NodeKind::Prose, range, ORIGIN, Derivation::Heuristic, None);
+        let mut node = StructureNode::new(format!("transition-none-{:06}", k + 1), NodeKind::Prose, range, TRANSITION_ORIGIN, Derivation::Heuristic, None);
         node.role = Some(PrimaryRole::Furniture);
         node.ranges = vec![range];
         node.line_ids = vec![id_of(k)];
@@ -411,7 +414,7 @@ pub fn structure_graph(pages: &[Page],
         constituents::Start::new(id, &kind)
     }).collect();
     nodes.extend(constituents::constituents(index, pages, &starts));
-    let mut structure = DocumentStructure::new(identity.document_id(), "local-pdf", index.text().to_owned(), ORIGIN);
+    let mut structure = DocumentStructure::new(identity.document_id(), "local-pdf", index.text().to_owned(), TRANSITION_ORIGIN);
     structure.origins.push(Origin { id: legal_structure_model::NOTE_PAIRING_ORIGIN.to_owned() });
     structure.source_sha256 = Some(identity.source_sha256.clone());
     structure.nodes = nodes;

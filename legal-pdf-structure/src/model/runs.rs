@@ -5,9 +5,9 @@ use legal_structure_model::{CandidateGrammar, CandidateObservationV2, Resolution
 
 /// A place in a line's text: the line's slot and the UTF-16 code units before the place.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-pub struct Place {
-    pub slot: Slot,
-    pub offset: u32,
+pub(crate) struct Place {
+    pub(crate) slot: Slot,
+    pub(crate) offset: u32,
 }
 
 /// A run of markers one grammar reads in a reading context (`ctx`, an index into the fences'
@@ -15,14 +15,14 @@ pub struct Place {
 /// family its first marker counts in (`numbering_marker`; empty where that reads none), and its
 /// members in text order.
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct Run {
-    pub ctx: u16,
-    pub id: String,
-    pub grammar: CandidateGrammar,
-    pub rooted: bool,
-    pub consecutive: bool,
-    pub family: String,
-    pub members: Vec<Member>,
+pub(crate) struct Run {
+    pub(crate) ctx: u16,
+    pub(crate) id: String,
+    pub(crate) grammar: CandidateGrammar,
+    pub(crate) rooted: bool,
+    pub(crate) consecutive: bool,
+    pub(crate) family: String,
+    pub(crate) members: Vec<Member>,
 }
 
 /// A marker of a run: its candidate's id, label and the grammar's reading of it; the line it opens,
@@ -34,42 +34,42 @@ pub struct Run {
 /// opens and the rule that says so; what its lines show; whether its text is prose, whether that
 /// text is shaped as a title, and whether it has three words or more (eight letters or more).
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct Member {
-    pub id: String,
-    pub label: String,
-    pub grammar_value: String,
+pub(crate) struct Member {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) grammar_value: String,
     /// A provision's kind as the grammar read its marker ("section", "part", ...); none for a clause read by its
     /// number alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub locator_kind: Option<String>,
-    pub slot: Slot,
-    pub beside: Option<Slot>,
-    pub text: Option<Slot>,
-    pub parent: Option<u32>,
-    pub level: u16,
-    pub value: u32,
-    pub marker: [Place; 2],
-    pub content: Place,
-    pub end: Place,
-    pub counted: bool,
-    pub kind: Option<UnitRole>,
-    pub rule: ResolutionRuleV2,
-    pub observations: Vec<CandidateObservationV2>,
-    pub carries_prose: bool,
-    pub title_shaped: bool,
-    pub worded: bool,
+    pub(crate) locator_kind: Option<String>,
+    pub(crate) slot: Slot,
+    pub(crate) beside: Option<Slot>,
+    pub(crate) text: Option<Slot>,
+    pub(crate) parent: Option<u32>,
+    pub(crate) level: u16,
+    pub(crate) value: u32,
+    pub(crate) marker: [Place; 2],
+    pub(crate) content: Place,
+    pub(crate) end: Place,
+    pub(crate) counted: bool,
+    pub(crate) kind: Option<UnitRole>,
+    pub(crate) rule: ResolutionRuleV2,
+    pub(crate) observations: Vec<CandidateObservationV2>,
+    pub(crate) carries_prose: bool,
+    pub(crate) title_shaped: bool,
+    pub(crate) worded: bool,
 }
 
 /// The document's numbering runs, and the lines whose markers the repair rewrote, with their text before.
 #[derive(Debug, Default, serde::Serialize)]
-pub struct Runs {
-    pub runs: Vec<Run>,
-    pub before: Vec<(Slot, String)>,
+pub(crate) struct Runs {
+    pub(crate) runs: Vec<Run>,
+    pub(crate) before: Vec<(Slot, String)>,
 }
 
 impl Runs {
     /// Every member of every run.
-    pub fn members(&self) -> impl Iterator<Item = &Member> {
+    pub(crate) fn members(&self) -> impl Iterator<Item = &Member> {
         self.runs.iter().flat_map(|run| &run.members)
     }
 }

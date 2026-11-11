@@ -5,6 +5,7 @@
 //! (`contexts`), and the outline its units hang in (`outline`).
 
 use crate::model::{Decided, Evidence, Role, Rule, Run, Slots};
+use crate::text::text_index::{source_membership, PdfTextIndex};
 use legal_pdf_core::model::Page;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::{
@@ -14,15 +15,14 @@ use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
-pub use crate::text::text_index::*;
-pub mod nodes;
-pub use nodes::*;
-pub mod contexts;
-pub use contexts::*;
-pub mod judgment;
-pub use judgment::*;
-pub mod outline;
-pub use outline::*;
+pub(crate) mod nodes;
+pub(crate) use nodes::*;
+pub(crate) mod contexts;
+pub(crate) use contexts::*;
+pub(crate) mod judgment;
+pub(crate) use judgment::*;
+pub(crate) mod outline;
+pub(crate) use outline::*;
 
 /// A heading's printed number: "1.", "1.1", "I.", "(a)", "ii.", a bare "1", or a numbered word
 /// ("PART 1", "Section 1.01").
@@ -45,7 +45,7 @@ fn heading_marker_alone_re() -> &'static Regex {
 /// a line the document's outline names, a heading of a rooted, consecutive count of provisions),
 /// never as a ladder's rung, an enactment's history or a transcript's part; a contents line, a
 /// quotation, a note, a table's cell and the page's edge never do.
-pub fn opens_units(role: Role, rule: Rule, run: &Run) -> bool {
+pub(crate) fn opens_units(role: Role, rule: Rule, run: &Run) -> bool {
     match role {
         Role::Open | Role::Body | Role::ListItem => true,
         Role::Heading | Role::Title | Role::MarginalNote => match rule {
@@ -58,7 +58,7 @@ pub fn opens_units(role: Role, rule: Rule, run: &Run) -> bool {
 }
 
 /// Each line's citations, as spans of its text in UTF-16 code units, by line id.
-pub fn citation_spans(pages: &[Page], slots: &Slots, evidence: &Evidence) -> BTreeMap<String, Vec<ScalarRange>> {
+pub(crate) fn citation_spans(pages: &[Page], slots: &Slots, evidence: &Evidence) -> BTreeMap<String, Vec<ScalarRange>> {
     pages
         .iter()
         .flat_map(|page| &page.lines)

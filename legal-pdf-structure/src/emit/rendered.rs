@@ -10,7 +10,7 @@ use legal_structure_model::{utf16_len, DocumentStructure, NodeKind, PrimaryRole,
 use std::collections::{HashMap, HashSet};
 
 /// A stretch of the rendered text that is a source line's text unchanged: where it stands in each (UTF-16), and the line.
-pub struct Run {
+pub(crate) struct Run {
     target: ScalarRange,
     source: ScalarRange,
     fragment: usize,
@@ -61,7 +61,7 @@ fn edited(text: &str, edits: &[(usize, usize, String)]) -> Result<(String, Vec<(
 }
 
 /// Writes the structure's rendered text and each node's rendered membership, ranges and range; the runs it is made of.
-pub fn render(pages: &[Page], structure: &mut DocumentStructure) -> Result<Vec<Run>> {
+pub(crate) fn render(pages: &[Page], structure: &mut DocumentStructure) -> Result<Vec<Run>> {
     let mut text = String::with_capacity(structure.text.len());
     let mut runs = Vec::new();
     {
@@ -234,7 +234,7 @@ fn source_of(structure: &DocumentStructure, node: &StructureNode, mappings: Vec<
 
 /// The authority units: each body unit's text, its notes' marks left out and where each stood; then each note's body, a
 /// note with its own mark (an author's "*") keeping the mark as the document prints it.
-pub fn authority_units(structure: &DocumentStructure, runs: &[Run]) -> Vec<AuthorityTextUnit> {
+pub(crate) fn authority_units(structure: &DocumentStructure, runs: &[Run]) -> Vec<AuthorityTextUnit> {
     let rendered = ScalarText::new(structure.rendered_text.as_deref().unwrap_or(&structure.text));
     let by_source = by_source(runs);
     let notes: Vec<&StructureNode> = structure.nodes.iter().filter(|node| note(node)).collect();

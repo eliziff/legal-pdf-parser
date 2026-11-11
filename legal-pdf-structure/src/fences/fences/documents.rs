@@ -4,7 +4,7 @@ use super::*;
 impl Fences {
     /// Each line's constituent document: the openings the document's bookmarks name, and those its
     /// own lines show, read on the lines no fence took and the note band left.
-    pub fn read_documents(&mut self, views: &[PageView], outline: &[PdfOutlineEntry]) {
+    pub(crate) fn read_documents(&mut self, views: &[PageView], outline: &[PdfOutlineEntry]) {
         let (role, band) = (&self.role, &self.band);
         let set_aside = |slot: Slot| role[slot.index()] != Role::Open || band[slot.index()];
         let mut starts = constituents::bookmarked_starts(views, outline, set_aside);
@@ -21,7 +21,7 @@ impl Fences {
     /// Which constituent documents are transcripts (`transcripts`) and which of them are testimony
     /// throughout (`testimony`), and each transcript's lines beside its number column
     /// (`numbered_row`).
-    pub fn read_transcripts(&mut self, slots: &Slots, evidence: &Evidence) {
+    pub(crate) fn read_transcripts(&mut self, slots: &Slots, evidence: &Evidence) {
         let count = slots.len();
         let documents = self.documents();
         let (mut numbered, mut speakers, mut lines) = (vec![0usize; documents], vec![0usize; documents], vec![0usize; documents]);

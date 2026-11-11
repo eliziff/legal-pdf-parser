@@ -3,7 +3,7 @@
 use super::*;
 
 /// English and French function words counted in some lines: (english, french).
-pub fn language_votes<'a>(lines: impl Iterator<Item = &'a Line>) -> (usize, usize) {
+pub(crate) fn language_votes<'a>(lines: impl Iterator<Item = &'a Line>) -> (usize, usize) {
     const ENGLISH: [&str; 24] = [
         "the", "of", "and", "to", "in", "that", "is", "be", "for", "by", "with", "or", "any",
         "which", "shall", "not", "was", "this", "as", "it", "are", "from", "under", "were",
@@ -23,7 +23,7 @@ pub fn language_votes<'a>(lines: impl Iterator<Item = &'a Line>) -> (usize, usiz
 }
 
 /// A column's language from its votes: Some(true) for French, Some(false) for English.
-pub fn column_language((english, french): (usize, usize), minimum: usize) -> Option<bool> {
+pub(crate) fn column_language((english, french): (usize, usize), minimum: usize) -> Option<bool> {
     if french >= minimum && french >= english * 3 {
         Some(true)
     } else if english >= minimum && english >= french * 3 {
@@ -40,7 +40,7 @@ pub fn column_language((english, french): (usize, usize), minimum: usize) -> Opt
 /// French side of every page is the translation wherever its own words are French.
 /// `models` are the pages' column models, by view; lines `set_aside` holds (a transcript's line
 /// numbers, furniture) are no column's text.
-pub fn translation_lines(views: &[PageView], models: &[ColumnModel], set_aside: impl Fn(Slot) -> bool) -> Vec<Slot> {
+pub(crate) fn translation_lines(views: &[PageView], models: &[ColumnModel], set_aside: impl Fn(Slot) -> bool) -> Vec<Slot> {
     let body = |&(slot, line): &(Slot, &Line)| has_valid_bbox(line) && !set_aside(slot);
     // A page's lines may show its two columns where its model does not (a margin lane read as a third): most of its lines
     // of words stand clear to one side of the body's middle.

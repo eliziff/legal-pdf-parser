@@ -21,7 +21,7 @@ impl TableEvidence {
     }
 }
 
-pub fn has_table_caption<'a>(lines: impl IntoIterator<Item = &'a Line>) -> bool {
+pub(crate) fn has_table_caption<'a>(lines: impl IntoIterator<Item = &'a Line>) -> bool {
     let regex =
         regex!(r"(?i)^(?:table|tableau)\s+(?:\d+|[ivxlcdm]+)\b");
     lines.into_iter().any(|line| regex.is_match(line.text.trim()))

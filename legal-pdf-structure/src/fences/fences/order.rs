@@ -4,7 +4,7 @@ use super::*;
 impl Fences {
     /// Every page's lines in reading order (`page_order`): its running head, its body by its columns
     /// with its note band woven in, its foot; a table's lines in its rows' order.
-    pub fn read_order(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
+    pub(crate) fn read_order(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
         self.order = Vec::with_capacity(slots.len());
         // Each table line's table and its place among the table's lines, row by row, cell by cell.
         let mut in_table: Vec<Option<(u32, u32)>> = vec![None; slots.len()];
@@ -55,7 +55,7 @@ impl Fences {
     /// ("104", "1", "105"). Each is read just before the first line of its row in the main text (a
     /// parallel translation's after), so it opens that line's paragraph; a page's reading order otherwise sets the
     /// margin after both columns, where its numbers would open whatever follows (the next page's running head).
-    pub fn read_margin_numbers(&mut self, pages: &[Page], slots: &Slots) {
+    pub(crate) fn read_margin_numbers(&mut self, pages: &[Page], slots: &Slots) {
         self.margin_number = vec![None; slots.len()];
         self.margin_twin = vec![None; slots.len()];
         let mut found: Vec<(u32, Slot, Slot, Option<Slot>)> = Vec::new();

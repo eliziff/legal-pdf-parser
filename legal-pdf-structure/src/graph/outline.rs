@@ -6,7 +6,7 @@ use super::*;
 use legal_structure_model::{NumberingMarker, PrimaryRole};
 
 /// A unit's document, quotation, and note, table cell or parallel text membership.
-pub type OutlineContext = (String, Option<String>, Option<String>);
+pub(crate) type OutlineContext = (String, Option<String>, Option<String>);
 
 #[derive(Clone, Copy)]
 enum Region {
@@ -59,7 +59,7 @@ struct Outline {
 /// shared numbering grammar, the units read in `text`, each in its context (`contexts`). Constituent
 /// documents and a parallel translation scope the stacks (a column's list or heading never opens under the
 /// other language's paragraph); quotation and object membership stay intact.
-pub fn assemble_outline(nodes: &mut [StructureNode], contexts: &[OutlineContext], text: &str, level: &dyn Fn(&str) -> Option<usize>) {
+pub(crate) fn assemble_outline(nodes: &mut [StructureNode], contexts: &[OutlineContext], text: &str, level: &dyn Fn(&str) -> Option<usize>) {
     let containers = nodes.iter().map(|node| (node.id.as_str(), node.kind)).collect::<HashMap<_, _>>();
     let mut units = nodes
         .iter()

@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 const PACKAGE_UNITS: &[&str] = &["tab", "exhibit", "schedule", "appendix", "annex", "attachment"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tier {
+pub(crate) enum Tier {
     Ignore,
     Skeleton,
     Full,
@@ -35,23 +35,23 @@ pub enum Tier {
 /// Same-page titles at or above this similarity refer to the same section.
 const REPAIR_SIMILARITY: f64 = 0.7;
 /// A title longer than this is a lead, not a heading.
-pub const BACKFILL_MAX_TITLE: usize = 100;
+pub(crate) const BACKFILL_MAX_TITLE: usize = 100;
 /// A bookmark title is found on at most this many consecutive lines.
-pub const MAX_TITLE_LINES: usize = 4;
+pub(crate) const MAX_TITLE_LINES: usize = 4;
 
 const CONTENT_UNITS: &[&str] = &["chapter", "chap", "ch", "part", "pt", "section", "sec", "book", "appendix"];
 const ROMAN_EXCLUDED: &[&str] = &["di", "div", "li", "liv", "mi", "mix", "xi"];
 
 #[derive(Debug, Clone)]
-pub struct Entry {
-    pub title: String,
-    pub level: usize,
+pub(crate) struct Entry {
+    pub(crate) title: String,
+    pub(crate) level: usize,
     /// One-based physical page.
-    pub page: usize,
+    pub(crate) page: usize,
 }
 
 /// A bookmark named for its page alone ("12", "Page 12").
-pub fn generic_title() -> &'static Regex {
+pub(crate) fn generic_title() -> &'static Regex {
     regex!(r"(?i)^(?:page\s*)?\d+$")
 }
 
@@ -69,7 +69,7 @@ fn roman(token: &str) -> Option<u32> {
 }
 
 /// Lowercased, LaTeX dropped, punctuation stripped, roman numerals as digits.
-pub fn normalize_title(title: &str) -> String {
+pub(crate) fn normalize_title(title: &str) -> String {
     tokens(title).into_iter().map(|token| roman(&token).map_or(token, |value| value.to_string())).collect()
 }
 
@@ -110,7 +110,7 @@ fn similarity(a: &str, b: &str) -> f64 {
 }
 
 /// Entries must walk forward through the document; levels are re-stacked over the survivors.
-pub fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
+pub(crate) fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
     let (mut kept, mut last_page) = (Vec::new(), 0);
     for entry in outline {
         let page = entry.page_index + 1;
@@ -124,7 +124,7 @@ pub fn validate(outline: &[PdfOutlineEntry], pages: usize) -> Vec<Entry> {
 }
 
 /// Repeated package labels name attached documents; ordinary chapter bookmarks do not.
-pub fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
+pub(crate) fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize, String)> {
     let entries = validate(outline, pages);
     let authorities = authorities_level(&entries);
     let entries = entries
@@ -154,7 +154,7 @@ pub fn package_targets(outline: &[PdfOutlineEntry], pages: usize) -> Vec<(usize,
         .collect()
 }
 
-pub fn restack(entries: &mut [Entry]) {
+pub(crate) fn restack(entries: &mut [Entry]) {
     let mut stack = Vec::<usize>::new();
     for entry in entries {
         while stack.last().is_some_and(|level| *level >= entry.level) {
@@ -165,7 +165,7 @@ pub fn restack(entries: &mut [Entry]) {
     }
 }
 
-pub fn classify(entries: &[Entry], pages: usize) -> Tier {
+pub(crate) fn classify(entries: &[Entry], pages: usize) -> Tier {
     if entries.len() < 3 {
         return Tier::Ignore;
     }
@@ -200,7 +200,7 @@ pub fn classify(entries: &[Entry], pages: usize) -> Tier {
     if max_level >= 2 && entries.len() >= 6.max(pages / 20) { Tier::Full } else { Tier::Skeleton }
 }
 
-pub fn same_title(found: &str, title: &str, heading: bool) -> bool {
+pub(crate) fn same_title(found: &str, title: &str, heading: bool) -> bool {
     if found.is_empty() || title.is_empty() {
         return false;
     }
@@ -217,7 +217,7 @@ pub fn same_title(found: &str, title: &str, heading: bool) -> bool {
 
 /// Whether a document's bookmarks outline its divisions at all (not generic titles, one numbered
 /// template, or too few).
-pub fn usable(outline: &[PdfOutlineEntry], pages: usize) -> bool {
+pub(crate) fn usable(outline: &[PdfOutlineEntry], pages: usize) -> bool {
     classify(&validate(outline, pages), pages) != Tier::Ignore
 }
 
@@ -225,7 +225,7 @@ pub fn usable(outline: &[PdfOutlineEntry], pages: usize) -> bool {
 /// name is none: one tree walking forward through the pages (not a bilingual act's two, the
 /// second starting over at its first page). A book of authorities' bookmarks name its tabs and the
 /// passages cited in them, none of its authorities' headings.
-pub fn complete(outline: &[PdfOutlineEntry], pages: usize) -> bool {
+pub(crate) fn complete(outline: &[PdfOutlineEntry], pages: usize) -> bool {
     let entries = validate(outline, pages);
     entries.len() * 10 >= outline.len() * 9 && classify(&entries, pages) == Tier::Full && authorities_level(&entries).is_none()
 }
@@ -241,7 +241,7 @@ fn authorities_level(entries: &[Entry]) -> Option<usize> {
 /// bookmarks name, whatever numbering label one side prints ("1 Short Title" / "Short Title"),
 /// confirms theirs; one they do not name stands after the entry before it, at its listed level
 /// counted from the nearest entry before it that both name (its own listed level where none does).
-pub fn merge_outlines(bookmarks: &[PdfOutlineEntry], listed: &[PdfOutlineEntry]) -> Vec<PdfOutlineEntry> {
+pub(crate) fn merge_outlines(bookmarks: &[PdfOutlineEntry], listed: &[PdfOutlineEntry]) -> Vec<PdfOutlineEntry> {
     let mut merged = bookmarks.to_vec();
     let mut cursor: Option<usize> = None;
     let mut anchor: Option<(usize, usize)> = None;

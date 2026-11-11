@@ -4,22 +4,22 @@
 use super::*;
 
 /// Where each page's text stands.
-pub struct PageMeasures<'a> {
+pub(crate) struct PageMeasures<'a> {
     /// Where the page's last running line of the body's type ends (a folio or a running citation, a few words, is none):
     /// a page's notes stand below it.
-    pub body_end: Vec<[f64; 2]>,
-    pub band_top: Vec<[f64; 2]>,
+    pub(crate) body_end: Vec<[f64; 2]>,
+    pub(crate) band_top: Vec<[f64; 2]>,
     /// Where the page's last line of a table in the body's type ends, a table holding the running text.
-    pub cells_end: Vec<[Option<f64>; 2]>,
-    pub edge: HashMap<(usize, bool), f64>,
+    pub(crate) cells_end: Vec<[Option<f64>; 2]>,
+    pub(crate) edge: HashMap<(usize, bool), f64>,
     columns: HashMap<(usize, bool), f64>,
     right_edges: HashMap<(usize, bool), f64>,
-    pub page_ends: Vec<(f64, f64)>,
-    pub running: HashSet<&'a str>,
+    pub(crate) page_ends: Vec<(f64, f64)>,
+    pub(crate) running: HashSet<&'a str>,
 }
 
 impl<'a> PageMeasures<'a> {
-    pub fn of(fences: &Fences, pages: &'a [Page], slots: &Slots, evidence: &Evidence) -> Self {
+    pub(crate) fn of(fences: &Fences, pages: &'a [Page], slots: &Slots, evidence: &Evidence) -> Self {
         // (Where a page's note band opens: small type above it is a quotation, whatever it numbers.)
         let (mut body_end, mut band_top) = (vec![[f64::MIN; 2]; pages.len()], vec![[f64::MAX; 2]; pages.len()]);
         let mut cells_end = vec![[None::<f64>; 2]; pages.len()];
@@ -86,28 +86,28 @@ impl<'a> PageMeasures<'a> {
         Self { body_end, band_top, cells_end, edge, columns, right_edges, page_ends, running }
     }
 
-    pub fn column(&self, page: usize, language: bool) -> f64 {
+    pub(crate) fn column(&self, page: usize, language: bool) -> f64 {
         self.columns.get(&(page % 2, language)).copied().unwrap_or(f64::MAX)
     }
 
     /// Where the page's running lines end.
-    pub fn right_edge(&self, page: usize, language: bool) -> f64 {
+    pub(crate) fn right_edge(&self, page: usize, language: bool) -> f64 {
         self.right_edges.get(&(page, language)).copied().unwrap_or(f64::MIN)
     }
 }
 
 /// The printed numbers, in reading order.
-pub struct Numbers {
-    pub sequence: [Vec<(Slot, Option<usize>)>; 2],
-    pub place_in: HashMap<Slot, usize>,
+pub(crate) struct Numbers {
+    pub(crate) sequence: [Vec<(Slot, Option<usize>)>; 2],
+    pub(crate) place_in: HashMap<Slot, usize>,
     /// The numbered lines whose words stand further in than the judgment's own.
-    pub further: HashSet<Slot>,
+    pub(crate) further: HashSet<Slot>,
     /// Those whose numbers the judgment's own place prints too.
-    pub indented: HashSet<Slot>,
+    pub(crate) indented: HashSet<Slot>,
 }
 
 impl Numbers {
-    pub fn of(fences: &Fences, pages: &[Page], slots: &Slots, evidence: &Evidence, printed: &[Option<usize>], stream_of: &[Stream], edge: &HashMap<(usize, bool), f64>) -> Self {
+    pub(crate) fn of(fences: &Fences, pages: &[Page], slots: &Slots, evidence: &Evidence, printed: &[Option<usize>], stream_of: &[Stream], edge: &HashMap<(usize, bool), f64>) -> Self {
         // Where a numbered line's words stand, from that edge: a quotation may hang its number in the judgment's own margin
         // (its words alone set in); a number alone on its line has them on its row.
         let indent = |slot: Slot| {
@@ -147,15 +147,15 @@ impl Numbers {
 /// A new count opens at a "1" in the body's type and at the judgment's own place, five or more numbers on, that goes
 /// on 2, 3, 4, 5: another decision in the file. A note list's "[1]" is small, a quotation's stands elsewhere, a
 /// list's stops short.
-pub struct Counts {
+pub(crate) struct Counts {
     /// The count each line stands in, in each stream.
-    pub count_of: Vec<[u16; 2]>,
-    pub note_lists: HashSet<(u16, Stream)>,
-    pub streams: u16,
+    pub(crate) count_of: Vec<[u16; 2]>,
+    pub(crate) note_lists: HashSet<(u16, Stream)>,
+    pub(crate) streams: u16,
 }
 
 impl Counts {
-    pub fn of(fences: &Fences, pages: &[Page], slots: &Slots, evidence: &Evidence, stream_of: &[Stream], numbers: &Numbers) -> Self {
+    pub(crate) fn of(fences: &Fences, pages: &[Page], slots: &Slots, evidence: &Evidence, stream_of: &[Stream], numbers: &Numbers) -> Self {
         let (mut count_of, mut printed_numbers, mut counts) = (vec![[0u16; 2]; slots.len()], [0usize; 2], [0u16; 2]);
         // Notes listed after the reasons in the body's own type open no decision: the reasons' lines call their numbers in
         // turn ("... of violence.[1]"), and the list is no one's paragraphs.
