@@ -291,12 +291,12 @@ fn apply_block_quote_heuristic(
 
     let mut relabel = HashSet::new();
     for group in groups {
-        let mut scores: Vec<f64> = group
+        let scores: Vec<f64> = group
             .iter()
             .map(|position| rows[*position].region_score)
             .collect();
         let group_score =
-            median(&mut scores, 0.0) + ((group.len().saturating_sub(1) as f64) * 0.025).min(0.10);
+            legal_pdf_core::median(scores) + ((group.len().saturating_sub(1) as f64) * 0.025).min(0.10);
         let start = group[0];
         let end = *group.last().expect("group is nonempty");
         let before = start.checked_sub(1).and_then(|position| rows.get(position));
@@ -944,19 +944,6 @@ fn percentile(values: impl IntoIterator<Item = f64>, fraction: f64, default: f64
     values.sort_by(f64::total_cmp);
     let index = ((values.len() - 1) as f64 * clamp01(fraction)).round_ties_even() as usize;
     values[index]
-}
-
-fn median(values: &mut [f64], default: f64) -> f64 {
-    if values.is_empty() {
-        return default;
-    }
-    values.sort_by(f64::total_cmp);
-    let half = values.len() / 2;
-    if values.len() % 2 == 1 {
-        values[half]
-    } else {
-        (values[half - 1] + values[half]) * 0.5
-    }
 }
 
 fn exact_page_digits(text: &str) -> Option<i64> {

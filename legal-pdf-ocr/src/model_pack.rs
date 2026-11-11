@@ -1,10 +1,10 @@
-use crate::indra::{canonical_file, IndraTier};
+use crate::indra::IndraTier;
 use legal_pdf_core::OrtBackend;
-use legal_pdf_core::{provider_asset_sha256, Error, Result};
+use legal_pdf_core::{pack_file, provider_asset_sha256, Error, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
 struct Asset {
@@ -92,20 +92,10 @@ impl ModelPack {
 }
 
 fn checked_asset(root: &Path, asset: &Asset) -> Result<PathBuf> {
-    let relative = Path::new(&asset.path);
-    if asset.path.contains(['\\', ':'])
-        || relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(Error::Message(
-            "Indra asset path must stay inside its model pack".to_owned(),
-        ));
-    }
-    let path = canonical_file(&root.join(relative), "Indra pack asset")?;
-    if !path.starts_with(root) || provider_asset_sha256(&path)? != asset.sha256 {
+    let path = pack_file(root, &asset.path, "Indra pack asset")?;
+    if provider_asset_sha256(&path)? != asset.sha256 {
         return Err(Error::Message(format!(
-            "Indra asset failed path/hash verification: {}",
+            "Indra asset failed hash verification: {}",
             asset.path
         )));
     }

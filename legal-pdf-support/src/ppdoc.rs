@@ -5,7 +5,7 @@ use crate::ppdoc_postprocess::{
 };
 use image::{imageops, RgbImage};
 use legal_pdf_core::model::Page;
-use legal_pdf_core::{provider_asset_sha256, Error, Result};
+use legal_pdf_core::{canonical_file, pack_file, provider_asset_sha256, required_path, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -242,7 +242,7 @@ impl ModelPack {
         {
             return fail("PPdoc model pack has an invalid postprocess score threshold");
         }
-        let model_path = pack_file(&root, &model.file, "model")?;
+        let model_path = pack_file(&root, &model.file, "PPdoc model")?;
         let model_sha256 = provider_asset_sha256(&model_path)?;
         if model_sha256 != model.sha256.to_ascii_lowercase() {
             return fail(format!(
@@ -255,7 +255,7 @@ impl ModelPack {
             .iter()
             .map(|companion| {
                 let actual =
-                    provider_asset_sha256(&pack_file(&root, &companion.file, "companion")?)?;
+                    provider_asset_sha256(&pack_file(&root, &companion.file, "PPdoc companion")?)?;
                 if actual != companion.sha256.to_ascii_lowercase() {
                     return fail(format!(
                         "PPdoc companion hash mismatch for {}: expected {}, found {actual}",
@@ -1005,34 +1005,3 @@ fn skips_reading_order(label: &str) -> bool {
     )
 }
 
-fn required_path(value: &Option<PathBuf>, variable: &str, label: &str) -> Result<PathBuf> {
-    let path = value
-        .clone()
-        .or_else(|| std::env::var_os(variable).map(PathBuf::from))
-        .filter(|path| !path.as_os_str().is_empty());
-    path.ok_or_else(|| {
-        Error::Message(format!(
-            "{label} is required; pass it explicitly or set {variable}"
-        ))
-    })
-}
-
-fn pack_file(root: &Path, relative: &str, label: &str) -> Result<PathBuf> {
-    let relative = Path::new(relative);
-    if relative.is_absolute() {
-        return fail(format!("PPdoc {label} path must be relative to its pack"));
-    }
-    let path = fs::canonicalize(root.join(relative))
-        .map_err(|source| Error::io(root.join(relative), source))?;
-    if !path.starts_with(root) {
-        return fail(format!("PPdoc {label} path escapes its pack"));
-    }
-    Ok(path)
-}
-
-fn canonical_file(path: &Path, label: &str) -> Result<PathBuf> {
-    if !path.is_file() {
-        return fail(format!("{label} does not exist: {}", path.display()));
-    }
-    fs::canonicalize(path).map_err(|source| Error::io(path, source))
-}

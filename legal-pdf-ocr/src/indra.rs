@@ -8,7 +8,7 @@ use crate::planning::{self, RuntimePlan};
 use image::{imageops, GrayImage, Luma, RgbaImage};
 use legal_pdf_core::profile::measure;
 use legal_pdf_core::render::{open_pdf, PageRenderer};
-use legal_pdf_core::{provider_asset_sha256, Error, OrtBackend, Result};
+use legal_pdf_core::{canonical_file, provider_asset_sha256, required_path, Error, OrtBackend, Result};
 use legal_pdf_core::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord};
 use ort::{
     execution_providers::{cuda::CuDNNConvAlgorithmSearch, CPUExecutionProvider, CUDAExecutionProvider},
@@ -22,7 +22,7 @@ use ort::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -896,21 +896,6 @@ fn validate_options(options: &OcrOptions) -> Result<()> {
         backend.normalized_device(options.device.as_deref())?;
     }
     Ok(())
-}
-
-fn required_path(value: &Option<PathBuf>, variable: &str, label: &str) -> Result<PathBuf> {
-    value
-        .clone()
-        .or_else(|| std::env::var_os(variable).map(PathBuf::from))
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or_else(|| Error::Message(format!("{label} is required; pass it explicitly or set {variable}")))
-}
-
-pub(crate) fn canonical_file(path: &Path, label: &str) -> Result<PathBuf> {
-    if !path.is_file() {
-        return Err(Error::Message(format!("{label} does not exist: {}", path.display())));
-    }
-    fs::canonicalize(path).map_err(|source| Error::io(path, source))
 }
 
 pub(crate) fn ort_error(error: ort::Error) -> Error {
