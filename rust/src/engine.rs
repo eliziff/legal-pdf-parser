@@ -22,6 +22,11 @@ use std::sync::{
 use std::time::SystemTime;
 
 const EXTRACTION_CACHE_SCHEMA: &str = "legalpdf.extraction-cache.v3";
+/// The recognizer's code a page's reading is cached under, alongside its provider's identity: a version, as extraction's
+/// schema is, never a fingerprint of source files, which discarded every recognized page on edits that read no page
+/// differently. Its value is the fingerprint the cache was written under (legal-pdf-parser f67cff9); a change to how a
+/// page is read gives it a new one.
+const RECOGNITION_CODE: &str = "a15fdddbf3186a9c7e19d1d5d524bf730b92ce19ad6ad2c17d108cd21b1a2d7b";
 const PARSE_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[cfg(feature = "ocr")]
@@ -284,7 +289,7 @@ fn cache_key(
         "ocr_provider_identity": ocr_provider.map(|provider| provider.1),
         "ocr_source_sha256": ocr_provider
             .filter(|provider| provider.0 != "supplied")
-            .map(|_| env!("LEGAL_PDF_OCR_SHA256")),
+            .map(|_| RECOGNITION_CODE),
         "layout_provider": ppdoc_identity.map(|_| "ppdoc-lite"),
         "layout_provider_identity": ppdoc_identity,
         "layout_source_sha256": ppdoc_identity.map(|_| env!("LEGAL_PDF_LAYOUT_SHA256")),
@@ -381,10 +386,10 @@ fn derive_document(
 #[doc(hidden)]
 pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPdf> {
     let source_hash = format!("{:x}", Sha256::digest(pdf));
-    let recognizer = std::env::var_os("LEGALPDF_INDRA_MODEL_PACK").is_some() && std::env::var_os("LEGALPDF_ONNXRUNTIME").is_some();
     let options = PdfRequest {
         cache_dir: Some(cache_dir.to_owned()),
-        ocr: recognizer.then(OcrOptions::default),
+        // Always the recognizer (LEGALPDF_INDRA_MODEL_PACK, LEGALPDF_ONNXRUNTIME), else a failure: a scan read without one is empty pages.
+        ocr: Some(OcrOptions::default()),
         #[cfg(feature = "ppdoc")]
         // The product's layout model (OpenVINO), on the same pack and runtime: LEGALPDF_PPDOC_DEVICE its device.
         ppdoc: std::env::var_os("LEGALPDF_PPDOC_MODEL_PACK").map(|pack| PPDocOptions {
@@ -663,7 +668,7 @@ fn recognized_extraction(
     #[cfg(feature = "ocr")]
     let mut ocr_provider = {
         let identity = providers.ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
-        let recognition_key = serialization_sha256(&("legalpdf.recognition-cache.v1", source_hash, env!("LEGAL_PDF_OCR_SHA256"), identity));
+        let recognition_key = serialization_sha256(&("legalpdf.recognition-cache.v1", source_hash, RECOGNITION_CODE, identity));
         let raster_key = serialization_sha256(&("legalpdf.raster-cache.v1", source_hash, env!("LEGAL_PDF_RASTER_SHA256")));
         let recognition_root = cache_root.map(|root| ocr_cache_root(root, options).join("recognition"));
         options.ocr.as_ref().zip(providers.ocr).map(|(options, prepared)| DeferredOcrProvider {

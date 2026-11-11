@@ -92,24 +92,6 @@ fn crate_inputs(root: &Path, name: &str) -> Vec<PathBuf> {
     inputs
 }
 
-/// What reads a page's text: the OCR crate's manifest and its top-level sources, but not its
-/// re-exports (lib.rs), its raster measures (raster.rs, keyed on their own), its command-line tool
-/// (bin), or where it finds its model pack and plans its run (model_pack.rs, planning.rs: the
-/// provider's identity, part of the key, holds the pack's hashes and the plan); and the page renderer
-/// it reads. Where a provider's files are found (legal-pdf-core's asset.rs) is no input either.
-fn recognition_sources(root: &Path) -> Vec<PathBuf> {
-    let owner = root.join("legal-pdf-ocr");
-    let mut inputs = vec![owner.join("Cargo.toml"), root.join("legal-pdf-core/src/render.rs")];
-    for entry in fs::read_dir(owner.join("src")).unwrap().flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") && !["lib.rs", "raster.rs", "model_pack.rs", "planning.rs"].contains(&name.to_str().unwrap_or_default()) {
-            inputs.push(path);
-        }
-    }
-    inputs
-}
-
 /// What measures a page's render beyond its text: the raster module and the shared render helpers.
 fn raster_sources(root: &Path) -> Vec<PathBuf> {
     ["legal-pdf-ocr/Cargo.toml", "legal-pdf-ocr/src/raster.rs", "legal-pdf-ocr/src/ocr.rs", "legal-pdf-ocr/src/separator.rs", "legal-pdf-core/src/ocr_contract.rs", "legal-pdf-core/src/render.rs"]
@@ -118,9 +100,9 @@ fn raster_sources(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-// Raw extraction and OCR pages do not depend on DOCX, structure inference or
-// document projection. Their hashes follow the code and contracts they use.
-fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
+// Raw extraction does not depend on DOCX, structure inference or document projection. Its hash
+// follows the code and contracts it uses. Recognition is keyed by a version (engine.rs's RECOGNITION_CODE).
+fn stage_inputs(root: &Path) -> [Vec<PathBuf>; 3] {
     let paths = |names: &[&str]| names.iter().map(|name| root.join(name)).collect::<Vec<_>>();
     let mut extraction = paths(&[
         "legal-pdf-core/Cargo.toml",
@@ -133,16 +115,6 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
     extraction.extend(["Cargo.toml", "src/lib.rs", "src/stats.rs"].map(|name| layout.join(name)));
     extraction.extend(inspector_inputs(root, NOT_EXTRACTION));
     extraction.extend(crate_inputs(root, "extraction-processor"));
-    let mut recognition = paths(&[
-        "legal-pdf-core/Cargo.toml",
-        "legal-pdf-core/src/ocr_contract.rs",
-        "legal-pdf-core/src/ort_backend.rs",
-        "legal-pdf-core/src/ort_runtime.rs",
-    ]);
-    recognition.extend(recognition_sources(root));
-    if indra {
-        recognition.push(root.join("rust/native/gpu_adapter.cpp"));
-    }
     let mut document = paths(&[
         "rust/src/contract.rs",
         "rust/src/engine.rs",
@@ -172,7 +144,7 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
         "legal-pdf-support/src/ppdoc_openvino.rs",
         "legal-pdf-support/src/ppdoc_postprocess.rs",
     ]);
-    [extraction, recognition, document, layout]
+    [extraction, document, layout]
 }
 
 fn main() {
@@ -190,15 +162,6 @@ fn main() {
     if pdf {
         for ((name, active, stage_features), inputs) in [
             ("EXTRACTION", true, vec![]),
-            (
-                "OCR",
-                enabled("OCR"),
-                features
-                    .iter()
-                    .filter(|name| ["OCR", "INDRA"].contains(&name.as_str()))
-                    .cloned()
-                    .collect(),
-            ),
             ("DOCUMENT", true, vec![]),
             (
                 "LAYOUT",
@@ -207,7 +170,7 @@ fn main() {
             ),
         ]
         .into_iter()
-        .zip(stage_inputs(&root, enabled("INDRA")))
+        .zip(stage_inputs(&root))
         {
             let inputs = if active { inputs } else { vec![] };
             println!(
