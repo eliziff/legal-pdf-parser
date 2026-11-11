@@ -1,43 +1,56 @@
-//! The structure stage's orchestrator: a PDF's extracted pages and lines in, its paragraphs, notes, headings and
-//! structure graph out. Each stage is a crate of its own over the contract (`legal_pdf_structure_model`); this calls
-//! them in order:
+//! The structure stage: a PDF's extracted pages and lines in, its paragraphs, notes, headings and structure graph out.
+//! Each stage is a module over the contract (`model`); `derive` calls them in order:
 //!
-//! 0. The pages normalized (`legal_pdf_evidence::normalize`): a transcript's line numbers parted from the lines
+//! 0. The pages normalized (`evidence::normalize`): a transcript's line numbers parted from the lines
 //!    they were read into, a table's rulings cleared from under its words, each line given its slot.
 //! 1. Measured (`Evidence`): each page's words, rows and note separator; each line's type, its source's tag, its marker,
 //!    note label, reference tokens, words and citations; the document's bookmarks and whether it is an instrument.
-//! 2. Fenced and ordered (`Fences`): a transcript's line numbers, furniture and folios (`legal_pdf_furniture`), each
-//!    page's columns, contents lists (`legal_pdf_headings`), tables, the note band under a separator, the body's type,
-//!    the constituent documents (`legal_pdf_constituents`), the reading order, quotations and reading contexts, and each
+//! 2. Fenced and ordered (`Fences`): a transcript's line numbers, furniture and folios (`furniture`), each
+//!    page's columns, contents lists (`headings`), tables, the note band under a separator, the body's type,
+//!    the constituent documents (`constituents`), the reading order, quotations and reading contexts, and each
 //!    line's continuation of the one before.
 //! 3. Numbered (`Runs`): each reading context's numbering runs, read and resolved by the engine.
-//! 4. Notes (`Notes`): each document's note band and the lanes that take more lines for notes (`legal_pdf_notes`).
-//! 5. Decided (`transition::tier0`): every rule heard on every line (`Decision::hear`), one decision on each line in
+//! 4. Notes (`Notes`): each document's note band and the lanes that take more lines for notes (`notes`).
+//! 5. Decided (`tier0`): every rule heard on every line (`Decision::hear`), one decision on each line in
 //!    reading order (`settle`), the headings' levels (`Decision::finish`). Paragraph numbers are fixed input.
 //! 6. Written once (`write_lines`): each line's place in its page's reading order; and read by slot, each line's zone
 //!    and block (`zones`, `blocks`).
 //! 7. Derived from the decision: notes paired (the engine's pairer, over `note_lines`), a note band's line no note holds
 //!    given back to the body, propositions and cross-references (`note_context`), and the moves the decided lines make
-//!    (`tier0::moves_of`, over `tier0::reading_regions`) emitted as the structure graph (`legal_pdf_emit`).
+//!    (`tier0::moves_of`, over `tier0::reading_regions`) emitted as the structure graph (`emit`). Tier 1 (DOC, with
+//!    `encoder`) reads over tier 0's reading (`transition`).
 //!
 //! Measure a change with the grader's digest (`structure-gold digest`): every parse hashed, two builds compared.
 
-pub use legal_pdf_structure_model::StructureIdentity;
-use legal_pdf_decide as decide;
-use legal_pdf_evidence::{normalize, Evidence};
-use legal_pdf_fences::{decided, Fences};
-use legal_pdf_structure_model::{Runs, Slots};
+mod constituents;
+mod decide;
+mod emit;
+mod evidence;
+mod fences;
+mod furniture;
+mod graph;
+mod headings;
+mod layout;
+mod machine;
+mod model;
+mod notes;
+mod runs;
+mod tables;
+mod text;
+mod tier0;
+mod transition;
+
+pub use model::StructureIdentity;
+use evidence::{normalize, Evidence};
+use fences::{decided, Fences};
+use model::{Runs, Slots};
 pub(crate) use decide::*;
-use legal_pdf_graph as graph;
 pub use graph::PdfTextIndex;
-use legal_pdf_notes::note_context;
+use notes::note_context;
 use note_context::*;
-/// Tier 1 over tier 0's reading: DOC (with `encoder`).
-use legal_pdf_transition as transition;
-use legal_pdf_tier0 as tier0;
-use legal_pdf_emit::Settled;
-use legal_pdf_machine::lines::LineTable;
-use legal_pdf_machine::machine::LineView;
+use emit::Settled;
+use machine::lines::LineTable;
+use machine::machine::LineView;
 use std::path::Path;
 
 use legal_pdf_core::model::{Diagnostic, LineZone, Page, PdfOutlineEntry};
@@ -86,16 +99,16 @@ pub fn derive(pages: &mut [Page],
     // Each page's measures and columns, read once for every stage that reads the pages before they are written.
     let geometry = decide::Geometry::of(pages);
     let mut evidence = measure("derive.measure", || {
-        legal_pdf_evidence::measure(pages, &slots, normalized, separators, outline, instrument)
+        crate::evidence::measure(pages, &slots, normalized, separators, outline, instrument)
     });
     let mut fences = measure("derive.fences", || Fences::read(pages, &slots, &evidence, outline, &identity.page_labels));
-    let runs = measure("derive.runs", || legal_pdf_runs::read(pages, &slots, &mut evidence, &mut fences, &geometry))?;
+    let runs = measure("derive.runs", || crate::runs::read(pages, &slots, &mut evidence, &mut fences, &geometry))?;
     measure("derive.machine", || output(pages, &mut slots, &evidence, fences, &runs, &geometry, outline, &identity, trace))
 }
 
 /// Tier 0's reading of the document written: its decision (`tier0::decide`), DOC's moves over it where DOC is given
 /// (`transition::over_tier0`), the lines written, the notes paired, the moves made (`tier0::moves_of`, DOC's in their
-/// place where it read them) and emitted as the structure graph (`legal_pdf_emit`).
+/// place where it read them) and emitted as the structure graph (`crate::emit`).
 #[allow(clippy::too_many_arguments)]
 fn output(pages: &mut [Page],
     slots: &mut Slots,
@@ -135,12 +148,12 @@ fn output(pages: &mut [Page],
     diagnostics.extend(pairing.diagnostics);
     give_back(&mut zones, slots, &notes);
     diagnostics.extend(unmatched_reference_diagnostics(fences.order.iter().map(|&slot| (slots.line(pages, slot), zones[slot.index()])), &notes, &index, &decided));
-    let views = LineView::all(slots, evidence, &fences, &table);
+    let views = LineView::all(evidence, &fences, &table);
     let moves = tier0::moves_of(slots, &fences, runs, &views, &decision, &tier0::reading_regions(pages, slots, &fences, &zones, &blocks), &notes);
     // The writer takes DOC's move for each line where DOC read one, but for the notes, the pairer's (a line either reads
     // as a note keeps this reading's move). DOC reads the same table, so its reading of a marker names one of this
     // reading's.
     let settled = Settled { index: &index, notes, runs };
-    let (structure_graph, authority_text_units) = legal_pdf_emit::structure_graph(pages, slots, evidence, &fences, &decided, &views, &moves, doc, identity, settled)?;
+    let (structure_graph, authority_text_units) = crate::emit::structure_graph(pages, slots, evidence, &fences, &decided, &views, &moves, doc, identity, settled)?;
     Ok(StructureOutput { authority_text_units, diagnostics, structure_graph })
 }
