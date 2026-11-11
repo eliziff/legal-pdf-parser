@@ -58,9 +58,9 @@ pub(crate) fn page_index(page: &StructureNode) -> usize {
     page.page_indexes[0]
 }
 
-/// A page node's page number, its label.
+/// A page node's page number, from 1.
 pub(crate) fn page_number(page: &StructureNode) -> u32 {
-    page.label.as_deref().unwrap_or("").parse().unwrap_or(0)
+    page_index(page) as u32 + 1
 }
 
 /// How far a page's text is to be trusted, from 0 to 1, of the pages' qualities (`PdfSummary::page_text_quality`).
@@ -181,9 +181,9 @@ impl PdfDocument {
             return (PdfLookupStatus::Invalid, Vec::new());
         };
         match self.paragraph_range(from, to) {
-            Ok(paragraphs) => {
+            Ok((start, end)) => {
                 // Each printing's extent: its words, its quotations and lists, as the structure reads them.
-                let mut ranges: Vec<ScalarRange> = paragraphs.iter().flat_map(|(_, printings)| printings)
+                let mut ranges: Vec<ScalarRange> = self.printed_paragraphs()[start..=end].iter().flat_map(|(_, printings)| printings)
                     .map(|&index| &self.structure.nodes[index])
                     .flat_map(|node| if node.extent.is_empty() { node.ranges.clone() } else { node.extent.clone() })
                     .collect();
@@ -194,11 +194,8 @@ impl PdfDocument {
         }
     }
 
-    pub(crate) fn paragraph_range(
-        &self,
-        from: usize,
-        to: usize,
-    ) -> Result<&[PrintedParagraph], PdfLookupStatus> {
+    /// Where paragraphs `from` to `to` stand among the printed paragraphs: the first's place and the last's.
+    pub(crate) fn paragraph_range(&self, from: usize, to: usize) -> Result<(usize, usize), PdfLookupStatus> {
         let paragraphs = self.printed_paragraphs();
         if paragraphs.is_empty() {
             return Err(PdfLookupStatus::Unavailable);
@@ -208,7 +205,7 @@ impl PdfDocument {
         if (from..=to).any(|number| at(number).is_err()) || end < start {
             return Err(PdfLookupStatus::NotFound);
         }
-        Ok(&paragraphs[start..=end])
+        Ok((start, end))
     }
 
     /// Each paragraph number the structure labels, once, with every printing of it, as the structure engine reads

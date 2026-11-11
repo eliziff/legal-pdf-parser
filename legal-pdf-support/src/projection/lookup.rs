@@ -157,13 +157,7 @@ pub(crate) fn result(
         requested.end_locator = None;
     }
     PdfStructureLookup {
-        kind: match input.locator_kind.as_str() {
-            "page" => "page",
-            "line" => "line",
-            "paragraph" => "paragraph",
-            "footnote" => "footnote",
-            _ => "section",
-        },
+        kind: lookup_kind(&input.locator_kind),
         requested,
         units: Vec::new(),
         before: Vec::new(),
@@ -174,6 +168,17 @@ pub(crate) fn result(
         payload_sha256: String::new(),
         page_text_sha256: String::new(),
         error,
+    }
+}
+
+/// The kind of unit a locator asks for: a page, a transcript's line, a paragraph, a note, else a provision.
+fn lookup_kind(locator_kind: &str) -> &'static str {
+    match locator_kind {
+        "page" => "page",
+        "line" => "line",
+        "paragraph" => "paragraph",
+        "footnote" => "footnote",
+        _ => "section",
     }
 }
 
@@ -409,10 +414,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
             Some("Invalid or unbounded PDF locator".to_owned()),
         );
     }
-    let kind = match input.locator_kind.as_str() {
-        "page" | "line" | "paragraph" | "footnote" => input.locator_kind.as_str(),
-        _ => "section",
-    };
+    let kind = lookup_kind(&input.locator_kind);
     let text = ScalarText::new(document.structure.query_text());
     let end_locator = input
         .end_locator
@@ -458,12 +460,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
             .find(|page| page.aliases.as_ref().is_some_and(|aliases| aliases.iter().any(|alias| alias.trim() == printed)))
             .or_else(|| document.page_nodes().find(|page| self::page_number(page) == page_number));
         let passage = document.passage_pages();
-        let Some((page, geometry)) = page.and_then(|page| {
-            passage
-                .iter()
-                .find(|geometry| geometry.number == self::page_number(page))
-                .map(|geometry| (page, geometry))
-        }) else {
+        let Some((page, geometry)) = page.and_then(|page| Some((page, passage.get(page_index(page))?))) else {
             return result(input, PdfLookupStatus::NotFound, None);
         };
         let lines = transcript_lines(document, page, geometry);
@@ -509,16 +506,11 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
                 Some("Paragraph range exceeds the lookup limit".to_owned()),
             );
         }
-        let selected = match document.paragraph_range(start_number, end_number) {
-            Ok(selected) => selected,
+        let (start, end) = match document.paragraph_range(start_number, end_number) {
+            Ok(range) => range,
             Err(status) => return result(input, status, None),
         };
         let printed = document.printed_paragraphs();
-        let start = printed
-            .iter()
-            .position(|p| std::ptr::eq(p, &selected[0]))
-            .unwrap();
-        let end = start + selected.len() - 1;
         return finish(document, &text, input, printed.len(), start, end, |index| {
             printed_unit(&text, document, &printed[index])
         });

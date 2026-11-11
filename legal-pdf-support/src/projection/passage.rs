@@ -184,8 +184,7 @@ impl PdfDocument {
             ..PdfLookupRequest::new(&target.locator_kind, &target.locator)
         });
         let ranges = if lookup.status == PdfLookupStatus::Ambiguous { Vec::new() } else {
-            lookup.matches.iter()
-                .filter_map(|id| self.structure.nodes.iter().find(|node| &node.id == id))
+            lookup.units.iter().map(|unit| &unit.node)
                 .flat_map(|node| {
                     if (matches!(node.kind, NodeKind::Heading | NodeKind::Section) || node.role == Some(PrimaryRole::Heading)) && !node.extent.is_empty() { &node.extent[..] }
                     else if !node.ranges.is_empty() { &node.ranges[..] }
