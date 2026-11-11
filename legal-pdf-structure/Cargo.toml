@@ -23,4 +23,4 @@ encoder = ["dep:ort", "dep:tokenizers", "legal-pdf-core/ort-runtime"]
 
 # Unit tests run the structure engine, which programs supply at run time.
 [dev-dependencies]
-legal-pdf-core = { path = "../legal-pdf-core", features = ["structure-analysis"] }
+legal-pdf-core = { path = "../legal-pdf-core" }

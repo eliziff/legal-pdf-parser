@@ -1208,6 +1208,7 @@ dependencies = [
  "legal-pdf-pages",
  "legal-pdf-structure",
  "legal-pdf-support",
+ "legal-structure",
  "legal-structure-model",
  "lopdf",
  "mimalloc",

@@ -10,14 +10,13 @@ ort-runtime = ["dep:ort"]
 # Drawing a PDF's pages (render.rs), for what reads their images.
 render = ["dep:hayro"]
 # Supply this checkout's structure engine by default, for tests and command-line tools.
-structure-analysis = ["dep:legal-structure"]
 # TypeScript declarations of the types the engine hands JavaScript (the engine's export-types), never a runtime build.
 binding-types = ["dep:ts-rs", "legal-layout/binding-types", "legal-structure-model/binding-types"]
 
 [dependencies]
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 hayro = { version = "0.7.0", default-features = false, optional = true }
-legal-structure = { workspace = true, features = ["structure-inference"], optional = true }
+legal-structure = { workspace = true, features = ["structure-inference"] }
 legal-layout = { workspace = true }
 legal-structure-model = { workspace = true }
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"], optional = true }

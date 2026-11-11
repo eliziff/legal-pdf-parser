@@ -35,7 +35,7 @@ full = ["language", "indra", "ppdoc", "doc"]
 # TypeScript declarations of the types the engine hands JavaScript (the engine's export-types), never a runtime build.
 binding-types = ["legal-pdf-core?/binding-types", "legal-pdf-support?/binding-types", "legal-pdf-extraction-processor?/binding-types", "legal-pdf-pages?/binding-types", "legal-pdf-language?/binding-types"]
 # The command-line tools, which run this checkout's structure engine.
-cli = ["pdf", "legal-pdf-core/structure-analysis"]
+cli = ["pdf"]
 
 [lib]
 name = "legalpdf"
@@ -54,6 +54,7 @@ legal-pdf-ocr = { path = "legal-pdf-ocr", optional = true }
 legal-pdf-structure = { path = "legal-pdf-structure", optional = true }
 legal-pdf-support = { path = "legal-pdf-support", optional = true }
 legal-pdf-pages = { path = "legal-pdf-pages", optional = true }
+legal-structure = { workspace = true }
 legal-structure-model = { workspace = true }
 legal-document-query = { workspace = true }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
@@ -62,8 +63,7 @@ serde_json = { version = "1.0", optional = true }
 sha2 = { version = "0.11", optional = true }
 
 [dev-dependencies]
-# Unit tests run the structure engine, which programs supply at run time.
-legal-pdf-core = { path = "legal-pdf-core", features = ["structure-analysis"] }
+legal-pdf-core = { path = "legal-pdf-core" }
 lopdf = { version = "0.45.0", default-features = false }
 
 [build-dependencies]

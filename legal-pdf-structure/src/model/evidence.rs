@@ -285,7 +285,7 @@ pub(crate) const WORD_TURN: u32 = 1 << 14;
 /// An index's entry, ending on its page (`rules::index_entry`).
 pub(crate) const WORD_INDEX_ENTRY: u32 = 1 << 15;
 
-/// A speaker's label opening the line (`LayoutAnalysis::speaker_label`).
+/// A speaker's label opening the line (`legal_structure::transcript::speaker_label`).
 pub(crate) const WORD_SPEAKER: u32 = 1 << 16;
 
 /// A notes heading (`endnote_heading`).

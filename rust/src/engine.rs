@@ -267,7 +267,7 @@ fn document_identity() -> &'static Value {
         json!({
             "document_source_sha256": env!("LEGAL_PDF_DOCUMENT_SHA256"),
             "extraction_source_sha256": env!("LEGAL_PDF_EXTRACTION_SHA256"),
-            "structure_source_sha256": legal_pdf_core::layout_analysis().source_sha256(),
+            "structure_source_sha256": legal_structure::ENGINE_SOURCE_SHA256,
         })
     })
 }

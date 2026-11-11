@@ -1,4 +1,3 @@
-mod analysis;
 mod asset;
 mod error;
 pub mod model;
@@ -11,9 +10,6 @@ mod ort_runtime;
 #[cfg(feature = "render")]
 pub mod render;
 mod storage;
-pub use analysis::{install_layout_analysis, layout_analysis};
-#[cfg(feature = "structure-analysis")]
-pub use analysis::CHECKOUT_ENGINE;
 pub use asset::{canonical_file, pack_file, provider_asset_sha256, required_path};
 pub use error::{Error, FailureKind, Result};
 pub use legal_structure_model::{AuthoritySource, AuthorityTextUnit, SourceMapping};
