@@ -60,16 +60,7 @@ pub struct QuoteSelection {
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PassageGeometry {
-    #[cfg_attr(feature = "binding-types", ts(type = "\"legalpdf.passage-geometry.v2\""))]
-    pub schema_version: &'static str,
     pub source_sha256: String,
-    pub parser_version: String,
-    #[cfg_attr(feature = "binding-types", ts(type = "\"visible_page_fraction\""))]
-    pub coordinate_space: &'static str,
-    #[cfg_attr(feature = "binding-types", ts(type = "\"top_left\""))]
-    pub coordinate_origin: &'static str,
-    #[cfg_attr(feature = "binding-types", ts(type = "true"))]
-    pub rotation_applied: bool,
     pub targets: Vec<PlacedPassage>,
 }
 
@@ -165,12 +156,7 @@ impl PdfDocument {
             .filter(|index| pages.get(*index).is_none_or(|page| page.lines.is_empty()))
             .collect::<HashSet<_>>();
         PassageGeometry {
-            schema_version: "legalpdf.passage-geometry.v2",
             source_sha256: self.summary.sha256.clone(),
-            parser_version: self.summary.parser_version.clone(),
-            coordinate_space: "visible_page_fraction",
-            coordinate_origin: "top_left",
-            rotation_applied: true,
             targets: targets.into_iter().map(|target| self.place(query, target, &pages, &unavailable)).collect(),
         }
     }
