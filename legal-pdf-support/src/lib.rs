@@ -10,6 +10,6 @@ mod projection;
 #[cfg(feature = "ppdoc")]
 pub use ppdoc::{PPDocDetection, PPDocLayout, PPDocOptions};
 pub use projection::{
-    brief_occurrence_pages, BriefUnit, PassageGeometry, PassageLine, PassageTarget, PdfDocument, PdfLookupPage,
+    brief_occurrence_pages, BriefUnit, PassageGeometry, PassageLine, PassageTarget, PlacedPassage, PdfDocument, PdfLookupPage,
     PdfLookupRequest, PdfLookupStatus, PdfLookupUnit, PdfStatus, PdfStructureLookup, PdfSummary, PrintedParagraph,
 };

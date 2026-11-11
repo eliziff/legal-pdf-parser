@@ -371,6 +371,11 @@ impl Composer {
     pub fn page_count(&self) -> usize { self.pages.len() }
     /// The page's crop box ([x, y, width, height]) and its rotation.
     pub fn frame(&self, page: usize) -> ([f64; 4], i64) { self.pages[page].frame }
+    /// The top of `rect` (page fractions from the top left of the page as displayed) on the page, in its user space.
+    pub fn top(&self, page: usize, rect: [f64; 4]) -> Option<f64> {
+        let (crop, rotation) = self.frame(page);
+        crate::annotate::quad(rect, crop, rotation).ok().map(|q| q[1].max(q[3]).max(q[5]).max(q[7]))
+    }
 
     /// The font for `face`, embedded once.
     pub fn font(&mut self, face: Face) -> usize {

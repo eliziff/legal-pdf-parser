@@ -55,7 +55,7 @@ pub use legal_pdf_language::{
 pub use legal_pdf_ocr::{OcrLine, OcrOptions, OcrProvider, OcrWord};
 #[cfg(feature = "pdf")]
 pub use legal_pdf_support::{
-    brief_occurrence_pages, BriefUnit, PassageGeometry, PassageLine, PassageTarget, PdfLookupPage, PdfLookupRequest, PdfLookupStatus,
+    brief_occurrence_pages, BriefUnit, PassageGeometry, PassageLine, PassageTarget, PlacedPassage, PdfLookupPage, PdfLookupRequest, PdfLookupStatus,
     PdfLookupUnit, PdfStructureLookup,
 };
 #[cfg(feature = "ppdoc")]

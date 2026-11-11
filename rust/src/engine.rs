@@ -562,18 +562,7 @@ fn parsed_pdf(
     #[cfg_attr(not(feature = "ocr"), allow(unused_variables))] progress: RecognitionProgress<'_>,
     require_cache_write: bool,
 ) -> Result<Option<PdfDocument>> {
-    let source_hash = if let Some(bytes) = bytes {
-        if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 || !bytes[..bytes.len().min(1024)].windows(5).any(|window| window == b"%PDF-") {
-            return Err(Error::Message("PDF source bytes are invalid".to_owned()).failure(FailureKind::Corrupt));
-        }
-        let actual = profile::measure("source_sha256", || format!("{:x}", Sha256::digest(bytes)));
-        if options.expected_source_sha256.as_deref().is_some_and(|expected| expected != actual) {
-            return Err(Error::Message("PDF source changed after preparation began".to_owned()).failure(FailureKind::SourceChanged));
-        }
-        actual
-    } else {
-        options.expected_source_sha256.clone().ok_or_else(|| Error::Message("PDF cache lookup requires expected_source_sha256".to_owned()))?
-    };
+    let source_hash = source_hash(bytes, options)?;
     let cache_root = options.cache_dir.clone().unwrap_or_else(default_cache_dir);
     if let Some(key) = options.cache_key.as_deref() {
         let cached = cached_document(&cache_root, key, &source_hash);
@@ -636,10 +625,26 @@ fn reading(source_hash: &str, options: &PdfRequest) -> Result<(String, Providers
 
 /// The cache key a reading of a PDF would be kept under, without reading it: the PDF is named by the request's
 /// expected source hash.
-pub fn pdf_cache_key(options: &PdfRequest) -> Result<String> {
-    let source_hash = options.expected_source_sha256.as_deref()
-        .ok_or_else(|| Error::Message("A PDF's cache key requires expected_source_sha256".to_owned()))?;
-    Ok(reading(source_hash, options)?.0)
+/// The cache key a PDF's reading is kept under: of `bytes` where given (they must be the source expected), else of
+/// the source expected.
+pub fn pdf_cache_key(bytes: Option<&[u8]>, options: &PdfRequest) -> Result<String> {
+    Ok(reading(&source_hash(bytes, options)?, options)?.0)
+}
+
+/// The source's SHA-256: of its bytes, a PDF's, where given, which must be the source expected; else the source
+/// expected.
+fn source_hash(bytes: Option<&[u8]>, options: &PdfRequest) -> Result<String> {
+    let Some(bytes) = bytes else {
+        return options.expected_source_sha256.clone().ok_or_else(|| Error::Message("PDF cache lookup requires expected_source_sha256".to_owned()));
+    };
+    if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 || !bytes[..bytes.len().min(1024)].windows(5).any(|window| window == b"%PDF-") {
+        return Err(Error::Message("PDF source bytes are invalid".to_owned()).failure(FailureKind::Corrupt));
+    }
+    let actual = profile::measure("source_sha256", || format!("{:x}", Sha256::digest(bytes)));
+    if options.expected_source_sha256.as_deref().is_some_and(|expected| expected != actual) {
+        return Err(Error::Message("PDF source changed after preparation began".to_owned()).failure(FailureKind::SourceChanged));
+    }
+    Ok(actual)
 }
 
 /// The providers a parse reads its pages with, prepared: its recognizer and the identity its

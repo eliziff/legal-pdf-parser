@@ -4,22 +4,28 @@
 //! /Highlight (or /Square for a margin mark) with printable appearance streams, never a change to page contents.
 use legal_pdf_core::{Error, Result};
 use lopdf::{dictionary, Dictionary, Document, IncrementalDocument, Object, ObjectId, Stream, StringFormat};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// A mark as `decodeAnnotationSet` (shared/pdf-annotations.mjs) returns it: rects are page fractions
 /// [left, top, right, bottom] with the origin at the top left of the page as it is displayed.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct AnnotationMark {
     pub id: String,
     pub kind: String,
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub excerpt: String,
     pub rgb: [f64; 3],
     pub opacity: f64,
     pub fragments: Vec<AnnotationFragment>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotationFragment {
@@ -77,7 +83,7 @@ pub(crate) fn page_frame(document: &Document, page_id: ObjectId) -> Result<([f64
 }
 
 /// shared/pdf-annotations.mjs `rectToPdfQuad`: page fractions to a QuadPoints quad in user space.
-fn quad(rect: [f64; 4], crop: [f64; 4], rotation: i64) -> Result<[f64; 8]> {
+pub(crate) fn quad(rect: [f64; 4], crop: [f64; 4], rotation: i64) -> Result<[f64; 8]> {
     let [cx, cy, cw, ch] = crop;
     if !rect.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) || rect[0] >= rect[2] || rect[1] >= rect[3] || cw <= 0.0 || ch <= 0.0 {
         return Err(fail("Invalid PDF geometry."));

@@ -10,7 +10,7 @@ type Rect = [f64; 4];
 
 /// A passage asked for: its id, its locator (a page's is the PDF's page, from 1, unless `physical_pages` names the
 /// pages), the instrument the locator is of where the PDF prints several, and the quotations to place in it.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PassageTarget {
@@ -35,7 +35,7 @@ pub struct PassageTarget {
 }
 
 /// A quotation's text and the part of it (UTF-16) that is placed: its words in their context.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct QuoteSelection {
     pub text: String,
