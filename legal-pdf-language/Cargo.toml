@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+# The TypeScript declaration of what it returns the engine (native/legal-structure-node's export-types).
+binding-types = ["dep:ts-rs"]
+
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
+ts-rs = { version = "12", optional = true }
 legal-structure-model = { workspace = true }
 quick-xml = "0.41"
 regex = "1.11"

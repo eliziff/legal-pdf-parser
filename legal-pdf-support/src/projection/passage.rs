@@ -384,6 +384,7 @@ pub struct BriefUnit {
 
 /// A citation of the brief (the draft's, by its id): its span of its unit's text (UTF-16) and its own text.
 #[derive(Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct BriefOccurrence {
     start: usize,
     end: usize,

@@ -104,6 +104,7 @@ pub fn system_arial(face: Face) -> Option<&'static [u8]> {
 /// A bookmark: its title, the page it opens (with the view its source gave it) or the inert action it takes, and
 /// the bookmarks under it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct Outline {
     pub title: String,

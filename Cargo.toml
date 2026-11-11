@@ -33,7 +33,7 @@ ppdoc = ["pdf", "legal-pdf-support/ppdoc"]
 doc = ["pdf", "legal-pdf-core/ort-runtime", "legal-pdf-structure/encoder"]
 full = ["language", "indra", "ppdoc", "doc"]
 # TypeScript declarations of the types the engine hands JavaScript (the engine's export-types), never a runtime build.
-binding-types = ["legal-pdf-core?/binding-types", "legal-pdf-support?/binding-types", "legal-pdf-extraction-processor?/binding-types", "legal-pdf-pages?/binding-types"]
+binding-types = ["legal-pdf-core?/binding-types", "legal-pdf-support?/binding-types", "legal-pdf-extraction-processor?/binding-types", "legal-pdf-pages?/binding-types", "legal-pdf-language?/binding-types"]
 # The command-line tools, which run this checkout's structure engine.
 cli = ["pdf", "legal-pdf-core/structure-analysis"]
 

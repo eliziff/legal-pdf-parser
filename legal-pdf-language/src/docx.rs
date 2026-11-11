@@ -266,6 +266,7 @@ static BOOKMARK_ID: LazyLock<Regex> = LazyLock::new(|| literal(r#"<w:bookmark(?:
 static BOOKMARK_NAME: LazyLock<Regex> = LazyLock::new(|| literal(r#"<w:bookmarkStart\b[^>]*\bw:name=(?:"([^"]*)"|'([^']*)')"#));
 
 #[derive(Debug, serde::Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct DocxSupraCleanup {
     /// The document as rewritten, returned beside its counts.
     #[serde(skip)]
