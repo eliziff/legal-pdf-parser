@@ -8,7 +8,9 @@ mod page_map;
 mod supplied_ocr;
 
 #[cfg(feature = "pdf")]
-pub use contract::{prepare_pdf_document, read_pdf, PdfDocument, PdfRequest, PdfSummary};
+pub use contract::{read_pdf, PdfDocument, PdfRequest, PdfSummary};
+#[cfg(feature = "pdf")]
+pub use engine::pdf_cache_key;
 /// Recognized pages so far, and pages to recognize, as recognition proceeds.
 pub type RecognitionProgress<'a> = Option<&'a (dyn Fn(usize, usize) + Sync)>;
 #[cfg(feature = "pdf")]

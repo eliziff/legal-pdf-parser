@@ -577,40 +577,13 @@ fn parsed_pdf(
         }
         return Ok(cached);
     }
-    let identity = document_identity();
-    #[cfg(feature = "ocr")]
-    let mut ocr_prepared = profile::measure("provider_identity_ocr", || options.ocr.as_ref().map(OcrProvider::prepare).transpose())
-        .map_err(|error| error.failure(FailureKind::OcrRuntime))?;
-    #[cfg(feature = "ocr")]
-    let ocr_identity = ocr_prepared.as_ref().map(|provider| (provider.name().to_owned(), provider.identity().to_owned()));
-    #[cfg(not(feature = "ocr"))]
-    let ocr_identity: Option<(String, String)> = None;
-    #[cfg(feature = "ppdoc")]
-    let mut ppdoc_prepared = profile::measure("provider_identity_ppdoc", || options.ppdoc.as_ref().map(PPDocLayout::new).transpose())
-        .map_err(|error| error.failure(FailureKind::LayoutRuntime))?;
-    #[cfg(feature = "ppdoc")]
-    let ppdoc_identity = ppdoc_prepared.as_ref().map(|provider| provider.identity().to_owned());
-    #[cfg(not(feature = "ppdoc"))]
-    let ppdoc_identity: Option<String> = None;
-    let ocr_identity = match &options.supplied_ocr {
-        Some(supplied) => Some(("supplied".to_owned(), supplied.identity(&source_hash)?)),
-        None => ocr_identity,
-    };
-    let ocr_pair = ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
-    let key = cache_key(&source_hash, identity, ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile)?;
+    let (key, providers) = reading(&source_hash, options)?;
     if let Some(cached) = cached_document(&cache_root, &key, &source_hash) {
         validate_output_size(&cached, options)?;
         return Ok(Some(cached));
     }
     let Some(bytes) = bytes else {
         return Ok(None);
-    };
-    let providers = Providers {
-        ocr_identity,
-        #[cfg(feature = "ocr")]
-        ocr: ocr_prepared.take(),
-        #[cfg(feature = "ppdoc")]
-        ppdoc: ppdoc_prepared.take(),
     };
     let extracted = recognized_extraction(bytes, &source_hash, options, Some(&cache_root), providers, progress, require_cache_write)?;
     let parsed = derive_document(extracted, &source_hash, &key, options.profile, None)?;
@@ -622,6 +595,46 @@ fn parsed_pdf(
         Err(_) => {}
     }
     Ok(Some(parsed))
+}
+
+/// The cache key the reading `options` asks for of the PDF with `source_hash` is kept under, and the providers
+/// that reading is made with, prepared (their identities are part of the key).
+fn reading(source_hash: &str, options: &PdfRequest) -> Result<(String, Providers)> {
+    #[cfg(feature = "ocr")]
+    let ocr_prepared = profile::measure("provider_identity_ocr", || options.ocr.as_ref().map(OcrProvider::prepare).transpose())
+        .map_err(|error| error.failure(FailureKind::OcrRuntime))?;
+    #[cfg(feature = "ocr")]
+    let ocr_identity = ocr_prepared.as_ref().map(|provider| (provider.name().to_owned(), provider.identity().to_owned()));
+    #[cfg(not(feature = "ocr"))]
+    let ocr_identity: Option<(String, String)> = None;
+    #[cfg(feature = "ppdoc")]
+    let ppdoc_prepared = profile::measure("provider_identity_ppdoc", || options.ppdoc.as_ref().map(PPDocLayout::new).transpose())
+        .map_err(|error| error.failure(FailureKind::LayoutRuntime))?;
+    #[cfg(feature = "ppdoc")]
+    let ppdoc_identity = ppdoc_prepared.as_ref().map(|provider| provider.identity().to_owned());
+    #[cfg(not(feature = "ppdoc"))]
+    let ppdoc_identity: Option<String> = None;
+    let ocr_identity = match &options.supplied_ocr {
+        Some(supplied) => Some(("supplied".to_owned(), supplied.identity(source_hash)?)),
+        None => ocr_identity,
+    };
+    let ocr_pair = ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
+    let key = cache_key(source_hash, document_identity(), ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile)?;
+    Ok((key, Providers {
+        ocr_identity,
+        #[cfg(feature = "ocr")]
+        ocr: ocr_prepared,
+        #[cfg(feature = "ppdoc")]
+        ppdoc: ppdoc_prepared,
+    }))
+}
+
+/// The cache key a reading of a PDF would be kept under, without reading it: the PDF is named by the request's
+/// expected source hash.
+pub fn pdf_cache_key(options: &PdfRequest) -> Result<String> {
+    let source_hash = options.expected_source_sha256.as_deref()
+        .ok_or_else(|| Error::Message("A PDF's cache key requires expected_source_sha256".to_owned()))?;
+    Ok(reading(source_hash, options)?.0)
 }
 
 /// The providers a parse reads its pages with, prepared: its recognizer and the identity its

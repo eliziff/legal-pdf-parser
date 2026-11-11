@@ -206,7 +206,7 @@ fn pdf_inspector_gate_command(arguments: &[String]) -> Result<i32> {
             "cacheDir": cache_dir,
             "expectedSourceSha256": entry.sha256,
         }))?;
-        let document = read_pdf(Some(&bytes), &request)?.ok_or_else(|| Error::Message("PDF cache miss after parsing source bytes".to_owned()))?;
+        let document = read_pdf(Some(&bytes), &request, None)?.ok_or_else(|| Error::Message("PDF cache miss after parsing source bytes".to_owned()))?;
         if document.page_count() != entry.pages {
             return Err(Error::Message(format!(
                 "PDF Inspector page count mismatch: {} expected {}, got {}",

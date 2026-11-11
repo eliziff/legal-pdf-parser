@@ -108,15 +108,10 @@ fn unsupported<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Resul
     Err(D::Error::custom("this legalpdf binary was built without the provider the request names"))
 }
 
-/// The PDF's document as `request` asks for it: read from its parse cache, or, given its bytes, parsed. None where
-/// there are no bytes and nothing is cached, or where the request names a cache key no longer cached.
-pub fn read_pdf(bytes: Option<&[u8]>, request: &PdfRequest) -> Result<Option<PdfDocument>> {
-    parse_pdf(bytes, request, None, false)
-}
-
-/// Prepares the PDF and caches its reading, reporting recognized pages of the pages to recognize as they finish.
-pub fn prepare_pdf_document(bytes: &[u8], request: &PdfRequest, progress: RecognitionProgress<'_>) -> Result<PdfSummary> {
-    let document = parse_pdf(Some(bytes), request, progress, true)?
-        .ok_or_else(|| crate::Error::Message("PDF cache miss after parsing source bytes".to_owned()))?;
-    Ok(document.summary().clone())
+/// The PDF's document as `request` asks for it: read from its parse cache, or, given its bytes, parsed and cached
+/// (failing where the cache cannot be written, since its cache key is how the reading is found again), reporting
+/// recognized pages of the pages to recognize as they finish. None where there are no bytes and nothing is cached, or
+/// where the request names a cache key no longer cached.
+pub fn read_pdf(bytes: Option<&[u8]>, request: &PdfRequest, progress: RecognitionProgress<'_>) -> Result<Option<PdfDocument>> {
+    parse_pdf(bytes, request, progress, bytes.is_some())
 }
