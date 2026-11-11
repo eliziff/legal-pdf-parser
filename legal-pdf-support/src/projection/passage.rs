@@ -25,6 +25,10 @@ pub struct PassageTarget {
     #[serde(default)]
     #[cfg_attr(feature = "binding-types", ts(optional))]
     pub instrument: Option<String>,
+    /// An item of the paragraph's list the locator names ("b" of "para 12, item (b)").
+    #[serde(default)]
+    #[cfg_attr(feature = "binding-types", ts(optional))]
+    pub item: Option<String>,
     /// The quotations to place in the passage: each whole, or the part of its text a selection names.
     #[serde(default)]
     #[cfg_attr(feature = "binding-types", ts(as = "Option<Vec<String>>", optional))]
@@ -169,7 +173,16 @@ impl PdfDocument {
     fn passage_of(&self, query: &legal_document_query::DocumentQuery, target: &PassageTarget) -> (PdfLookupStatus, Vec<ScalarRange>, Vec<u32>) {
         if target.locator_kind == "paragraph" {
             let (status, ranges) = self.paragraph_source_ranges(&target.locator);
-            return (status, ranges, Vec::new());
+            let Some(item) = target.item.as_deref() else { return (status, ranges, Vec::new()) };
+            // An item of the paragraph: the one list item among its printings with that label, with what is set under it.
+            let items = self.structure.nodes.iter().filter(|node| node.kind == NodeKind::ListItem
+                && node.label.as_deref().is_some_and(|label| label.trim_start_matches('(').trim_end_matches(['.', ')']) == item)
+                && ranges.iter().any(|range| range.start <= node.range.start && node.range.start < range.end)).collect::<Vec<_>>();
+            return match items[..] {
+                [node] => (status, if node.extent.is_empty() { node.ranges.clone() } else { node.extent.clone() }, Vec::new()),
+                [] => (PdfLookupStatus::NotFound, Vec::new(), Vec::new()),
+                _ => (PdfLookupStatus::Ambiguous, Vec::new(), Vec::new()),
+            };
         }
         if let Some(physical) = target.physical_pages.as_ref().filter(|_| target.locator_kind == "page") {
             let pages = physical.iter().copied().filter(|page| *page > 0 && (*page as usize) <= self.page_count()).collect::<Vec<_>>();
