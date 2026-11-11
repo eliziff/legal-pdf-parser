@@ -22,11 +22,10 @@ use std::collections::{BTreeMap, HashMap};
 use legal_pdf_core::regex;
 use legal_pdf_core::model::{Diagnostic, Page};
 use legal_structure_model::text::{label_prefix, line_start_label_prefix, normalize_label};
-use crate::fences::fences::Fences;
-use crate::model::{PageView, Role, Runs, Slot, Slots};
-use crate::model::evidence::Evidence;
-use crate::notes::band::{Document, NoteKind, read_band, separator_tolerance, verified_endnotes};
-use crate::notes::lines::endnote_heading;
+use crate::fences::Fences;
+use crate::model::{Evidence, PageView, Role, Runs, Slot, Slots};
+use crate::notes::endnote_heading;
+use crate::notes::band::{read_band, separator_tolerance, verified_endnotes, Document, NoteKind};
 use crate::notes::lanes::note_promotions;
 
 /// A line saying a note runs on across the page: "(Footnote continued…)", "Notes continued".

@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use legal_pdf_core::Line;
-use super::{ColumnKind, ColumnModel, has_valid_bbox, line_center_x, line_width};
+use super::{has_valid_bbox, line_center_x, line_width, ColumnKind, ColumnModel};
 use super::note_lines::{aligned_note_body_among, standalone_note_label};
 
 /// The text items of the page's lines `keep` holds, taken from the page's items (`page_items`),

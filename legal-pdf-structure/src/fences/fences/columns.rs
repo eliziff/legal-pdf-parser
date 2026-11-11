@@ -1,10 +1,8 @@
 //! Each page's columns, read on the words the fences before them left, and the parallel translation's lines.
 use std::collections::HashMap;
 use legal_pdf_core::model::Page;
-use crate::layout::columns::columns_of;
-use crate::layout::language::translation_lines;
-use crate::model::{PageView, Role, Slot, Slots};
-use crate::model::evidence::Evidence;
+use crate::layout::{columns_of, translation_lines};
+use crate::model::{Evidence, PageView, Role, Slot, Slots};
 use crate::tables::PageItems;
 use super::Fences;
 

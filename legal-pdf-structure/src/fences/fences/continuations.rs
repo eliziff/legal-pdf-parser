@@ -1,9 +1,8 @@
 //! How each line goes on with the line before it, and the statute's running heads its spine bears out.
 use legal_pdf_core::model::Page;
-use crate::headings::native::{body_flow_edge, carries_a_sentence_onto, continues_prose_from};
-use crate::model::{Role, Rule, Slot, Slots};
-use crate::model::evidence::Evidence;
-use crate::notes::lines::reference_wrapped_onto;
+use crate::headings::{body_flow_edge, carries_a_sentence_onto, continues_prose_from};
+use crate::model::{Evidence, Role, Rule, Slot, Slots};
+use crate::notes::reference_wrapped_onto;
 use super::{Continuation, Fences};
 
 impl Fences {

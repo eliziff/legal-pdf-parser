@@ -2,7 +2,7 @@
 //! them, and a whole document recognized.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use legal_pdf_core::{Error, OcrLine, OcrPageRequest, PdfOcrProvider, Result, regex};
+use legal_pdf_core::{regex, Error, OcrLine, OcrPageRequest, PdfOcrProvider, Result};
 use legal_pdf_core::model::{Diagnostic, Line, Page, Word};
 use super::ExtractedPdf;
 use super::pictures::place_picture_lines;

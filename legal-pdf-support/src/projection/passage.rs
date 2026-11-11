@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use legal_pdf_core::model::{Page, ScalarRange};
-use legal_structure_model::{NodeKind, ScalarText, utf16_len};
+use legal_structure_model::{utf16_len, NodeKind, ScalarText};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 use super::document::PdfDocument;

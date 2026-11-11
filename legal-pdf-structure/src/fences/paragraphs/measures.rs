@@ -4,9 +4,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use legal_pdf_core::model::Page;
 use crate::fences::fences::Fences;
-use crate::model::{Role, Slot, Slots};
-use crate::model::evidence::Evidence;
-use super::{QUOTED_INDENT, Stream};
+use crate::model::{Evidence, Role, Slot, Slots};
+use super::{Stream, QUOTED_INDENT};
 
 /// Where each page's text stands.
 pub(crate) struct PageMeasures<'a> {

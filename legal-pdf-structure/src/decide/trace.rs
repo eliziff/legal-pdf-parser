@@ -4,9 +4,8 @@
 //! trace or without one.
 
 use legal_pdf_core::model::Page;
-use crate::fences::fences::Fences;
-use crate::model::{Runs, Slot, Slots};
-use crate::model::evidence::{Evidence, MarkerReading};
+use crate::fences::Fences;
+use crate::model::{Evidence, MarkerReading, Runs, Slot, Slots};
 use super::notes::Notes;
 use super::residual::{LOOK, OWN};
 use super::rules::Decision;

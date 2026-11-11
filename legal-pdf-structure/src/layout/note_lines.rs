@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use legal_pdf_core::Line;
 use legal_structure_model::text::{is_note_symbol, MAX_SYMBOL_LABEL_LEN};
-use super::{ColumnKind, line_center_x, line_width};
+use super::{line_center_x, line_width, ColumnKind};
 use super::columns::{columns_of, kept_items, note_column_model};
 
 pub(crate) fn band_geometry_top(line: &Line) -> f64 {

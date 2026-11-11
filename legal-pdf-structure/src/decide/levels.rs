@@ -8,17 +8,17 @@
 use legal_pdf_core::model::{Page, PdfOutlineEntry};
 use pdf_inspector::markdown::has_dot_leaders;
 use crate::headings;
-use crate::fences::fences::Fences;
-use crate::layout::Geometry;
-use crate::model::{Role, Slot, Slots};
-use crate::model::evidence::{Evidence, SourceTag};
-use crate::text::text::enumerated;
-use super::residual::{apart, Families, Look, look_of, marker_alone};
-use super::rules::{body_like, Decision, OutlineAnchor, Sequences};
-use crate::headings::rules::{ladder_levels, ATTACHMENTS};
+use crate::fences::Fences;
 use crate::headings::bookmarks::{
-    classify, generic_title, normalize_title, restack, same_title, validate, Entry, Tier, BACKFILL_MAX_TITLE, MAX_TITLE_LINES,
+    classify, generic_title, normalize_title, restack, same_title, validate, Entry, Tier, BACKFILL_MAX_TITLE,
+    MAX_TITLE_LINES,
 };
+use crate::headings::rules::{ladder_levels, ATTACHMENTS};
+use crate::layout::Geometry;
+use crate::model::{Evidence, Role, Slot, Slots, SourceTag};
+use crate::text::text::enumerated;
+use super::residual::{apart, look_of, marker_alone, Families, Look};
+use super::rules::{body_like, Decision, OutlineAnchor, Sequences};
 
 /// The lines the document's outline names (`OutlineAnchor`), and where each frame entry of it opens,
 /// as (document, parallel translation, place in the reading order).

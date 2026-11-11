@@ -27,14 +27,16 @@ use super::lines::{
 };
 use legal_pdf_core::model::{Diagnostic, Line, Page};
 use legal_pdf_core::median;
-use crate::headings::recognized_page;
-use crate::layout::{ColumnKind, 
-    aligned_note_body_among, band_geometry_top, columns_of, kept_items, line_center_x, line_width, margin_note_model,
-    standalone_note_label, ColumnModel,
-};
-use crate::model::{Evidence, NoteLabel, PageView, Role, Slot, Slots, SourceTag, SUPPRESS_COMMA, SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED};
 use crate::fences::Fences;
-use crate::layout::layout_labelled;
+use crate::headings::recognized_page;
+use crate::layout::{
+    aligned_note_body_among, band_geometry_top, columns_of, kept_items, layout_labelled, line_center_x, line_width,
+    margin_note_model, standalone_note_label, ColumnKind, ColumnModel,
+};
+use crate::model::{
+    Evidence, NoteLabel, PageView, Role, Slot, Slots, SourceTag, SUPPRESS_COMMA, SUPPRESS_CORNER, SUPPRESS_FOOT,
+    SUPPRESS_WRAPPED,
+};
 use crate::text::text::all_caps;
 use legal_structure_model::text::{is_note_symbol, label_prefix, line_start_label_prefix, LabelPrefix};
 use std::collections::BTreeSet;

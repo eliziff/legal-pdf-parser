@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use legal_pdf_core::model::{Page, ScalarRange};
-use legal_structure_model::{DocumentStructure, NodeKind, ScalarText, serialization_sha256, StructureNode, utf16_len};
+use legal_structure_model::{serialization_sha256, utf16_len, DocumentStructure, NodeKind, ScalarText, StructureNode};
 use serde::{Deserialize, Serialize};
 use super::{LOCATOR_KINDS, MAX_CONTEXT, MAX_RETURN_CHARS, MAX_UNITS};
 use super::document::{lookup_payload_sha256, page_confidence, page_index, page_number, PdfDocument};

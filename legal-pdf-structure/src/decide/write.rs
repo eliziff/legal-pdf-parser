@@ -17,13 +17,14 @@
 use std::collections::BTreeMap;
 use legal_pdf_core::model::{Line, Page};
 use crate::headings;
-use crate::fences::fences::Fences;
-use crate::model::{Role, Rule, Slot, Slots};
-use crate::model::evidence::{Evidence, WORD_COURT, WORD_DATE, WORD_FIELD, WORD_JURAT, WORD_LABEL, WORD_PARTY};
+use crate::fences::Fences;
+use crate::model::{
+    Evidence, Role, Rule, Slot, Slots, WORD_COURT, WORD_DATE, WORD_FIELD, WORD_JURAT, WORD_LABEL, WORD_PARTY,
+};
 use crate::notes::band::NoteKind;
+use crate::text::paragraphs::{measure_of, paragraphs_of, Measure};
 use super::notes::Notes;
 use super::rules::Decision;
-use crate::text::paragraphs::{measure_of, paragraphs_of, Measure};
 use legal_structure_model::UnitRole;
 use legal_pdf_core::model::{LineZone, NoteLine, NoteMode, NotePage};
 

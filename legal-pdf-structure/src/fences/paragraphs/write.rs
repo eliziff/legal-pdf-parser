@@ -1,7 +1,7 @@
 //! A stream's text, written as a provider writes a decision: a block to a line.
 
 use std::collections::{HashMap, HashSet};
-use legal_pdf_core::model::{Line, sentence_ended};
+use legal_pdf_core::model::{sentence_ended, Line};
 use crate::model::Slot;
 use super::{Reading, Stream};
 

@@ -1,22 +1,20 @@
 //! What the parser's scorer reads of each line before it reads any state: the line set against its
 //! page and its document (place, gaps, type, look and how common the look is, ink, its column), the
 //! shape of its text, and what the readers found on it (its marker's readings, a note label, reference
-//! marks, the words the lexicon knows, a furniture edge, a table cell, the note band). Nothing here is
-//! a decision: every value is measured on the pages or read by an evidence reader.
+//! marks, the words the lexicon knows, a table cell). Each value is measured on the pages or read by an
+//! evidence reader, but for what t0 decided: its furniture, its note band and the T0 row (`measure`).
 
 use std::collections::{HashMap, HashSet};
 use legal_pdf_core::model::{Line, Page};
-use crate::decide::notes::Notes;
-use crate::decide::rules::Decision;
+use crate::decide::{Decision, Notes};
 use crate::evidence::{marker_readings, reference_spans};
-use crate::fences::fences::Fences;
-use crate::model::{Held, Slot, Slots};
-use crate::model::evidence::{
-    Evidence, LOOK_BOLD, LOOK_CAPS, LOOK_ITALIC, MarkerReading, REFERENCE_DETACHED, REFERENCE_GLUED, REFERENCE_RAISED,
-    REFERENCE_SUPERSCRIPT, WORD_DIVISION,
+use crate::fences::Fences;
+use crate::layout::Geometry;
+use crate::model::{
+    Evidence, Held, MarkerReading, Role, Slot, Slots, LOOK_BOLD, LOOK_CAPS, LOOK_ITALIC, REFERENCE_DETACHED,
+    REFERENCE_GLUED, REFERENCE_RAISED, REFERENCE_SUPERSCRIPT, WORD_DIVISION,
 };
 use legal_pdf_core::{flag_share, text_shape, BOLD, ITALIC, MONOSPACED, SUPERSCRIPT};
-use crate::layout::Geometry;
 
 /// The names of a line's own features, in order.
 pub(crate) const LINE_FEATURES: &[&str] = &[
@@ -127,25 +125,13 @@ impl Looks {
 const COUNTS: [&str; 9] = ["1", "1.1", "1.1.1", "1.1.1.1", "a", "A", "i", "I", "bullet"];
 const WRAPS: [&str; 5] = ["()", "[]", ")", ".", ""];
 
-/// Whether each line (in `order`) stands at its page's top or bottom tenth with a text, figures aside,
-/// that lines there on three pages or more print: a running head or foot, measured, not fenced.
-fn repeated_at_edges(pages: &[Page], slots: &Slots, order: &[Slot]) -> Vec<bool> {
-    let key = |slot: Slot| -> Option<String> {
-        let page = &pages[slots.page(slot)];
-        let line = slots.line(pages, slot);
-        let height = page.height.max(1.0);
-        let edge = line.bbox[3] <= 0.1 * height || line.bbox[1] >= 0.9 * height;
-        let text: String = line.text.chars().filter(|c| c.is_alphabetic()).flat_map(char::to_lowercase).collect();
-        (edge && text.chars().count() >= 3).then_some(text)
-    };
-    let mut pages_of: HashMap<String, HashSet<usize>> = HashMap::new();
-    let keys: Vec<Option<String>> = order.iter().map(|&slot| key(slot)).collect();
-    for (k, found) in keys.iter().enumerate() {
-        if let Some(text) = found {
-            pages_of.entry(text.clone()).or_default().insert(slots.page(order[k]));
-        }
-    }
-    keys.iter().map(|found| found.as_ref().is_some_and(|text| pages_of[text].len() >= 3)).collect()
+/// A reading's family as the line features read it: whether a division's word opens it ("Section:():1"), and its
+/// count's and wrap's places among `COUNTS` and `WRAPS`.
+pub(crate) fn marker_family(reading: &MarkerReading) -> (bool, Option<usize>, Option<usize>) {
+    let family = reading.family.as_str();
+    let (word, plain) = if family.matches(':').count() > 1 { family.split_once(':').unwrap_or(("", family)) } else { ("", family) };
+    let (wrap, count) = plain.rsplit_once(':').unwrap_or(("", plain));
+    (!word.is_empty(), COUNTS.iter().position(|c| *c == count), WRAPS.iter().position(|c| *c == wrap))
 }
 
 /// The line's text with its opening token read as recognition likely misread it (`confusions`, each
@@ -250,7 +236,6 @@ impl LineTable {
         }).collect();
         let off_grid: Vec<usize> = pages.iter().map(|page| legal_pdf_core::off_grid_sizes(page.lines.iter().filter(|line| !line.exclude_from_body))).collect();
         let looks = Looks::tally(pages, slots, evidence);
-        let repeated = repeated_at_edges(pages, slots, order);
         let page_count = pages.len().max(1) as f64;
         let mut own = vec![0f32; n * WIDTH];
         for (k, &slot) in order.iter().enumerate() {
@@ -314,29 +299,22 @@ impl LineTable {
                 flag(evidence.references[at] & REFERENCE_SUPERSCRIPT != 0), flag(evidence.references[at] & REFERENCE_DETACHED != 0),
                 flag(evidence.references[at] & REFERENCE_RAISED != 0), flag(evidence.references[at] & REFERENCE_GLUED != 0),
                 flag(evidence.title_shaped[at]), flag(evidence.beside[at].is_some()), flag(evidence.line_number[at]),
-                flag(repeated[k]), flag(fences.cell[at] > 0),
-                flag(evidence.pages[p].separator.is_some_and(|y| line.bbox[1] >= y)), flag(fences.at(at).translation),
+                // t0's furniture (a running head or foot, a folio) and its note band.
+                flag(matches!(decision.role[at], Role::Furniture | Role::PageLabel)), flag(fences.cell[at] > 0),
+                flag(fences.band[at]), flag(fences.at(at).translation),
             ]);
             let found = &readings[k];
             let mut marker = [0.0f64; 20];
             if let Some(first) = found.first() {
-                let (word, plain) = match first.family.matches(':').count() {
-                    0 | 1 => ("", first.family.as_str()),
-                    _ => first.family.split_once(':').unwrap_or(("", first.family.as_str())),
-                };
-                let (wrap, count) = plain.rsplit_once(':').unwrap_or(("", plain));
+                let (word, count, wrap) = marker_family(first);
                 marker[0] = 1.0;
-                marker[1] = flag(!word.is_empty());
+                marker[1] = flag(word);
                 marker[2] = (1.0 + f64::from(first.value)).ln();
                 marker[3] = first.prefix.len() as f64;
                 marker[4] = flag(found.len() > 1);
                 marker[5] = flag(evidence.marker[at].is_some_and(|m| m.only));
-                if let Some(c) = COUNTS.iter().position(|c| *c == count) {
-                    marker[6 + c] = 1.0;
-                }
-                if let Some(c) = WRAPS.iter().position(|c| *c == wrap) {
-                    marker[15 + c] = 1.0;
-                }
+                count.into_iter().for_each(|c| marker[6 + c] = 1.0);
+                wrap.into_iter().for_each(|c| marker[15 + c] = 1.0);
             }
             values.extend(marker);
             debug_assert_eq!(values.len(), LINE_FEATURES.len());

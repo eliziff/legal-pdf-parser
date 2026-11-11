@@ -2,7 +2,7 @@
 
 use legal_pdf_core::model::sentence_ended;
 use crate::model::{Role, Slot};
-use super::{QUOTED_INDENT, Reading, Stream};
+use super::{Reading, Stream, QUOTED_INDENT};
 use super::notes::NoteWalk;
 
 /// The most letters and figures a recognizer's reading of a folio holds.

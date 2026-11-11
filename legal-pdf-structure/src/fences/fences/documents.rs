@@ -1,8 +1,7 @@
 //! Each line's constituent document, and which documents are transcripts.
 use legal_pdf_core::model::PdfOutlineEntry;
 use crate::constituents;
-use crate::model::{PageView, Role, Slot, Slots};
-use crate::model::evidence::{Evidence, WORD_SPEAKER};
+use crate::model::{Evidence, PageView, Role, Slot, Slots, WORD_SPEAKER};
 use super::Fences;
 
 impl Fences {

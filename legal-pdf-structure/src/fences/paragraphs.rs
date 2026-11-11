@@ -2,9 +2,8 @@
 //! keeps, and what the reader of its text holds of them.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use legal_pdf_core::model::{Page, sentence_ended};
-use crate::model::{Held, Paragraphs, Role, Slot, Slots};
-use crate::model::evidence::Evidence;
+use legal_pdf_core::model::{sentence_ended, Page};
+use crate::model::{Evidence, Held, Paragraphs, Role, Slot, Slots};
 use super::fences::Fences;
 
 pub(crate) mod ends;

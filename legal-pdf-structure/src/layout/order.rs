@@ -2,9 +2,9 @@
 //! source's and the geometry's), a drop cap joined to its line, furniture last, a transcript's turns
 //! kept. Orders are slots of the page's lines.
 
-use legal_pdf_core::{Diagnostic, Line, median, Page};
+use legal_pdf_core::{median, Diagnostic, Line, Page};
 use crate::tables::has_table_caption;
-use super::{ColumnKind, ColumnModel, has_valid_bbox, line_center_x, line_center_y, line_width};
+use super::{has_valid_bbox, line_center_x, line_center_y, line_width, ColumnKind, ColumnModel};
 use super::columns::{column_switches, inspected_order, kept_items, margin_lane, median_column_run};
 use super::note_lines::{band_geometry_top, order_note_lines, read_rows, weave_note_columns};
 

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use legal_pdf_core::median;
 use legal_pdf_core::model::{Line, Page};
 use pdf_inspector::types::{PdfLine, PdfRect};
-use super::geometry::{PageGeometry, PageGeometryMap, round3, transform_point};
+use super::geometry::{round3, transform_point, PageGeometry, PageGeometryMap};
 use super::lines::begins_with_note_label;
 
 /// The page's `index`th region of `kind` drawn (a rule, a rectangle), counted from 1.

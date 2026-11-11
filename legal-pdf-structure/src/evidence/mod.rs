@@ -9,25 +9,23 @@
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use legal_pdf_core::{flag_share, layout_analysis, median};
 use crate::furniture::compact_note_line;
-use crate::headings::native::{bold_char_share, date_line};
-use crate::headings::{self, captions, contents_lists};
+use crate::headings::{self, bold_char_share, captions, contents_lists, date_line};
+use crate::model::{
+    Cited, Evidence, Marker, MarkerReading, NoteLabel, PageEvidence, Rows, Slot, Slots, SourceTag, LOOK_BOLD, LOOK_CAPS,
+    LOOK_ITALIC, LOOK_UNDERLINED, REFERENCE_DETACHED, REFERENCE_GLUED, REFERENCE_RAISED, REFERENCE_SUPERSCRIPT,
+    SUPPRESS_COMMA, SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED, WORD_AUTHOR, WORD_CITATION_TITLE, WORD_CLOSING,
+    WORD_CONTENTS_TITLE, WORD_COURT, WORD_DATE, WORD_DIVISION, WORD_EXAMINATION, WORD_FIELD, WORD_HEARING_PART,
+    WORD_HISTORY, WORD_INDEX_ENTRY, WORD_INDEX_LETTER, WORD_JURAT, WORD_LABEL, WORD_NOTES_HEADING, WORD_PARTY,
+    WORD_REASONS, WORD_RESET_HEADING, WORD_SIGNATURE, WORD_SPEAKER, WORD_TRANSCRIPT_PART, WORD_TURN, WORD_WITNESS,
+};
 use crate::notes::{endnote_heading, label_is_raised, label_spans, reference_wrapped_onto, structural_reset_heading};
+use crate::tables::PageItems;
 use crate::text::text::{all_caps, party_label};
 use legal_pdf_core::model::sentence_ended;
 use legal_structure_model::text::{is_note_symbol, label_prefix, normalize_label};
 use regex::Regex;
 use std::collections::HashMap;
-use crate::model::evidence::{
-    Cited, Evidence, LOOK_BOLD, LOOK_CAPS, LOOK_ITALIC, LOOK_UNDERLINED, Marker, MarkerReading, NoteLabel, PageEvidence,
-    REFERENCE_DETACHED, REFERENCE_GLUED, REFERENCE_RAISED, REFERENCE_SUPERSCRIPT, Rows, SourceTag, SUPPRESS_COMMA,
-    SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED, WORD_AUTHOR, WORD_CITATION_TITLE, WORD_CLOSING,
-    WORD_CONTENTS_TITLE, WORD_COURT, WORD_DATE, WORD_DIVISION, WORD_EXAMINATION, WORD_FIELD, WORD_HEARING_PART,
-    WORD_HISTORY, WORD_INDEX_ENTRY, WORD_INDEX_LETTER, WORD_JURAT, WORD_LABEL, WORD_NOTES_HEADING, WORD_PARTY,
-    WORD_REASONS, WORD_RESET_HEADING, WORD_SIGNATURE, WORD_SPEAKER, WORD_TRANSCRIPT_PART, WORD_TURN, WORD_WITNESS,
-};
-use crate::model::{Slot, Slots};
 use legal_pdf_core::{dominant_face, regex, CitationSpan, ITALIC};
-use crate::tables::PageItems;
 
 /// Lines in one baseline band are one row, the one row model every reader of rows reads (`Rows`, `Evidence::row`): the
 /// bands of `lines` (each line's box by `bbox`) in their

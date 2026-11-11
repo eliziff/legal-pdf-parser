@@ -1,11 +1,11 @@
 //! The projected document: its pages, lines and words as the reader sees them, and its summary.
 
 use std::sync::{Arc, OnceLock};
-use legal_pdf_core::model::{Page, PARSER_VERSION, PdfExtractionMetadata, ScalarRange};
-use legal_structure_model::{DocumentStructure, NodeKind, ScalarText, serialization_sha256, StructureNode};
+use legal_pdf_core::model::{Page, PdfExtractionMetadata, ScalarRange, PARSER_VERSION};
+use legal_structure_model::{serialization_sha256, DocumentStructure, NodeKind, ScalarText, StructureNode};
 use serde::{Deserialize, Serialize};
 use super::lookup::{
-    PdfLookupRequest, PdfLookupStatus, PdfStructureLookup, PrintedParagraph, rendered_slice, structure_lookup,
+    rendered_slice, structure_lookup, PdfLookupRequest, PdfLookupStatus, PdfStructureLookup, PrintedParagraph,
 };
 
 #[derive(Deserialize, Serialize)]

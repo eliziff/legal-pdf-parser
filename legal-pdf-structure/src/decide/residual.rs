@@ -31,13 +31,14 @@
 //! body's that sits nearer the line above than the text below (a signature block's names, a form's
 //! field).
 
-use legal_pdf_core::model::{Page, sentence_ended};
+use legal_pdf_core::model::{sentence_ended, Page};
 use crate::headings;
-use crate::fences::fences::Fences;
-use crate::headings::native::date_line;
+use crate::fences::Fences;
+use crate::headings::date_line;
 use crate::layout::Geometry;
-use crate::model::{Role, Rule, Slot, Slots};
-use crate::model::evidence::{Evidence, LOOK_BOLD, LOOK_ITALIC, LOOK_UNDERLINED, SourceTag, WORD_DIVISION, WORD_SPEAKER};
+use crate::model::{
+    Evidence, Role, Rule, Slot, Slots, SourceTag, LOOK_BOLD, LOOK_ITALIC, LOOK_UNDERLINED, WORD_DIVISION, WORD_SPEAKER,
+};
 use crate::text::text::all_caps;
 use super::rules::{body_like, Decision, Sequences};
 use super::trace::{

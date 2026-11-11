@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use legal_pdf_core::{Error, Result};
 use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureNode};
 use crate::model::Decided;
-use crate::text::text_index::{PdfTextIndex, source_membership};
+use crate::text::text_index::{source_membership, PdfTextIndex};
 use super::{heading_marker_alone_re, heading_marker_re};
 use legal_structure_model::utf16_len;
 

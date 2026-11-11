@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use legal_structure_model::{NodeKind, ScalarRange};
 use crate::model::Decided;
-use crate::text::text_index::{PdfTextIndex, source_membership};
+use crate::text::text_index::{source_membership, PdfTextIndex};
 use super::outline::OutlineContext;
 
 /// Settle each node's exact membership and role, and give the context its outline lives in: the

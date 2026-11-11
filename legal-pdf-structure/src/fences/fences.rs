@@ -15,8 +15,7 @@ use legal_pdf_core::model::{Diagnostic, Page, PdfOutlineEntry};
 use crate::constituents;
 use crate::headings::contents_lists;
 use crate::layout::ColumnModel;
-use crate::model::{Context, Edge, PageView, Paragraphs, Role, Rule, Slot, Slots};
-use crate::model::evidence::{Evidence, Rows};
+use crate::model::{Context, Decided, Edge, Evidence, PageView, Paragraphs, Role, Rows, Rule, Slot, Slots};
 
 pub(crate) mod band;
 pub(crate) mod columns;
@@ -28,7 +27,6 @@ pub(crate) mod order;
 pub(crate) mod quotations;
 pub(crate) mod tables;
 
-use crate::model::Decided;
 
 /// Why a line goes on with the one before it in reading order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]

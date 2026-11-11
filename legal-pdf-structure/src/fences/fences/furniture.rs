@@ -2,8 +2,7 @@
 use std::collections::HashMap;
 use legal_pdf_core::model::Page;
 use crate::furniture::page_labels_among;
-use crate::model::{PageView, Role, Rule, Slot, Slots};
-use crate::model::evidence::{Evidence, Rows};
+use crate::model::{Evidence, PageView, Role, Rows, Rule, Slot, Slots};
 use super::Fences;
 
 

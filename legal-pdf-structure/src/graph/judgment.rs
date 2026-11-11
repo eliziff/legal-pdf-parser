@@ -4,8 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use legal_pdf_core::model::Page;
 use legal_structure_model::{Derivation, NodeKind, ScalarRange, StructureNode};
-use crate::model::Decided;
-use crate::model::Held;
+use crate::model::{Decided, Held};
 use legal_structure_model::{DocumentStructure, SourceFragment};
 
 /// Write the numbered paragraphs the reading decided. A document it read none in keeps what its pages read.

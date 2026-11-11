@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use legal_pdf_core::model::sentence_ended;
 use crate::model::Slot;
-use super::{QUOTED_INDENT, Reading};
+use super::{Reading, QUOTED_INDENT};
 
 /// A bold line under an elision is a quotation's emphasis.
 fn elided(text: &str) -> bool {
