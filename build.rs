@@ -83,13 +83,6 @@ fn inspector_inputs(root: &Path, skip: &[&str]) -> Vec<PathBuf> {
 /// stage reads tables), its vision models or its Python bindings.
 const NOT_EXTRACTION: &[&str] = &["markdown", "tables", "vision", "python.rs"];
 
-/// The structure stage's crates: its orchestrator and every crate it reads with, so an edit to any of them is a
-/// new structure (and a new reader and document key).
-const STRUCTURE_STAGE: &[&str] = &[
-    "structure", "structure-model", "constituents", "decide", "emit", "evidence", "fences", "furniture", "graph",
-    "headings", "layout", "machine", "notes", "runs", "tables", "text", "tier0", "transition",
-];
-
 fn crate_inputs(root: &Path, name: &str) -> Vec<PathBuf> {
     let owner = root.join(format!("legal-pdf-{name}"));
     let mut inputs = vec![owner.join("Cargo.toml"), owner.join("src")];
@@ -166,9 +159,8 @@ fn stage_inputs(root: &Path, indra: bool) -> [Vec<PathBuf>; 4] {
     // The structure stage reads pdf-inspector's layout too (columns, furniture, leaders, words'
     // joins, heading tiers, tables).
     document.extend(inspector_inputs(root, &[]));
-    for name in STRUCTURE_STAGE {
-        document.extend(crate_inputs(root, name));
-    }
+    // The structure stage, one crate: an edit to it is a new structure (and a new reader and document key).
+    document.extend(crate_inputs(root, "structure"));
     let layout = paths(&[
         "legal-pdf-core/Cargo.toml",
         "legal-pdf-core/src/model.rs",

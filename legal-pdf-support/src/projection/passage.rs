@@ -128,7 +128,7 @@ impl PdfDocument {
     /// Each passage placed on the pages it is read on, with its quotations. A scan not yet read has no geometry; a page
     /// whose own layer reads poorly (a signature's scribble over it) and waits on recognition has its lines, read and
     /// placed as the structure took them.
-    pub fn passage_geometry(&self, targets: Vec<PassageTarget>) -> PassageGeometry {
+    pub fn passage_geometry(&self, query: &legal_document_query::DocumentQuery, targets: Vec<PassageTarget>) -> PassageGeometry {
         let pages = self.passage_pages();
         let unavailable = self.summary.pages_needing_ocr.iter().chain(&self.summary.ocr_routed_pages).copied()
             .filter(|index| pages.get(*index).is_none_or(|page| page.lines.is_empty()))
@@ -140,13 +140,13 @@ impl PdfDocument {
             coordinate_space: "visible_crop_box",
             coordinate_origin: "top_left",
             rotation_applied: true,
-            targets: targets.into_iter().map(|target| self.place(target, &pages, &unavailable)).collect(),
+            targets: targets.into_iter().map(|target| self.place(query, target, &pages, &unavailable)).collect(),
         }
     }
 
     /// The passage's status, its spans of the text and the pages its locator names: a paragraph's every printing, a
     /// page's own pages where they are named, else what a lookup finds (none where it finds several places).
-    fn passage_of(&self, target: &PassageTarget) -> (PdfLookupStatus, Vec<ScalarRange>, Vec<u32>) {
+    fn passage_of(&self, query: &legal_document_query::DocumentQuery, target: &PassageTarget) -> (PdfLookupStatus, Vec<ScalarRange>, Vec<u32>) {
         if target.locator_kind == "paragraph" {
             let (status, ranges) = self.paragraph_source_ranges(&target.locator);
             return (status, ranges, Vec::new());
@@ -155,7 +155,7 @@ impl PdfDocument {
             let pages = physical.iter().copied().filter(|page| *page > 0 && (*page as usize) <= self.page_count()).collect::<Vec<_>>();
             return (if pages.is_empty() { PdfLookupStatus::NotFound } else { PdfLookupStatus::Found }, Vec::new(), pages);
         }
-        let lookup = self.lookup(&PdfLookupRequest {
+        let lookup = self.lookup(query, &PdfLookupRequest {
             instrument: target.instrument.clone(),
             ..PdfLookupRequest::new(&target.locator_kind, &target.locator)
         });
@@ -172,10 +172,10 @@ impl PdfDocument {
         (lookup.status, ranges, pages)
     }
 
-    fn place(&self, target: PassageTarget, pages: &[Page], unavailable: &HashSet<usize>) -> PlacedPassage {
+    fn place(&self, query: &legal_document_query::DocumentQuery, target: PassageTarget, pages: &[Page], unavailable: &HashSet<usize>) -> PlacedPassage {
         let fragments: &[SourceFragment] = &self.structure.source_fragments;
         let whole_page = target.locator_kind == "page";
-        let (status, mut ranges, wanted) = self.passage_of(&target);
+        let (status, mut ranges, wanted) = self.passage_of(query, &target);
         ScalarRange::normalize_union(&mut ranges);
         // The passage's part of each source line, in the line's own UTF-16.
         let mut selected = HashMap::<&str, Vec<ScalarRange>>::new();

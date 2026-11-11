@@ -2,6 +2,7 @@
 //! each locator finds its units.
 
 use super::*;
+use legal_document_query::{note_named, DocumentQuery, Provisions};
 
 /// A paragraph a PDF numbers in print ("[12]", or 12 in the margin): its number and its printings, the structure's
 /// paragraph nodes that print it (a parallel report's columns), the first printing's first, as the structure engine
@@ -161,14 +162,6 @@ pub(crate) fn result(
     }
 }
 
-pub(crate) fn nfkc_text(value: &str) -> Cow<'_, str> {
-    if value.is_ascii() {
-        Cow::Borrowed(value)
-    } else {
-        Cow::Owned(value.nfkc().collect())
-    }
-}
-
 pub(crate) fn range_text(text: &ScalarText<'_>, ranges: &[ScalarRange]) -> String {
     ranges
         .iter()
@@ -184,88 +177,6 @@ pub(crate) fn rendered_slice(
     node: &StructureNode,
 ) -> String {
     range_text(text, &document.query_ranges(node))
-}
-
-/// The PDF's provisions, in the order its text prints them, within `scope` where it is given: a node located by a
-/// kind. A heading's or a constituent document's extent is no provision: it has no identifier to look up; and a
-/// parallel translation's provisions repeat the body's, which is read.
-pub(crate) fn section_nodes(document: &PdfDocument, scope: Option<(usize, usize)>) -> Vec<&StructureNode> {
-    let mut sections: Vec<&StructureNode> = document
-        .structure
-        .nodes
-        .iter()
-        .filter(|node| {
-            node.kind == NodeKind::Section
-                && node.locator_kind.as_deref().is_some_and(|kind| !kind.is_empty())
-                && node.grammar.as_deref() != Some("translation")
-                && scope.is_none_or(|(start, end)| start <= node.range.start && node.range.start < end)
-        })
-        .collect();
-    sections.sort_by_key(|node| node.range.start);
-    sections
-}
-
-/// A heading's words, without a Part's number before them or a note's number after a year, in capitals.
-fn title_words(text: &str) -> Vec<String> {
-    let mut words = text.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty())
-        .map(str::to_uppercase).collect::<Vec<_>>();
-    if words.first().is_some_and(|word| word == "PART") && words.len() > 2 {
-        words.drain(..2);
-    }
-    let year = |word: &String| word.len() == 4 && word.chars().all(|c| c.is_ascii_digit());
-    if words.len() > 1 && words.last().is_some_and(|note| note.len() <= 3 && note.chars().all(|c| c.is_ascii_digit()))
-        && year(&words[words.len() - 2]) {
-        words.pop();
-    }
-    words
-}
-
-/// Where one instrument of a PDF that prints several is printed ("The Constitution Acts 1867 to 1982"): from the
-/// heading that is its title ("CONSTITUTION ACT, 1982", "PART I Canadian Charter of Rights and Freedoms", a note's
-/// number after it read past) to the next heading that is another Act's title in capitals ("CANADA ACT 1982", "LOI
-/// CONSTITUTIONNELLE DE 1867"). A contents list that names it comes before its body: the last heading that is its title
-/// opens it. None where no heading is its title, or where the PDF prints one Act.
-fn instrument_scope(document: &PdfDocument, text: &ScalarText<'_>, instrument: &str) -> Option<(usize, usize)> {
-    let wanted = title_words(instrument);
-    if wanted.is_empty() {
-        return None;
-    }
-    // Each heading's start and own text, in the order the text prints them.
-    let mut headings: Vec<(usize, String)> = document.structure.nodes.iter()
-        .filter(|node| node.kind == NodeKind::Heading || node.role == Some(legal_structure_model::PrimaryRole::Heading))
-        .map(|node| (node.range.start, range_text(text, if node.ranges.is_empty() { std::slice::from_ref(&node.range) } else { &node.ranges })))
-        .collect();
-    headings.sort_by_key(|(start, _)| *start);
-    // Another Act's title: a heading in capitals that ends in its year.
-    let act_title = |text: &str| {
-        let words = title_words(text);
-        !text.chars().any(char::is_lowercase) && words.iter().any(|word| word == "ACT" || word == "LOI")
-            && words.last().is_some_and(|year| year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()))
-    };
-    let acts = headings.iter().filter(|(_, text)| act_title(text)).map(|(_, text)| title_words(text)).collect::<HashSet<_>>();
-    if acts.len() < 2 {
-        return None;
-    }
-    let (at, (start, _)) = headings.iter().enumerate().rev().find(|(_, (_, text))| title_words(text) == wanted)?;
-    let end = headings[at + 1..].iter().find(|(_, text)| act_title(text) && title_words(text) != wanted)
-        .map_or(usize::MAX, |(end, _)| *end);
-    Some((*start, end))
-}
-
-/// The place a Part, Division or Schedule takes as the instrument grammar reads its heading, its kind's mark and label
-/// ("part2", "div2", "scheda": `StructureNode::fragment`): a Part's or Division's number in figures or capital roman
-/// numerals. None for another kind; an empty place for a number neither reads.
-fn container_label(kind: &str, locator: &str) -> Option<String> {
-    match kind {
-        "part" | "division" => {
-            let number = locator.trim().trim_start_matches(|c: char| c.is_alphabetic() && !"IVXLCDM".contains(c)).trim();
-            let value = number.parse::<u32>().ok().or_else(|| legal_structure_model::layout::roman_value(number)
-                .filter(|_| number.chars().all(|c| c.is_ascii_uppercase())));
-            Some(value.map_or_else(String::new, |value| format!("{}{value}", if kind == "part" { "part" } else { "div" })))
-        }
-        "schedule" => Some(format!("sched{}", locator.trim().to_lowercase())),
-        _ => None,
-    }
 }
 
 /// A declared paragraph as a lookup unit: its first printing, with its other printings and the text of them all; trusted
@@ -369,58 +280,15 @@ pub(crate) fn section_unit(
     PdfLookupUnit::new(section, rendered_slice(text, document, section).trim().to_owned(), confidence)
 }
 
-/// A typed section locator's place, as a provision's fragment names it ("s. 5 (2)" is "sec5(2)").
-pub(crate) fn normalized_section(raw: &str) -> Option<String> {
-    match legal_locator::section_locator(&nfkc_text(raw)) {
-        Some(legal_locator::SectionLocator::Section(label)) => Some(format!("sec{label}")),
-        _ => None,
-    }
-}
-
-pub(crate) fn section_alias(raw: &str) -> String {
-    normalized_section(raw).unwrap_or_else(|| {
-        let value = nfkc_text(raw);
-        value
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-    })
-}
-
-pub(crate) fn section_matches(section: &StructureNode,
-    requested_kind: &str,
-    requested: &str,
-) -> bool {
-    if requested_kind != "section" && section.locator_kind.as_deref() != Some(requested_kind) {
-        return false;
-    }
-    if requested_kind == "section"
-        && !section.id.is_empty()
-        && section_alias(&format!("section:{}", section.id)) == requested
-    {
-        return true;
-    }
-    // (A provision is named by its place, its kind's mark and label, a section by its label too, or as it is printed.)
-    let section_label = (legal_structure_model::provision_mark(section.locator_kind.as_deref()) == "sec").then_some(section.label.as_deref()).flatten();
-    section
-        .fragment()
-        .iter()
-        .map(String::as_str)
-        .chain(section_label)
-        .chain(section.aliases.iter().flatten().map(String::as_str))
-        .any(|value| section_alias(value) == requested)
-}
-
 pub(crate) fn exact_footnotes(document: &PdfDocument, notes: &[&StructureNode], locator: &str, input: &PdfLookupRequest) -> Vec<usize> {
-    let query = legal_locator::note_label(locator);
+    let wanted = legal_locator::note_label(locator);
     (0..notes.len()).filter(|&at| {
         let note = notes[at];
         let label = note.label.as_deref().unwrap_or("");
         input.occurrence.is_none_or(|number| notes[..=at].iter().filter(|other| other.label.as_deref().unwrap_or("") == label).count() == number)
             && input.page.is_none_or(|number| note.calls.first().and_then(|call| page_at(document, call.start)) == Some(number)
                 || note.page_indexes.iter().any(|page| *page as u32 + 1 == number))
-            && (legal_locator::note_label(&note.id) == query || legal_locator::note_label(label) == query)
+            && note_named(note, &wanted)
     }).collect()
 }
 
@@ -516,6 +384,7 @@ where
 }
 
 pub(crate) fn structure_lookup(document: &PdfDocument,
+    query: &DocumentQuery,
     input: &PdfLookupRequest,
 ) -> PdfStructureLookup {
     if !input.valid() {
@@ -663,70 +532,22 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         };
         return finish(document, &text, input, notes.len(), start, end, |index| footnote_unit(&text, document, &notes, index));
     }
-    // One instrument of a PDF printing several is read on its own; a PDF printing one is read whole.
-    let scope = input.instrument.as_deref().and_then(|instrument| instrument_scope(document, &text, instrument));
-    let sections = section_nodes(document, scope);
-    // A code's rules are its sections.
-    let kind = if input.locator_kind == "rule" { "section" } else { input.locator_kind.as_str() };
-    let container = container_label(kind, &input.locator).is_some();
-    if kind != "section"
-        && !container
-        && !sections.iter().any(|section| section.locator_kind.as_deref() == Some(kind))
-    {
-        return result(
-            input,
-            PdfLookupStatus::Unavailable,
-            Some(format!("No exact {kind} identifiers exist in this source PDF")),
-        );
-    }
-    // The provisions a locator names: a Part, Division or Schedule the one its heading's label names, any other the one
-    // its label or printing names.
-    let named = |locator: &str| -> Vec<usize> {
-        let label = container_label(kind, locator);
-        let requested = section_alias(locator);
-        (0..sections.len()).filter(|&index| match &label {
-            Some(place) => !place.is_empty() && sections[index].fragment().as_deref() == Some(place.as_str()),
-            None => section_matches(sections[index], kind, &requested),
-        }).collect()
-    };
-    // A range ("49-51", "5-2-5-3", or a locator to an end locator) runs from its first provision through its last,
-    // unless a provision is itself numbered so ("1-2"): its dash is the one both ends are found at.
-    let (first, last) = match end_locator {
-        Some(end) => (named(&input.locator), named(end)),
-        None => {
-            let whole = named(&input.locator);
-            let dashed = || input.locator.char_indices().filter(|(_, c)| matches!(c, '-' | '\u{2013}')).find_map(|(at, dash)| {
-                let (first, last) = (named(input.locator[..at].trim()), named(input.locator[at + dash.len_utf8()..].trim()));
-                (!first.is_empty() && !last.is_empty()).then_some((first, last))
-            });
-            if whole.is_empty() { dashed().unwrap_or_default() } else { (whole.clone(), whole) }
-        }
-    };
-    // A label the body prints twice is ambiguous, as is a range whose last provision is printed before its first.
-    if first.len() > 1 || last.len() > 1 || first.first().zip(last.first()).is_some_and(|(first, last)| first > last) {
-        let mut lookup = result(input, PdfLookupStatus::Ambiguous, None);
-        for index in first.iter().chain(&last) {
-            if !lookup.matches.contains(&sections[*index].id) {
-                lookup.matches.push(sections[*index].id.clone());
-            }
-        }
-        return lookup;
-    }
-    let (Some(&first), Some(&last)) = (first.first(), last.first()) else {
-        return result(input, PdfLookupStatus::NotFound, None);
-    };
+    // The provisions the locator names, as the query reads them for every document (`DocumentQuery::provisions`).
+    let kind = input.locator_kind.as_str();
     let pages: HashMap<_, _> = document.page_nodes().map(|page| (page_index(page), page)).collect();
-    if first == last {
-        return finish(document, &text, input, sections.len(), first, first, |index| {
-            section_unit(&document.structure, &text, &document.summary.page_text_quality, &pages, sections[index])
-        });
+    match query.provisions(&document.structure, kind, &input.locator, end_locator, input.instrument.as_deref(), true) {
+        Provisions::Unavailable => {
+            let kind = if kind == "rule" { "section" } else { kind };
+            result(input, PdfLookupStatus::Unavailable, Some(format!("No exact {kind} identifiers exist in this source PDF")))
+        }
+        Provisions::NotFound => result(input, PdfLookupStatus::NotFound, None),
+        Provisions::Ambiguous(nodes) => {
+            let mut lookup = result(input, PdfLookupStatus::Ambiguous, None);
+            lookup.matches = nodes.into_iter().map(|index| document.structure.nodes[index].id.clone()).collect();
+            lookup
+        }
+        Provisions::Found { order, first, last } => finish(document, &text, input, order.len(), first, last, |at| {
+            section_unit(&document.structure, &text, &document.summary.page_text_quality, &pages, &document.structure.nodes[order[at]])
+        }),
     }
-    // A range's provisions are the outermost from its first through its last, each with what it holds.
-    let spanned: HashSet<&str> = sections[first..=last].iter().map(|section| section.id.as_str()).collect();
-    let span: Vec<&StructureNode> = sections[first..=last].iter().copied()
-        .filter(|section| section.parent_id.as_deref().is_none_or(|parent| !spanned.contains(parent)))
-        .collect();
-    finish(document, &text, input, span.len(), 0, span.len() - 1, |index| {
-        section_unit(&document.structure, &text, &document.summary.page_text_quality, &pages, span[index])
-    })
 }

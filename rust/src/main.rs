@@ -215,9 +215,10 @@ fn pdf_inspector_gate_command(arguments: &[String]) -> Result<i32> {
                 document.page_count()
             )));
         }
+        let query = legal_document_query::DocumentQuery::new();
         let mut pages = Vec::with_capacity(entry.pages);
         for page in 1..=entry.pages {
-            pages.push(document.lookup(&PdfLookupRequest::new("page", page.to_string())));
+            pages.push(document.lookup(&query, &PdfLookupRequest::new("page", page.to_string())));
         }
         let product = PdfInspectorProduct {
             structure: document.structure(),

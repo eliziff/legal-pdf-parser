@@ -1117,6 +1117,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "legal-document-query"
+version = "0.1.0"
+dependencies = [
+ "legal-locator",
+ "legal-structure-model",
+ "regex",
+ "serde",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "legal-grammar"
 version = "0.1.0"
 dependencies = [
@@ -1212,6 +1224,7 @@ dependencies = [
 name = "legal-pdf-parser"
 version = "0.1.0"
 dependencies = [
+ "legal-document-query",
  "legal-pdf-core",
  "legal-pdf-extraction-processor",
  "legal-pdf-language",
@@ -1246,6 +1259,7 @@ name = "legal-pdf-support"
 version = "0.1.0"
 dependencies = [
  "image",
+ "legal-document-query",
  "legal-locator",
  "legal-pdf-core",
  "legal-structure-model",

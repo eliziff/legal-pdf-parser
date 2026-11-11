@@ -8,7 +8,7 @@ use legal_pdf_structure::{StructureIdentity, StructureOutput};
 use legal_pdf_support::{profile, PdfDocument, PdfStatus};
 #[cfg(feature = "ppdoc")]
 use legal_pdf_support::{PPDocLayout, PPDocOptions};
-use legal_structure_model::{DetectionProfile, DocumentStructure, ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
+use legal_structure_model::{serialization_sha256, DetectionProfile, DocumentStructure, ScalarText, DOCUMENT_STRUCTURE_SCHEMA};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -71,7 +71,6 @@ fn cached_rasters(
 ) -> Vec<CachedRaster> {
     let keys = requests.iter().map(|request| {
         serialization_sha256(&("raster-v4", identity, request.page_index, request.width, request.height, &request.lines, &request.words))
-            .unwrap_or_default()
     }).collect::<Vec<_>>();
     let mut found = keys.iter().map(|key| {
         root.and_then(|root| read_gzip_json::<CachedRaster>(&root.join(format!("{key}.json.gz"))).ok())
@@ -112,7 +111,7 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
         }
         let (mut results, mut missing, mut paths) = (Vec::new(), Vec::new(), BTreeMap::new());
         for request in requests {
-            let key = serialization_sha256(&(&self.cache_identity, request.page_index, request.width, request.height, &request.regions))?;
+            let key = serialization_sha256(&(&self.cache_identity, request.page_index, request.width, request.height, &request.regions));
             let path = self.cache_root.as_ref().map(|root| root.join(format!("{key}.json.gz")));
             let cached = path
                 .as_ref()
@@ -184,7 +183,7 @@ impl legal_pdf_core::PdfOcrProvider for DeferredOcrProvider<'_> {
     /// A region read again, through the recognition cache as a page reading is: the same OCR code
     /// and provider read the same region of the same page the same way.
     fn read_region(&mut self, pdf: &[u8], page_index: usize, region: [f64; 4], scale: f64) -> Result<Vec<legal_pdf_core::OcrLine>> {
-        let key = serialization_sha256(&("region-v1", &self.cache_identity, page_index, region.map(|value| (value * 100.0).round() as i64), (scale * 100.0).round() as i64))?;
+        let key = serialization_sha256(&("region-v1", &self.cache_identity, page_index, region.map(|value| (value * 100.0).round() as i64), (scale * 100.0).round() as i64));
         let path = self.cache_root.as_ref().map(|root| root.join(format!("region-{key}.json.gz")));
         if let Some(cached) = path.as_ref().and_then(|path| read_gzip_json::<CachedRegion>(path).ok()).filter(|cached| cached.key == key) {
             return Ok(cached.lines);
@@ -275,7 +274,7 @@ fn cache_key(
     ppdoc_identity: Option<&str>,
     ocr_pages: Option<&[usize]>,
     semantic_profile: Option<DetectionProfile>,
-) -> Result<String> {
+) -> String {
     let value = json!({
         "source_sha256": source_hash,
         "schema_version": SCHEMA_VERSION,
@@ -358,7 +357,8 @@ fn derive_document(
     semantic_profile: Option<DetectionProfile>,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
-    let passage_pages = PdfDocument::passage_evidence(&extracted.pages);
+    // The witnesses passages read: the pages as extracted, before the structure stage rewrites their lines.
+    let passage_pages = extracted.pages.clone();
     let derived = profile::measure("derive_document", || {
         derive_extracted(&mut extracted, source_hash, semantic_profile)
     })?;
@@ -412,7 +412,7 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
 #[doc(hidden)]
 pub fn gold_inputs_identity() -> String {
     let models = ["LEGALPDF_INDRA_MODEL_PACK", "LEGALPDF_ONNXRUNTIME", "LEGALPDF_PPDOC_MODEL_PACK"].map(|name| std::env::var(name).ok());
-    let identity = serialization_sha256(&("legalpdf.gold-inputs.v2", EXTRACTION_CACHE_SCHEMA, models)).unwrap_or_default();
+    let identity = serialization_sha256(&("legalpdf.gold-inputs.v2", EXTRACTION_CACHE_SCHEMA, models));
     identity[..16.min(identity.len())].to_owned()
 }
 /// The structure gold's replay: a recognized extraction through the structure stage, uncached;
@@ -619,7 +619,7 @@ fn reading(source_hash: &str, options: &PdfRequest) -> Result<(String, Providers
         None => ocr_identity,
     };
     let ocr_pair = ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
-    let key = cache_key(source_hash, document_identity(), ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile)?;
+    let key = cache_key(source_hash, document_identity(), ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile);
     Ok((key, Providers {
         ocr_identity,
         #[cfg(feature = "ocr")]
@@ -663,8 +663,8 @@ fn recognized_extraction(
     #[cfg(feature = "ocr")]
     let mut ocr_provider = {
         let identity = providers.ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
-        let recognition_key = serialization_sha256(&("legalpdf.recognition-cache.v1", source_hash, env!("LEGAL_PDF_OCR_SHA256"), identity))?;
-        let raster_key = serialization_sha256(&("legalpdf.raster-cache.v1", source_hash, env!("LEGAL_PDF_RASTER_SHA256")))?;
+        let recognition_key = serialization_sha256(&("legalpdf.recognition-cache.v1", source_hash, env!("LEGAL_PDF_OCR_SHA256"), identity));
+        let raster_key = serialization_sha256(&("legalpdf.raster-cache.v1", source_hash, env!("LEGAL_PDF_RASTER_SHA256")));
         let recognition_root = cache_root.map(|root| ocr_cache_root(root, options).join("recognition"));
         options.ocr.as_ref().zip(providers.ocr).map(|(options, prepared)| DeferredOcrProvider {
             options,
@@ -689,7 +689,7 @@ fn recognized_extraction(
     };
     // A PDF's extraction is keyed by the PDF and the schema, never by a fingerprint of source files: work after
     // extraction never re-extracts, and a change to extraction itself bumps EXTRACTION_CACHE_SCHEMA.
-    let extraction_key = serialization_sha256(&(EXTRACTION_CACHE_SCHEMA, source_hash))?;
+    let extraction_key = serialization_sha256(&(EXTRACTION_CACHE_SCHEMA, source_hash));
     let extraction_path = cache_root.map(|root| parse_cache_root(root).join("extractions").join(format!("{extraction_key}.json.gz")));
     let cached = extraction_path
         .as_ref()
@@ -728,9 +728,6 @@ fn recognized_extraction(
     Ok(extracted)
 }
 
-fn serialization_sha256(value: &impl Serialize) -> Result<String> {
-    Ok(legal_structure_model::serialization_sha256(value))
-}
 
 fn structure_examples(graph: &DocumentStructure) -> Value {
     use legal_structure_model::NodeKind;
@@ -799,14 +796,14 @@ pub fn corpus_check_cached_extraction(input: impl AsRef<Path>) -> Result<Value> 
         "by_kind": by_kind,
         "sections_by_locator_kind": sections_by_locator_kind,
         "heading_derived_section_count": heading_derived_sections,
-        "graph_sha256": serialization_sha256(graph)?,
+        "graph_sha256": serialization_sha256(graph),
         "examples": structure_examples(graph),
     });
     Ok(json!({
         "source_sha256": source_sha256,
         "page_count": page_count,
         "line_count": line_count,
-        "product_sha256": serialization_sha256(&(&extracted.pages, graph, &extracted.diagnostics))?,
+        "product_sha256": serialization_sha256(&(&extracted.pages, graph, &extracted.diagnostics)),
         "structure": structure,
     }))
 }

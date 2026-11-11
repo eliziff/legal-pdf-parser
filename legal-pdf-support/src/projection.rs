@@ -2,21 +2,19 @@
 //! (`lookup`).
 
 use legal_pdf_core::model::{
-    Line, Page, PdfExtractionMetadata, ScalarRange, PARSER_VERSION,
+    Page, PdfExtractionMetadata, ScalarRange, PARSER_VERSION,
 };
 use legal_structure_model::{
-    document_fingerprint, serialization_sha256, utf16_len, DigestWriter, DocumentFingerprint,
+    serialization_sha256, utf16_len,
     ScalarText,
 };
 use legal_structure_model::{
     DocumentStructure, NodeKind, StructureNode,
 };
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
-use std::borrow::Cow;
+use unicode_normalization::UnicodeNormalization;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
-use unicode_normalization::UnicodeNormalization;
 
 mod document;
 pub use document::*;

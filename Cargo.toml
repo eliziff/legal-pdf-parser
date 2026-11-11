@@ -17,6 +17,7 @@ legal-structure = { path = "../legal-structure" }
 legal-layout = { path = "../legal-structure/layout" }
 legal-structure-model = { path = "../legal-structure/model" }
 legal-locator = { path = "../legal-structure/locator" }
+legal-document-query = { path = "../legal-structure/query" }
 legal-structure-features = { path = "../legal-structure/features" }
 pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 
@@ -52,6 +53,7 @@ legal-pdf-structure = { path = "legal-pdf-structure", optional = true }
 legal-pdf-support = { path = "legal-pdf-support", optional = true }
 legal-pdf-pages = { path = "legal-pdf-pages", optional = true }
 legal-structure-model = { workspace = true }
+legal-document-query = { workspace = true }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }

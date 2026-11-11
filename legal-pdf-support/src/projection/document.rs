@@ -7,7 +7,9 @@ pub struct PdfDocument {
     pub(crate) structure: legal_structure_model::DocumentStructure,
     pub(crate) authority_text_units: Vec<legal_pdf_core::AuthorityTextUnit>,
     pub(crate) summary: PdfSummary,
-    /// The extraction's pages as witnesses, as read before the structure stage rewrote their lines.
+    /// The extraction's pages as witnesses, as read before the structure stage rewrote their lines, a recognized
+    /// line's words joined where recognition gave it no text of its own: the one copy passages, page maps and
+    /// recognized text read.
     pub(crate) evidence: Arc<Vec<Page>>,
     #[serde(skip)]
     pub(crate) printed: OnceLock<Vec<PrintedParagraph>>,
@@ -55,16 +57,11 @@ pub(crate) fn page_confidence(quality: &[f64], page: &StructureNode) -> f64 {
     quality.get(page_index(page)).copied().unwrap_or(0.0).clamp(0.0, 1.0)
 }
 
+/// The digest of a lookup's answer: its units and the units before and after them.
 pub(crate) fn lookup_payload_sha256(lookup: &PdfStructureLookup) -> String {
-    let mut writer = DigestWriter::default();
-    writer.0.update(b"{\"units\":");
-    serde_json::to_writer(&mut writer, &lookup.units).expect("lookup serialization");
-    writer.0.update(b",\"before\":");
-    serde_json::to_writer(&mut writer, &lookup.before).expect("lookup serialization");
-    writer.0.update(b",\"after\":");
-    serde_json::to_writer(&mut writer, &lookup.after).expect("lookup serialization");
-    writer.0.update(b"}");
-    format!("{:x}", writer.0.finalize())
+    #[derive(serde::Serialize)]
+    struct Payload<'a, T> { units: &'a T, before: &'a T, after: &'a T }
+    serialization_sha256(&Payload { units: &lookup.units, before: &lookup.before, after: &lookup.after })
 }
 
 impl PdfDocument {
@@ -75,7 +72,7 @@ impl PdfDocument {
         status: PdfStatus,
         metadata: PdfExtractionMetadata,
         page_text_quality: Vec<f64>,
-        evidence: Arc<Vec<Page>>,
+        mut evidence: Vec<Page>,
         authority_text_units: Vec<legal_pdf_core::AuthorityTextUnit>,
         structure: DocumentStructure,
     ) -> Self {
@@ -91,26 +88,20 @@ impl PdfDocument {
             ocr_routed_pages: metadata.ocr_routed_pages,
             scanned_pages: metadata.scanned_pages,
         };
-        Self { evidence, printed: OnceLock::new(), structure, authority_text_units, summary }
-    }
-
-    /// Capture extraction witnesses before structural derivation rewrites lines.
-    pub fn passage_evidence(pages: &[Page]) -> Arc<Vec<Page>> {
-        Arc::new(pages.to_vec())
-    }
-
-    /// The pages passages are read from: the extraction witnesses, a recognized scan's lines each read in full
-    /// (`recognized_line`).
-    pub fn passage_pages(&self) -> Arc<Vec<Page>> {
-        if self.evidence.iter().all(|page| page.source == "native") {
-            return Arc::clone(&self.evidence);
+        for line in evidence.iter_mut().filter(|page| page.source != "native").flat_map(|page| &mut page.lines) {
+            if line.text.is_empty() {
+                line.text = line.words.iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" ");
+            }
         }
-        Arc::new(self.evidence.iter().map(|page| if page.source == "native" { page.clone() } else {
-            Page { lines: page.lines.iter().map(recognized_line).collect(), ..page.clone() }
-        }).collect())
+        Self { evidence: Arc::new(evidence), printed: OnceLock::new(), structure, authority_text_units, summary }
     }
 
-    /// The pages recognition read, as it read them.
+    /// The pages passages are read from: the extraction witnesses.
+    pub fn passage_pages(&self) -> Arc<Vec<Page>> {
+        Arc::clone(&self.evidence)
+    }
+
+    /// The pages recognition read, each line's words joined where it has no text of its own.
     pub fn recognized_pages(&self) -> impl Iterator<Item = &Page> {
         self.evidence.iter().filter(|page| page.source != "native")
     }
@@ -157,17 +148,9 @@ impl PdfDocument {
         &self.authority_text_units
     }
 
-    pub fn fingerprint(&self) -> DocumentFingerprint {
-        let mut fingerprint = document_fingerprint(&self.structure);
-        let product = serialization_sha256(&(&self.summary, &self.evidence));
-        fingerprint.components.insert("pdf", product.clone());
-        fingerprint.result_sha256 =
-            serialization_sha256(&(fingerprint.result_sha256.as_str(), product));
-        fingerprint
-    }
-
-    pub fn lookup(&self, request: &PdfLookupRequest) -> PdfStructureLookup {
-        structure_lookup(self, request)
+    /// The units `request` names, the document's provisions and notes named as `query` (the document's own) reads them.
+    pub fn lookup(&self, query: &legal_document_query::DocumentQuery, request: &PdfLookupRequest) -> PdfStructureLookup {
+        structure_lookup(self, query, request)
     }
 
     /// Each paragraph number this PDF prints, with its printings (`PrintedParagraph`), in the order their text opens.
@@ -234,12 +217,4 @@ impl PdfDocument {
         let text = ScalarText::new(self.structure.query_text());
         self.page_nodes().map(|page| rendered_slice(&text, &self.structure, page)).collect()
     }
-}
-
-/// A recognized line read as a witness: its text in full, its words joined where recognition gave it none of its own.
-fn recognized_line(line: &Line) -> Line {
-    if !line.text.is_empty() {
-        return line.clone();
-    }
-    Line { text: line.words.iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" "), ..line.clone() }
 }

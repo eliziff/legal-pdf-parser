@@ -12,6 +12,7 @@ ppdoc = ["dep:image", "dep:libloading", "legal-pdf-core/render"]
 legal-pdf-core = { path = "../legal-pdf-core" }
 legal-structure-model = { workspace = true }
 legal-locator = { workspace = true }
+legal-document-query = { workspace = true }
 pdf-inspector = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 libloading = { version = "0.8", optional = true }
