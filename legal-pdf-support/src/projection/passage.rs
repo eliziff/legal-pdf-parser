@@ -60,7 +60,6 @@ pub struct QuoteSelection {
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PassageGeometry {
-    pub source_sha256: String,
     pub targets: Vec<PlacedPassage>,
 }
 
@@ -156,7 +155,6 @@ impl PdfDocument {
             .filter(|index| pages.get(*index).is_none_or(|page| page.lines.is_empty()))
             .collect::<HashSet<_>>();
         PassageGeometry {
-            source_sha256: self.summary.sha256.clone(),
             targets: targets.into_iter().map(|target| self.place(query, target, &pages, &unavailable)).collect(),
         }
     }
