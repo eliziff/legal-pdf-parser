@@ -13,8 +13,10 @@ use std::collections::HashSet;
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct AnnotationMark {
     pub id: String,
+    #[cfg_attr(feature = "binding-types", ts(type = "\"highlight\" | \"margin\""))]
     pub kind: String,
     #[serde(default)]
+    #[cfg_attr(feature = "binding-types", ts(type = "\"automatic\" | \"manual\""))]
     pub origin: String,
     #[serde(default)]
     pub label: String,
