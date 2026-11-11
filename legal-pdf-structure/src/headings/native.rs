@@ -7,6 +7,7 @@
 use legal_pdf_core::model::{Line, Page};
 use legal_pdf_core::{flag_share, line_font_size, off_grid_sizes, BOLD};
 use legal_pdf_core::model::sentence_ended;
+use crate::model::SourceTag;
 use crate::text::text::{
     bracket_excess, closes_before_opening, dangling_end, enumerated, hyphen_continuation, hyphen_fragment_tail,
     starts_note_or_list,
@@ -191,12 +192,13 @@ pub(crate) fn recognized_page(page: &Page) -> bool {
 /// The heading tags a document puts on so many of its tagged lines that they mark its body (every
 /// numbered paragraph tagged H2), as pdf-inspector reads them
 /// (`detect_overused_struct_heading_levels`: a level on over 15% of 20 tagged lines or more): each
-/// line's tag (`role`, by page slot and line slot) read on the pages' items (`page_items`).
-pub(crate) fn overused_tags<'a>(
+/// line's tag (`role`, by page slot and line slot) read on the pages' items (`page_items`); each overused level as a
+/// source tag's heading level (0, H, is overused with H1; a tag past H6 reads as H6, as its name is written).
+pub(crate) fn overused_tags(
     pages: &[Page],
     items: &[crate::tables::PageItems],
-    role: impl Fn(usize, usize) -> Option<&'a str>,
-) -> HashSet<String> {
+    role: impl Fn(usize, usize) -> Option<SourceTag>,
+) -> HashSet<u8> {
     use pdf_inspector::structure_tree::StructRole;
     use pdf_inspector::types::TextLine;
     let mut roles: HashMap<u32, HashMap<i64, StructRole>> = HashMap::new();
@@ -209,7 +211,7 @@ pub(crate) fn overused_tags<'a>(
             };
             let mut item = item.clone();
             item.mcid = Some(slot as i64);
-            roles.entry(number).or_default().insert(slot as i64, StructRole::from_name(role));
+            roles.entry(number).or_default().insert(slot as i64, StructRole::from_name(role.name()));
             match lines.last_mut() {
                 Some(line) if line.page == number && line.items[0].mcid == item.mcid => line.items.push(item),
                 _ => lines.push(TextLine { items: vec![item], y: 0.0, page: number, adaptive_threshold: 0.1 }),
@@ -218,7 +220,8 @@ pub(crate) fn overused_tags<'a>(
     }
     pdf_inspector::markdown::detect_overused_struct_heading_levels(&lines, Some(&roles))
         .into_iter()
-        .flat_map(|level| [Some(format!("H{level}")), (level == 1).then(|| "H".to_owned())])
+        .filter_map(|level| u8::try_from(level).ok())
+        .flat_map(|level| [Some(level), (level == 1).then_some(0)])
         .flatten()
         .collect()
 }

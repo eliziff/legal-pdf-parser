@@ -19,7 +19,7 @@
 //! becomes the body's.
 
 use super::*;
-use crate::notes::lanes::{note_promotions, LaneLines, LANE_BODY, LANE_FURNITURE, LANE_NOTE, LANE_PARAGRAPH};
+use crate::notes::lanes::note_promotions;
 
 /// A line saying a note runs on across the page: "(Footnote continued…)", "Notes continued".
 fn continued_note(text: &str) -> bool {
@@ -127,26 +127,6 @@ impl Notes {
                 unit[member.slot.index()] = true;
             }
         }
-        let headed = |at: usize| {
-            fences.role[at] == Role::Heading || matches!(evidence.tag[at], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle)
-        };
-        let layout_notes = legal_structure_model::ablated("layout_notes");
-        let flags: Vec<u8> = (0..count)
-            .map(|at| {
-                [
-                    (BAND_EXCLUDED, matches!(fences.role[at], Role::LineLabel | Role::Contents)),
-                    (BAND_FURNITURE, matches!(fences.role[at], Role::Furniture | Role::PageLabel)),
-                    (BAND_CELL, fences.cell[at] != 0),
-                    (BAND_PARAGRAPH, unit[at] || !fences.paragraphs.held[at].is_empty() || fences.margin_number[at].is_some()),
-                    (BAND_NOTED, evidence.tag[at] == SourceTag::Note),
-                    (BAND_HEADED, headed(at)),
-                    (BAND_LAYOUT, layout_notes && layout_labelled(slots.line(pages, Slot(at as u32)))),
-                ]
-                .into_iter()
-                .filter(|(_, holds)| *holds)
-                .fold(0, |bits, (bit, _)| bits | bit)
-            })
-            .collect();
         let mut notes = Self {
             note: vec![None; count],
             paragraph_label: vec![false; count],
@@ -155,28 +135,14 @@ impl Notes {
             heading: vec![false; count],
             ..Self::default()
         };
-        let mut lane_flags = vec![0u8; count];
         // The lines taken beside the band's notes under the separator, and the pages the band read
         // a note on, by page slot.
         let mut added = vec![false; count];
         let mut read = vec![false; pages.len()];
         for (key, (lines_of, order)) in groups {
-            let lines = BandLines { sizes: &evidence.size, labels: &evidence.label, flags: &flags, body_size: body_sizes[&key] };
+            let document = Document { slots, evidence, fences, unit: &unit, body_size: body_sizes[&key] };
             let views = PageView::of_slots(pages, slots, &lines_of);
-            let band_pages: Vec<BandPage> = views
-                .into_iter()
-                .map(|view| {
-                    let page = slots.page(view.slot(0));
-                    BandPage {
-                        view,
-                        separator: separators[page],
-                        columns: fences.columns[page],
-                        items: &evidence.items[page],
-                        contents: fences.contents_pages[page],
-                    }
-                })
-                .collect();
-            let reading = legal_pdf_core::profile::measure("notes.band", || read_band(&band_pages, &lines));
+            let reading = legal_pdf_core::profile::measure("notes.band", || read_band(&views, document));
             for &(slot, kind) in &reading.notes {
                 notes.note[slot.index()] = Some(kind);
             }
@@ -197,16 +163,15 @@ impl Notes {
             // else the separator.
             let mut noted: HashMap<usize, (bool, Option<f64>)> = HashMap::new();
             let mut seen = false;
-            for (band, page_reading) in band_pages.iter().zip(&reading.pages) {
-                let values: Vec<u32> = band
-                    .view
+            for (view, page_reading) in views.iter().zip(&reading.pages) {
+                let values: Vec<u32> = view
                     .lines
                     .iter()
                     .filter(|slot| fences.band[slot.index()] && matches!(fences.role[slot.index()], Role::Open | Role::Table))
                     .filter_map(|slot| evidence.label[slot.index()].filter(|label| label.suppress == 0 && label.value > 0))
                     .map(|label| label.value)
                     .collect();
-                let page = slots.page(band.view.slot(0));
+                let page = slots.page(view.slot(0));
                 if page_reading.noted
                     || seen && values.contains(&page_reading.next_label)
                     || values.iter().any(|value| values.contains(&(value + 1)))
@@ -220,14 +185,14 @@ impl Notes {
             // a note is a note's: its notes heading and an endnote page's running head aside. On a
             // page the band read no note on, only a line set in a note's type, smaller than the
             // body's (a map's labels and a column of the body under a stray rule are none).
-            let body = lines.body_size;
+            let body = document.body_size;
             for &slot in &lines_of {
                 let at = slot.index();
                 let Some(&(read_here, cut)) = noted.get(&slots.page(slot)) else { continue };
                 let typed = read_here || body > 0.0 && evidence.size[at] > 0.0 && evidence.size[at] < body * 0.90;
                 if fences.band[at]
                     && typed
-                    && flags[at] & BAND_PARAGRAPH == 0
+                    && !document.paragraph(at)
                     && cut.is_none_or(|cut| slots.line(pages, slot).bbox[1] >= cut - separator_tolerance(&pages[slots.page(slot)]))
                     && fences.role[at] == Role::Open
                     && !notes.heading[at]
@@ -240,42 +205,22 @@ impl Notes {
             }
             // The lanes read the band's notes, and take only the body lines it left open: no
             // heading, furniture, line label, contents, table cell, contents page's line or
-            // numbered paragraph's line.
-            for &slot in &lines_of {
-                let at = slot.index();
-                let furniture = flags[at] & BAND_FURNITURE != 0 || notes.running_head[at];
-                let note = notes.note[at].is_some();
-                let held = flags[at] & (BAND_EXCLUDED | BAND_CELL | BAND_HEADED) != 0
-                    || notes.heading[at]
-                    || notes.paragraph_label[at]
-                    || fences.contents_pages[slots.page(slot)];
-                lane_flags[at] = [
-                    (LANE_NOTE, note),
-                    (LANE_BODY, !note && !furniture && !held),
-                    (LANE_FURNITURE, furniture),
-                    (LANE_PARAGRAPH, notes.paragraph_label[at]),
-                ]
-                .into_iter()
-                .filter(|(_, holds)| *holds)
-                .fold(0, |bits, (bit, _)| bits | bit);
-            }
-            let promoted = legal_pdf_core::profile::measure("notes.lanes", || {
-                note_promotions(LaneLines { pages, order: &order, starts: &starts, flags: &lane_flags }, &separators)
-            });
+            // numbered paragraph's line (`DocumentLines::mutable`).
+            let promoted = legal_pdf_core::profile::measure("notes.lanes", || note_promotions(pages, &order, document, &notes, separators));
             for (page, place) in promoted {
                 notes.note[starts[page] + place].get_or_insert(NoteKind::Footnote);
             }
-            notes.settle_kinds(pages, slots, &band_pages);
+            notes.settle_kinds(pages, slots, &views);
             // The lines taken beside the band's own notes in an endnote run the body never refers
             // to are the body's; the band's own and the lanes' stand.
-            let mut held: Vec<Vec<(usize, NoteKind)>> = band_pages
+            let mut held: Vec<Vec<(usize, NoteKind)>> = views
                 .iter()
-                .map(|band| band.view.iter().filter_map(|(slot, _)| Some((band.view.place(slot), notes.note[slot.index()]?))).collect())
+                .map(|view| view.iter().filter_map(|(slot, _)| Some((view.place(slot), notes.note[slot.index()]?))).collect())
                 .collect();
-            verified_endnotes(&band_pages, &lines, &mut held);
-            for (band, held) in band_pages.iter().zip(&held) {
-                for &slot in &band.view.lines {
-                    let place = band.view.place(slot);
+            verified_endnotes(&views, document, &mut held);
+            for (view, held) in views.iter().zip(&held) {
+                for &slot in &view.lines {
+                    let place = view.place(slot);
                     if added[slot.index()] && !held.iter().any(|(kept, _)| *kept == place) {
                         notes.note[slot.index()] = None;
                     }
@@ -285,10 +230,10 @@ impl Notes {
             // the page's foot (a small-type headnote, a cover's lines), and is the body's (on the
             // gold, 1,951 such lines were no notes, 170 were).
             let mut lifted = Vec::new();
-            for band in &band_pages {
-                for &slot in band.view.lines.iter().filter(|slot| notes.note[slot.index()].is_some()) {
+            for view in &views {
+                for &slot in view.lines.iter().filter(|slot| notes.note[slot.index()].is_some()) {
                     let [x0, _, x1, y1] = slots.line(pages, slot).bbox;
-                    let under = band.view.lines.iter().any(|&other| {
+                    let under = view.lines.iter().any(|&other| {
                         let (o, below) = (other.index(), slots.line(pages, other).bbox);
                         notes.note[o].is_none()
                             && fences.role[o] == Role::Open
@@ -314,21 +259,21 @@ impl Notes {
     /// Each page's notes settled as footnotes or endnotes, page by page through a document and
     /// language: all its notes are endnotes on a page under a notes heading, holding an endnote,
     /// or going on with the endnotes of the page before (no label, or the label they expect).
-    fn settle_kinds(&mut self, pages: &[Page], slots: &Slots, band_pages: &[BandPage]) {
+    fn settle_kinds(&mut self, pages: &[Page], slots: &Slots, views: &[PageView]) {
         let mut run = EndnoteRun::Outside;
         let mut previous_page: Option<usize> = None;
-        for band in band_pages {
-            let index = band.view.page.index;
+        for view in views {
+            let index = view.page.index;
             if previous_page.is_some_and(|prior| prior.checked_add(1) != Some(index)) {
                 run = EndnoteRun::Outside;
             }
             previous_page = Some(index);
-            let noted: Vec<Slot> = band.view.lines.iter().copied().filter(|slot| self.note[slot.index()].is_some()).collect();
+            let noted: Vec<Slot> = view.lines.iter().copied().filter(|slot| self.note[slot.index()].is_some()).collect();
             if noted.is_empty() {
                 run = EndnoteRun::Outside;
                 continue;
             }
-            let heading = band.view.lines.iter().any(|&slot| endnote_heading(&slots.line(pages, slot).text));
+            let heading = view.lines.iter().any(|&slot| endnote_heading(&slots.line(pages, slot).text));
             let explicit = noted.iter().any(|slot| self.note[slot.index()] == Some(NoteKind::Endnote));
             let numbers: Vec<u32> = noted
                 .iter()

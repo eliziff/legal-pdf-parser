@@ -14,10 +14,8 @@ use crate::model::{Member, PageView, Role, Rule, Run, Runs, Slot, Slots};
 use legal_pdf_core::model::{Diagnostic, Line, Page, PdfOutlineEntry};
 use crate::headings::native::date_line;
 use crate::headings;
-use crate::layout::layout_labelled;
 use crate::notes::{
-    endnote_heading, read_band, separator_tolerance, verified_endnotes, BandLines, BandPage, NoteKind, BAND_CELL, BAND_EXCLUDED, BAND_FURNITURE, BAND_HEADED,
-    BAND_LAYOUT, BAND_NOTED, BAND_PARAGRAPH,
+    endnote_heading, read_band, separator_tolerance, verified_endnotes, Document, NoteKind,
 };
 use crate::text::heading_ladder::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
 use crate::text::text::{all_caps, enumerated};

@@ -17,7 +17,7 @@
 //!
 //! The band then gives back the endnote runs the body never refers to (`verify_endnotes`), and says
 //! of each page whether it read a note there and where its band begins. It reads a document's lines
-//! (`BandLines`) on its pages (`BandPage`) and writes nothing (`read_band`).
+//! (`Document`: its evidence and fences) on its pages and writes nothing (`read_band`).
 //! A line a page layout model labelled keeps that label's reading of note or text under
 //! LEGALPDF_ABLATE=layout_notes.
 
@@ -29,52 +29,18 @@ use crate::layout::{ColumnKind,
     aligned_note_body_among, band_geometry_top, columns_of, kept_items, line_center_x, line_width, margin_note_model,
     standalone_note_label, ColumnModel,
 };
-use crate::model::{NoteLabel, PageView, Slot, SUPPRESS_COMMA, SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED};
+use crate::model::{Evidence, NoteLabel, PageView, Role, Slot, Slots, SourceTag, SUPPRESS_COMMA, SUPPRESS_CORNER, SUPPRESS_FOOT, SUPPRESS_WRAPPED};
+use crate::fences::Fences;
+use crate::layout::layout_labelled;
 use crate::text::text::all_caps;
 use legal_structure_model::text::{is_note_symbol, label_prefix, line_start_label_prefix, LabelPrefix};
 use std::collections::BTreeSet;
-
-/// A line the band never reads: a transcript's line number, a line held out of the body.
-pub(crate) const BAND_EXCLUDED: u8 = 1;
-/// A running head or foot, or a folio.
-pub(crate) const BAND_FURNITURE: u8 = 1 << 1;
-/// A table's cell: body, its number no note's label.
-pub(crate) const BAND_CELL: u8 = 1 << 2;
-/// A numbered paragraph's number, unless its page shows it a note's (`paragraph_labels`).
-pub(crate) const BAND_PARAGRAPH: u8 = 1 << 3;
-/// Labelled a note by its source.
-pub(crate) const BAND_NOTED: u8 = 1 << 4;
-/// Labelled a heading by its source.
-pub(crate) const BAND_HEADED: u8 = 1 << 5;
-/// Labelled by a page layout model.
-pub(crate) const BAND_LAYOUT: u8 = 1 << 6;
 
 /// A note's kind: at its page's foot, or among the notes collected at a part's or the document's end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum NoteKind {
     Footnote,
     Endnote,
-}
-
-/// What the band reads of a document's lines beside their text and boxes, by slot: each line's type
-/// size (`line_font_size`), the note label it opens with, and its `BAND_*` flags; and the document's
-/// body type size, against which notes are set small (0 where unknown: each page then reads its own).
-pub(crate) struct BandLines<'a> {
-    pub(crate) sizes: &'a [f64],
-    pub(crate) labels: &'a [Option<NoteLabel>],
-    pub(crate) flags: &'a [u8],
-    pub(crate) body_size: f64,
-}
-
-/// A page as the band reads it: the document's lines on it (`view`), the note separator rule the
-/// extraction found on it, its columns read on its words outside its furniture (`Fences::columns`)
-/// and its words' text items, and whether it is a contents page.
-pub(crate) struct BandPage<'a> {
-    pub(crate) view: PageView<'a>,
-    pub(crate) separator: Option<f64>,
-    pub(crate) columns: ColumnModel,
-    pub(crate) items: &'a crate::tables::PageItems,
-    pub(crate) contents: bool,
 }
 
 /// What the band reads of a document: each note line and its kind; the lines whose number it read
@@ -102,21 +68,58 @@ pub(crate) struct BandPageReading {
     pub(crate) next_label: u32,
 }
 
+/// What the band reads a document's lines by: the pages' slots, the evidence (each line's type size, note label and
+/// source tag), the fences (each line's role, cell, held paragraph and margin number; each page's separator, columns and
+/// whether it is a contents page), which counted runs' members open a unit in their document's body type (`unit`, by
+/// slot), and the document's body type size, against which notes are set small (0 where unknown: each page then reads
+/// its own).
+#[derive(Clone, Copy)]
+pub(crate) struct Document<'a> {
+    pub(crate) slots: &'a Slots,
+    pub(crate) evidence: &'a Evidence,
+    pub(crate) fences: &'a Fences,
+    pub(crate) unit: &'a [bool],
+    pub(crate) body_size: f64,
+}
+
+impl Document<'_> {
+    /// A line the band never reads: a transcript's line number, a contents list's line.
+    pub(crate) fn excluded(&self, at: usize) -> bool { matches!(self.fences.role[at], Role::LineLabel | Role::Contents) }
+    /// A running head or foot, or a folio.
+    pub(crate) fn furniture(&self, at: usize) -> bool { matches!(self.fences.role[at], Role::Furniture | Role::PageLabel) }
+    /// A table's cell: body, its number no note's label.
+    pub(crate) fn cell(&self, at: usize) -> bool { self.fences.cell[at] != 0 }
+    /// A numbered paragraph's number, unless its page shows it a note's (`paragraph_labels`): a counted run's member
+    /// opening a unit, a paragraph's held number, a margin's number.
+    pub(crate) fn paragraph(&self, at: usize) -> bool {
+        self.unit[at] || !self.fences.paragraphs.held[at].is_empty() || self.fences.margin_number[at].is_some()
+    }
+    /// Labelled a note by its source.
+    pub(crate) fn noted(&self, at: usize) -> bool { self.evidence.tag[at] == SourceTag::Note }
+    /// A heading by its fence or its source.
+    pub(crate) fn headed(&self, at: usize) -> bool {
+        self.fences.role[at] == Role::Heading || matches!(self.evidence.tag[at], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle)
+    }
+}
+
 /// A page with its lines' measures, each by its line's place on the page: the document's lines on it
-/// (`members`, in page order, and `member` by place), their sizes, labels and flags.
+/// (`members`, in page order, and `member` by place), their sizes and labels, and the document it is read in.
 struct Sheet<'a> {
     page: &'a Page,
+    /// The page's slot among the document's pages.
+    at: usize,
+    /// The slot of its first line.
+    first: usize,
     view: &'a PageView<'a>,
     members: Vec<usize>,
     member: Vec<bool>,
     sizes: &'a [f64],
     labels: &'a [Option<NoteLabel>],
-    flags: &'a [u8],
+    document: Document<'a>,
 }
 
 impl<'a> Sheet<'a> {
-    fn of(page: &'a BandPage<'a>, lines: &'a BandLines<'a>) -> Self {
-        let view = &page.view;
+    fn of(view: &'a PageView<'a>, document: Document<'a>) -> Self {
         let count = view.page.lines.len();
         let first = view.slot(0).index();
         let members: Vec<usize> = view.lines.iter().map(|&slot| view.place(slot)).collect();
@@ -126,21 +129,34 @@ impl<'a> Sheet<'a> {
         }
         Self {
             page: view.page,
+            at: document.slots.page(view.slot(0)),
+            first,
             view,
             members,
             member,
-            sizes: &lines.sizes[first..first + count],
-            labels: &lines.labels[first..first + count],
-            flags: &lines.flags[first..first + count],
+            sizes: &document.evidence.size[first..first + count],
+            labels: &document.evidence.label[first..first + count],
+            document,
         }
     }
 
     fn line(&self, place: usize) -> &'a Line { &self.page.lines[place] }
-    fn flagged(&self, place: usize, flag: u8) -> bool { self.flags[place] & flag != 0 }
     /// A running head or foot, a folio.
-    fn furniture(&self, place: usize) -> bool { self.flagged(place, BAND_FURNITURE) }
+    fn furniture(&self, place: usize) -> bool { self.document.furniture(self.first + place) }
     /// A line the band never reads.
-    fn excluded(&self, place: usize) -> bool { self.flagged(place, BAND_EXCLUDED) }
+    fn excluded(&self, place: usize) -> bool { self.document.excluded(self.first + place) }
+    fn cell(&self, place: usize) -> bool { self.document.cell(self.first + place) }
+    fn paragraph(&self, place: usize) -> bool { self.document.paragraph(self.first + place) }
+    fn noted(&self, place: usize) -> bool { self.document.noted(self.first + place) }
+    fn headed(&self, place: usize) -> bool { self.document.headed(self.first + place) }
+    /// The note separator rule the extraction found on the page.
+    fn separator(&self) -> Option<f64> { self.document.fences.separators[self.at] }
+    /// The page's columns, read on its words outside its furniture (`Fences::columns`).
+    fn columns(&self) -> ColumnModel { self.document.fences.columns[self.at] }
+    /// The page's words' text items.
+    fn items(&self) -> &'a crate::tables::PageItems { &self.document.evidence.items[self.at] }
+    /// Whether the page is a contents page.
+    fn contents(&self) -> bool { self.document.fences.contents_pages[self.at] }
 
     /// The document's lines on the page, with their places.
     fn lines(&self) -> impl Iterator<Item = (usize, &'a Line)> + '_ {
@@ -203,7 +219,7 @@ struct PageReading {
 
 fn page_reading(sheet: &Sheet, separator: Option<f64>, document_body: f64) -> PageReading {
     let page = sheet.page;
-    let table_cells: Vec<bool> = (0..page.lines.len()).map(|place| sheet.member[place] && sheet.flagged(place, BAND_CELL)).collect();
+    let table_cells: Vec<bool> = (0..page.lines.len()).map(|place| sheet.member[place] && sheet.cell(place)).collect();
     let body_size = if document_body > 0.0 && sheet.members.iter().any(|&place| sheet.sizes[place] > 0.0) {
         document_body
     } else {
@@ -247,10 +263,10 @@ fn paragraph_labels(sheet: &Sheet, reading: &PageReading, expected_endnote: Opti
     let mut found = vec![false; sheet.page.lines.len()];
     for (place, line) in sheet.lines() {
         let label = || printed_label(line);
-        found[place] = sheet.flagged(place, BAND_PARAGRAPH)
+        found[place] = sheet.paragraph(place)
             && !reading.separator.is_some_and(|cut| line.bbox[1] >= cut - reading.tolerance)
             && !has_prior_reference(sheet.lines().map(|(_, line)| line), &label(), line.bbox[1])
-            && !sheet.flagged(place, BAND_NOTED)
+            && !sheet.noted(place)
             && !sheet.lines().any(|(_, heading)| heading.bbox[1] < line.bbox[1] && endnote_heading(&heading.text))
             && !expected_endnote.is_some_and(|expected| {
                 label().parse::<u32>().is_ok_and(|number| number >= expected)
@@ -325,19 +341,19 @@ struct PageFacts {
 
 /// The columns of the page's lines `keep` holds (places), its furniture aside, read on their words'
 /// text items: the page's own columns where they are all its lines.
-fn columns_among(band: &BandPage, sheet: &Sheet, keep: &[bool]) -> ColumnModel {
+fn columns_among(sheet: &Sheet, keep: &[bool]) -> ColumnModel {
     let page = sheet.page;
     let kept = |place: usize| keep[place] && !sheet.furniture(place);
     let places = (0..page.lines.len()).filter(|&place| kept(place));
-    columns_of(&page.lines, places, &kept_items(band.items, kept), page.index as u32 + 1)
+    columns_of(&page.lines, places, &kept_items(sheet.items(), kept), page.index as u32 + 1)
 }
 
-fn page_facts(band: &BandPage, sheet: &Sheet, reading: &PageReading, candidates: &[Candidate]) -> PageFacts {
+fn page_facts(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate]) -> PageFacts {
     let page = sheet.page;
     let (sizes, body_size) = (sheet.sizes, reading.body_size);
     let numeric: Vec<u32> = candidates.iter().filter_map(|(_, prefix, _)| prefix.label.parse().ok()).collect();
     let columns = {
-        let page_model = if sheet.members.len() == page.lines.len() { band.columns } else { columns_among(band, sheet, &sheet.member) };
+        let page_model = if sheet.members.len() == page.lines.len() { sheet.columns() } else { columns_among(sheet, &sheet.member) };
         if page_model.kind == ColumnKind::Two {
             page_model
         } else {
@@ -345,7 +361,7 @@ fn page_facts(band: &BandPage, sheet: &Sheet, reading: &PageReading, candidates:
             for (place, _, _) in candidates {
                 labelled[*place] = true;
             }
-            let label_model = columns_among(band, sheet, &labelled);
+            let label_model = columns_among(sheet, &labelled);
             if label_model.kind == ColumnKind::Single { page_model } else { label_model }
         }
     };
@@ -379,7 +395,7 @@ fn page_facts(band: &BandPage, sheet: &Sheet, reading: &PageReading, candidates:
     let structural_reset = generic_heading_reset
         || content_before().any(|place| {
             let line = sheet.line(place);
-            (sheet.flagged(place, BAND_HEADED) || line.bbox[1] >= page.height * 0.08) && structural_reset_heading(&line.text)
+            (sheet.headed(place) || line.bbox[1] >= page.height * 0.08) && structural_reset_heading(&line.text)
         });
     let label_sizes: Vec<f64> = candidates.iter().map(|(place, _, _)| sizes[*place]).filter(|size| *size > 0.0).collect();
     let label_size = (!label_sizes.is_empty()).then(|| median(label_sizes));
@@ -707,23 +723,23 @@ fn verify_endnotes(sheets: &[Sheet], notes: &mut [Vec<(usize, NoteKind)>]) {
 }
 
 /// Every page's note band, in order, then the endnote runs the body never refers to given back.
-pub(crate) fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
+pub(crate) fn read_band(views: &[PageView], document: Document) -> BandReading {
     let mut found = BandReading::default();
-    let sheets: Vec<Sheet> = pages.iter().map(|page| Sheet::of(page, lines)).collect();
+    let sheets: Vec<Sheet> = views.iter().map(|view| Sheet::of(view, document)).collect();
     let mut notes: Vec<Vec<(usize, NoteKind)>> = Vec::with_capacity(sheets.len());
     let mut run = EndnoteRun::default();
     // The label the document's next note takes, by the notes read so far.
     let mut next_label = 1;
-    for (band, sheet) in pages.iter().zip(&sheets) {
+    for sheet in &sheets {
         let page = sheet.page;
         found.pages.push(BandPageReading { next_label, ..BandPageReading::default() });
         run.enter(page.index);
-        let reading = page_reading(sheet, band.separator, lines.body_size);
+        let reading = page_reading(sheet, sheet.separator(), sheet.document.body_size);
         let paragraph = paragraph_labels(sheet, &reading, run.expected);
         found.paragraph_labels.extend(sheet.members.iter().filter(|&&place| paragraph[place]).map(|&place| sheet.view.slot(place)));
         let (candidates, suppress) = label_candidates(sheet, &reading, &paragraph);
         found.suppressed.extend(suppress.into_iter().map(|place| sheet.view.slot(place)));
-        let facts = page_facts(band, sheet, &reading, &candidates);
+        let facts = page_facts(sheet, &reading, &candidates);
         let (continuation, suppress) = continue_endnotes(sheet, &candidates, &facts, &run);
         found.suppressed.extend(suppress.into_iter().map(|place| sheet.view.slot(place)));
         let margin = margin_notes(sheet, &reading, &candidates);
@@ -734,7 +750,7 @@ pub(crate) fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
         let heads = if endnote_page && !labels.is_empty() { running_heads(sheet, &labels) } else { Vec::new() };
         found.running_heads.extend(heads.iter().map(|&place| sheet.view.slot(place)));
         let furniture = |place: usize| sheet.furniture(place) || heads.contains(&place);
-        let cut = note_cut(sheet, &reading, &labels, band.contents, endnote_page, &continuation, &run, &furniture, &mut found.diagnostics);
+        let cut = note_cut(sheet, &reading, &labels, sheet.contents(), endnote_page, &continuation, &run, &furniture, &mut found.diagnostics);
         found.pages.last_mut().expect("the page's reading").cut = cut;
         let columns = margin.map_or(facts.columns, |(model, _)| model);
         let column_cuts = column_cuts(sheet, &labels, columns, margin.is_some(), endnote_page, &facts, &furniture);
@@ -747,9 +763,9 @@ pub(crate) fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
         for (place, line) in sheet.lines().filter(|&(place, _)| !sheet.excluded(place)) {
             if endnote_heading(&line.text) {
                 found.headings.push(sheet.view.slot(place));
-            } else if reading.table_cells[place] || furniture(place) || sheet.flagged(place, BAND_HEADED) {
-            } else if legal_structure_model::ablated("layout_notes") && sheet.flagged(place, BAND_LAYOUT) {
-                if sheet.flagged(place, BAND_NOTED) {
+            } else if reading.table_cells[place] || furniture(place) || sheet.headed(place) {
+            } else if legal_structure_model::ablated("layout_notes") && layout_labelled(line) {
+                if sheet.noted(place) {
                     page_notes.push((place, kind));
                 }
             } else if !paragraph[place] && band.holds(line) {
@@ -774,7 +790,7 @@ pub(crate) fn read_band(pages: &[BandPage], lines: &BandLines) -> BandReading {
 /// The endnote runs among a document's notes (`notes`: each page's note lines by place, with their
 /// kind, by the pages' order) that the body never refers to, given back (`verify_endnotes`): the
 /// notes kept.
-pub(crate) fn verified_endnotes(pages: &[BandPage], lines: &BandLines, notes: &mut [Vec<(usize, NoteKind)>]) {
-    let sheets: Vec<Sheet> = pages.iter().map(|page| Sheet::of(page, lines)).collect();
+pub(crate) fn verified_endnotes(views: &[PageView], document: Document, notes: &mut [Vec<(usize, NoteKind)>]) {
+    let sheets: Vec<Sheet> = views.iter().map(|view| Sheet::of(view, document)).collect();
     verify_endnotes(&sheets, notes);
 }

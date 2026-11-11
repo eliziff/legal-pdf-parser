@@ -479,11 +479,11 @@ pub(crate) fn measure(pages: &[Page],
     // A heading tag on so many of the tagged lines that it marks the body is no heading's.
     let overused = headings::overused_tags(pages, &items, |page, line| {
         let slot = slots.at(page, line).index();
-        (!line_numbers[slot] && evidence.tag[slot] != SourceTag::None).then(|| evidence.tag[slot].name())
+        (!line_numbers[slot] && evidence.tag[slot] != SourceTag::None).then_some(evidence.tag[slot])
     });
     if !overused.is_empty() {
         for tag in &mut evidence.tag {
-            if matches!(tag, SourceTag::Heading(_)) && overused.contains(tag.name()) {
+            if matches!(*tag, SourceTag::Heading(level) if overused.contains(&level.min(6))) {
                 *tag = SourceTag::None;
             }
         }

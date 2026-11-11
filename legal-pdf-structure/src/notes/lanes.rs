@@ -4,7 +4,7 @@
 //! reroute and the note band closure) and `note_band_witness.py` (the printed separator's band and
 //! the font-role strands).
 //!
-//! The lanes read a document's lines as the note band left them (`LaneLines`) and write nothing
+//! The lanes read a document's lines as the note band left them (`Notes`) and write nothing
 //! (`note_promotions`). Every lane proposes; the claims are taken together once all have spoken, an
 //! earlier lane's claim reserving its line from the later ones, so a weaker witness never
 //! overrides a stronger.
@@ -20,6 +20,8 @@ use legal_pdf_core::{
     regex,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::decide::Notes;
+use super::band::Document;
 
 const SEPARATOR_Y_TOLERANCE: f64 = 0.006;
 const MAX_NUMERIC_LABEL_STEP: i64 = 5;
@@ -127,50 +129,37 @@ fn dense(labels: &[i64]) -> bool {
     labels.len() >= 2 && labels.windows(2).all(|pair| (1..=MAX_NUMERIC_LABEL_STEP).contains(&(pair[1] - pair[0])))
 }
 
-/// A note's line: the note band's.
-pub(crate) const LANE_NOTE: u8 = 1;
-/// A body line whose role may still change: no heading, running head, folio, table's cell, or line
-/// the reading holds out of the body.
-pub(crate) const LANE_BODY: u8 = 1 << 1;
-/// A running head or foot, or a folio.
-pub(crate) const LANE_FURNITURE: u8 = 1 << 2;
-/// A numbered paragraph's label, as the note band read it.
-pub(crate) const LANE_PARAGRAPH: u8 = 1 << 3;
-
-/// A document's lines as the lanes read them: its pages, each page's lines of the document in
-/// reading order (page slot, the lines' places on the page), each page's first slot, and each
-/// line's `LANE_*` flags by slot.
-pub(crate) struct LaneLines<'a> {
-    pub(crate) pages: &'a [Page],
-    pub(crate) order: &'a [(usize, Vec<usize>)],
-    pub(crate) starts: &'a [usize],
-    pub(crate) flags: &'a [u8],
-}
-
+/// A document's lines as the lanes read them, as the note band left them: its pages, each page's lines of the document
+/// in reading order (page slot, the lines' places on the page), what the band reads them by (`Document`), and what the
+/// band read of them (`Notes`).
 struct DocumentLines<'a> {
-    lines: LaneLines<'a>,
+    pages: &'a [Page],
+    order: &'a [(usize, Vec<usize>)],
+    document: Document<'a>,
+    notes: &'a Notes,
     /// Native font sizes and recognized glyph heights are distinct measurements.
     note_sizes: [Option<f64>; 2],
 }
 
 impl<'a> DocumentLines<'a> {
-    fn new(lines: LaneLines<'a>) -> Self {
-        let mut document = Self { lines, note_sizes: [None; 2] };
-        document.note_sizes = note_type_sizes(&document);
-        document
-    }
-
     /// Each page's slot and its lines in reading order.
     fn pages(&self) -> impl Iterator<Item = (usize, Vec<LineRef>)> + 'a {
-        self.lines.order.iter().map(|(page, slots)| (*page, slots.iter().map(|slot| (*page, *slot)).collect()))
+        self.order.iter().map(|(page, slots)| (*page, slots.iter().map(|slot| (*page, *slot)).collect()))
     }
 
     fn line(&self, (page, line): LineRef) -> &'a Line {
-        &self.lines.pages[page].lines[line]
+        &self.pages[page].lines[line]
     }
 
-    fn flagged(&self, (page, line): LineRef, flag: u8) -> bool {
-        self.lines.flags[self.lines.starts[page] + line] & flag != 0
+    /// The line's slot.
+    fn at(&self, (page, line): LineRef) -> usize {
+        self.document.slots.on(page).start as usize + line
+    }
+
+    /// A running head or foot, or a folio.
+    fn furniture(&self, line: LineRef) -> bool {
+        let at = self.at(line);
+        self.document.furniture(at) || self.notes.running_head[at]
     }
 
     fn text(&self, line: LineRef) -> &'a str {
@@ -178,21 +167,24 @@ impl<'a> DocumentLines<'a> {
     }
 
     fn is_note(&self, line: LineRef) -> bool {
-        self.flagged(line, LANE_NOTE)
+        self.notes.note[self.at(line)].is_some()
     }
 
     /// A line whose label may still change: a body line, not a heading, a running head, a folio,
     /// a table's cell or a line the reading holds out.
     fn mutable(&self, line: LineRef) -> bool {
-        self.flagged(line, LANE_BODY)
+        let at = self.at(line);
+        let held = self.document.excluded(at) || self.document.cell(at) || self.document.headed(at) || self.notes.heading[at]
+            || self.notes.paragraph_label[at] || self.document.fences.contents_pages[line.0];
+        !self.is_note(line) && !self.furniture(line) && !held
     }
 
     fn paragraph_label(&self, line: LineRef) -> bool {
-        self.flagged(line, LANE_PARAGRAPH) && bare_label(&self.line(line).text).is_some()
+        self.notes.paragraph_label[self.at(line)] && bare_label(&self.line(line).text).is_some()
     }
 
     fn y_ratio(&self, at: LineRef) -> f64 {
-        let (height, bbox) = (self.lines.pages[at.0].height, self.line(at).bbox);
+        let (height, bbox) = (self.pages[at.0].height, self.line(at).bbox);
         if height > 0.0 { (bbox[1] + bbox[3]) / 2.0 / height } else { 0.0 }
     }
 
@@ -231,7 +223,7 @@ fn note_type_sizes(lines: &DocumentLines<'_>) -> [Option<f64>; 2] {
         }
         if lines.is_note(at) {
             notes[source].push(size);
-        } else if lines.flagged(at, LANE_BODY | LANE_PARAGRAPH) {
+        } else if lines.mutable(at) || lines.notes.paragraph_label[lines.at(at)] {
             body[source].push(size);
         }
     }
@@ -246,8 +238,10 @@ fn note_type_sizes(lines: &DocumentLines<'_>) -> [Option<f64>; 2] {
 
 /// The lines one logical document's lanes take for notes, beside the note band's (`lines`), with
 /// separators aligned to its page slots: each by its page slot and its place on the page, in order.
-pub(crate) fn note_promotions(lines: LaneLines<'_>, separators: &[Option<f64>]) -> Vec<LineRef> {
-    let lines = DocumentLines::new(lines);
+pub(crate) fn note_promotions(pages: &[Page], order: &[(usize, Vec<usize>)], document: Document, notes: &Notes, separators: &[Option<f64>]) -> Vec<LineRef> {
+    let mut lines = DocumentLines { pages, order, document, notes, note_sizes: [None; 2] };
+    lines.note_sizes = note_type_sizes(&lines);
+    let lines = lines;
     let rerouted = post_footnote_reroute(&lines);
     let mut claims = band_closure(&lines, &rerouted).into_iter().chain(rerouted).collect::<BTreeSet<_>>();
     let band = note_band(&lines, separators, &claims);
@@ -343,7 +337,7 @@ fn band_closure(lines: &DocumentLines<'_>, rerouted: &[LineRef]) -> Vec<LineRef>
         let (mut tail, mut broken) = (Vec::new(), false);
         for &line in &refs[last + 1..] {
             let text = lines.text(line);
-            if note(&line) || text.is_empty() || lines.flagged(line, LANE_FURNITURE) || page_label(text) {
+            if note(&line) || text.is_empty() || lines.furniture(line) || page_label(text) {
                 continue;
             }
             if !lines.mutable(line) {
@@ -388,7 +382,7 @@ fn note_band(lines: &DocumentLines<'_>, separators: &[Option<f64>], reserved: &B
         let Some(separator) = separators.get(page).copied().flatten() else {
             continue;
         };
-        let height = lines.lines.pages[page].height;
+        let height = lines.pages[page].height;
         if height <= 0.0 {
             continue;
         }
@@ -469,11 +463,11 @@ fn note_band(lines: &DocumentLines<'_>, separators: &[Option<f64>], reserved: &B
             }
         }
         let (y, text) = band_lines.iter().max_by(|left, right| left.0.total_cmp(&right.0)).cloned().unwrap_or_default();
-        states.insert(lines.lines.pages[page].index, (!band_lines.is_empty(), y, text));
+        states.insert(lines.pages[page].index, (!band_lines.is_empty(), y, text));
     }
-    deferred.sort_by_key(|(page, _)| lines.lines.pages[*page].index);
+    deferred.sort_by_key(|(page, _)| lines.pages[*page].index);
     for (page, candidates) in deferred {
-        let index = lines.lines.pages[page].index;
+        let index = lines.pages[page].index;
         let Some(previous) = index.checked_sub(1).and_then(|previous| states.get(&previous)) else {
             continue;
         };
@@ -521,7 +515,7 @@ fn font_role_strands(lines: &DocumentLines<'_>, separators: &[Option<f64>], rese
             ladder_last = ladder_last.max(Some(*label));
         }
         let page_ladder_start = ladder_last;
-        let height = lines.lines.pages[page].height;
+        let height = lines.pages[page].height;
         let rule = separators.get(page).copied().flatten().filter(|_| height > 0.0).map(|separator| separator / height);
         let texts = refs.iter().map(|line| lines.text(*line)).collect::<Vec<_>>();
         if texts.iter().filter(|text| pdf_inspector::markdown::has_dot_leaders(text)).count() >= 3
@@ -565,7 +559,7 @@ fn font_role_strands(lines: &DocumentLines<'_>, separators: &[Option<f64>], rese
                 if !run.iter().any(|line| lines.matches_note_type(*line)) {
                     continue;
                 }
-                let bottom_terminal = refs[position..].iter().all(|line| lines.flagged(*line, LANE_FURNITURE) || lines.text(*line).is_empty());
+                let bottom_terminal = refs[position..].iter().all(|line| lines.furniture(*line) || lines.text(*line).is_empty());
                 let adjacent_note = (start > 0 && lines.is_note(refs[start - 1])) || refs.get(position).is_some_and(|line| lines.is_note(*line));
                 let separator_anchor = expanded_pass && rule.is_some() && run.iter().any(|line| promoted.contains(line));
                 let mut labels = run
