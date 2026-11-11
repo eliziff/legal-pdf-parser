@@ -311,7 +311,7 @@ const DOC_PROMOTED: &[&str] = &[];
 /// What a request's DOC is keyed by: its export's settings (`docparse.json`), which each fit writes anew.
 fn doc_identity(doc: &crate::contract::DocOptions) -> Result<String> {
     let path = doc.model_pack.join("docparse.json");
-    fs::read(&path).map(|settings| format!("{:x}", Sha256::digest(settings))).map_err(|source| Error::Io { path, source })
+    fs::read(&path).map(|settings| Sha256::digest(settings).iter().map(|byte| format!("{byte:02x}")).collect::<String>()).map_err(|source| Error::Io { path, source })
 }
 
 /// The extraction's structure, its moves DOC's where the request names `doc` and the PDF's mode is promoted, else tier 0's.
@@ -407,7 +407,7 @@ fn derive_document(
 #[cfg(feature = "ocr")]
 #[doc(hidden)]
 pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPdf> {
-    let source_hash = format!("{:x}", Sha256::digest(pdf));
+    let source_hash = Sha256::digest(pdf).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     let options = PdfRequest {
         cache_dir: Some(cache_dir.to_owned()),
         // Always the recognizer (LEGALPDF_INDRA_MODEL_PACK, LEGALPDF_ONNXRUNTIME), else a failure: a scan read without one is empty pages.
@@ -663,7 +663,7 @@ fn source_hash(bytes: Option<&[u8]>, options: &PdfRequest) -> Result<String> {
     if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 || !bytes[..bytes.len().min(1024)].windows(5).any(|window| window == b"%PDF-") {
         return Err(Error::Message("PDF source bytes are invalid".to_owned()).failure(FailureKind::Corrupt));
     }
-    let actual = profile::measure("source_sha256", || format!("{:x}", Sha256::digest(bytes)));
+    let actual = profile::measure("source_sha256", || Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>());
     if options.expected_source_sha256.as_deref().is_some_and(|expected| expected != actual) {
         return Err(Error::Message("PDF source changed after preparation began".to_owned()).failure(FailureKind::SourceChanged));
     }

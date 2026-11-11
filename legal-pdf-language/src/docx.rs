@@ -75,25 +75,23 @@ struct XmlDocument {
 
 fn namespace_value(value: ResolveResult<'_>) -> Option<String> {
     match value {
-        ResolveResult::Bound(namespace) => Some(String::from_utf8_lossy(namespace.as_ref()).into_owned()),
+        ResolveResult::Bound(namespace) => Some(namespace.as_ref().to_owned()),
         ResolveResult::Unbound | ResolveResult::Unknown(_) => None,
     }
 }
 
-fn decode_attribute(raw: &quick_xml::events::attributes::Attribute<'_>, decoder: quick_xml::encoding::Decoder) -> Result<String> {
-    #[allow(deprecated)]
-    raw.decode_and_unescape_value(decoder).map(|value| value.into_owned()).map_err(|error| failed("XML attribute decoding failed", error))
+fn decode_attribute(raw: &quick_xml::events::attributes::Attribute<'_>) -> Result<String> {
+    raw.normalized_value(quick_xml::XmlVersion::Implicit1_0).map(|value| value.into_owned()).map_err(|error| failed("XML attribute decoding failed", error))
 }
 
 fn parse_element(reader: &NsReader<&[u8]>, start: &BytesStart<'_>, namespace: Option<String>, self_closing: bool) -> Result<XmlElement> {
-    let name = |bytes: &[u8], what: &str| std::str::from_utf8(bytes).map(str::to_owned).map_err(|error| failed(what, error));
-    let local = name(start.local_name().as_ref(), "XML name is not UTF-8")?;
+    let local = start.local_name().as_ref().to_owned();
     let mut attributes = Vec::new();
     for raw in start.attributes().with_checks(false) {
         let raw = raw.map_err(|error| failed("XML attribute failed", error))?;
         let (resolved, local_name) = reader.resolver().resolve_attribute(raw.key);
-        let local = name(local_name.as_ref(), "XML attribute name is not UTF-8")?;
-        attributes.push(XmlAttribute { namespace: namespace_value(resolved), local, value: decode_attribute(&raw, reader.decoder())? });
+        let local = local_name.as_ref().to_owned();
+        attributes.push(XmlAttribute { namespace: namespace_value(resolved), local, value: decode_attribute(&raw)? });
     }
     Ok(XmlElement { namespace, local, attributes, children: Vec::new(), self_closing })
 }
@@ -182,17 +180,14 @@ impl XmlElement {
 
 fn raw_text(event: &Event<'_>) -> Result<Option<String>> {
     match event {
-        Event::Text(text) => {
-            let decoded = text.decode().map_err(|error| failed("XML text decoding failed", error))?;
-            quick_xml::escape::unescape(&decoded).map(|value| Some(value.into_owned())).map_err(|error| failed("XML text unescaping failed", error))
-        }
-        Event::CData(text) => text.decode().map(|value| Some(value.into_owned())).map_err(|error| failed("XML text decoding failed", error)),
+        Event::Text(text) => quick_xml::escape::unescape(text).map(|value| Some(value.into_owned())).map_err(|error| failed("XML text unescaping failed", error)),
+        Event::CData(text) => Ok(Some((**text).to_owned())),
         Event::GeneralRef(reference) => {
             if let Some(value) = reference.resolve_char_ref().map_err(|error| failed("XML reference failed", error))? {
                 return Ok(Some(value.to_string()));
             }
-            let name = reference.decode().map_err(|error| failed("XML reference failed", error))?;
-            let entity = match name.as_ref() {
+            let name: &str = reference;
+            let entity = match name {
                 "lt" => "<",
                 "gt" => ">",
                 "amp" => "&",
@@ -409,7 +404,7 @@ fn read_docx_files(bytes: &[u8], wanted: Option<&[&str]>) -> Result<Vec<(String,
     let (mut expanded, mut xml_expanded, mut declared_expanded, mut declared_xml_expanded, mut file_count) = (0_u64, 0_u64, 0_u64, 0_u64, 0);
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(corrupted)?;
-        let name = entry.name().replace('\\', "/");
+        let name = entry.name().map_err(corrupted)?.replace('\\', "/");
         if name.contains('\0') || name.starts_with('/') || name.as_bytes().get(1) == Some(&b':') || name.split('/').any(|component| component == "..") {
             return Err(refused("DOCX contains an unsafe package path"));
         }
@@ -1011,7 +1006,7 @@ fn split_drafting_image_runs(xml: &str) -> Result<String> {
     let mut changed = false;
     loop {
         let event = reader.read_event().map_err(|error| failed("XML error", error))?.into_owned();
-        let is_run = matches!(&event, Event::Start(start) if start.local_name().as_ref() == b"r" && word(&reader, start));
+        let is_run = matches!(&event, Event::Start(start) if start.local_name().as_ref() == "r" && word(&reader, start));
         if matches!(event, Event::Eof) {
             break;
         }
@@ -1034,9 +1029,9 @@ fn split_drafting_image_runs(xml: &str) -> Result<String> {
                 if let Event::Start(child) | Event::Empty(child) = &event {
                     if word(&reader, child) {
                         let local = child.local_name();
-                        properties = local.as_ref() == b"rPr";
-                        has_image |= matches!(local.as_ref(), b"drawing" | b"pict");
-                        has_text |= local.as_ref() == b"t";
+                        properties = local.as_ref() == "rPr";
+                        has_image |= matches!(local.as_ref(), "drawing" | "pict");
+                        has_text |= local.as_ref() == "t";
                     }
                 }
                 children.push((properties, Vec::new()));

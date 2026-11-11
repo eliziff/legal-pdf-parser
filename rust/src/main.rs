@@ -185,7 +185,7 @@ fn pdf_inspector_gate_command(arguments: &[String]) -> Result<i32> {
                 entry.path
             )));
         }
-        let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let source_sha256 = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         if source_sha256 != entry.sha256 {
             return Err(Error::Message(format!(
                 "PDF Inspector source SHA-256 mismatch: {}",
@@ -224,7 +224,7 @@ fn pdf_inspector_gate_command(arguments: &[String]) -> Result<i32> {
             structure: document.structure(),
             pages,
         };
-        let product_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&product)?));
+        let product_sha256 = Sha256::digest(serde_json::to_vec(&product)?).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         serde_json::to_writer(
             &mut output,
             &PdfInspectorRow {

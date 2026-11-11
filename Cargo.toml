@@ -59,7 +59,7 @@ legal-document-query = { workspace = true }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 
 [dev-dependencies]
 # Unit tests run the structure engine, which programs supply at run time.
@@ -67,7 +67,7 @@ legal-pdf-core = { path = "legal-pdf-core", features = ["structure-analysis"] }
 lopdf = { version = "0.45.0", default-features = false }
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
 
 [patch.crates-io]
 hayro-jpeg2000 = { git = "https://github.com/LaurenzV/hayro.git", rev = "ff7e2e407f6b9c429b44dc29a851180727892b6c" }

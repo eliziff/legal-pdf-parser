@@ -60,7 +60,7 @@ fn fingerprint(root: &Path, inputs: &[PathBuf], features: &[String]) -> String {
         digest.update(feature.as_bytes());
         digest.update([0]);
     }
-    format!("{:x}", digest.finalize())
+    digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// pdf-inspector's sources, "bin" and the names in skip aside.

@@ -77,7 +77,7 @@ impl SuppliedOcr {
             }
         }
         let bytes = serde_json::to_vec(self).map_err(|e| Error::Message(e.to_string()))?;
-        Ok(format!("{:x}", Sha256::digest(bytes)))
+        Ok(Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect())
     }
 }
 

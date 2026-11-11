@@ -31,7 +31,7 @@ pub fn provider_asset_sha256(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..count]);
     }
-    let digest = format!("{:x}", digest.finalize());
+    let digest = digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     cache.insert(path, digest.clone());
     Ok(digest)
 }
