@@ -646,6 +646,21 @@ fn reading(source_hash: &str, options: &PdfRequest) -> Result<(String, Providers
     }))
 }
 
+/// The pages a PDF's recognition would read, by index from 0: those its extraction (cached) finds no text layer reads
+/// well, as a parse with no recognizer leaves them, its structure not read.
+pub fn pages_needing_ocr(bytes: &[u8], options: &PdfRequest) -> Result<Vec<usize>> {
+    let source_hash = source_hash(Some(bytes), options)?;
+    let cache_root = options.cache_dir.clone().unwrap_or_else(default_cache_dir);
+    let providers = Providers {
+        ocr_identity: None,
+        #[cfg(feature = "ocr")]
+        ocr: None,
+        #[cfg(feature = "ppdoc")]
+        ppdoc: None,
+    };
+    Ok(recognized_extraction(bytes, &source_hash, options, Some(&cache_root), providers, None, false)?.metadata.pages_needing_ocr)
+}
+
 /// The cache key a PDF's reading is kept under: of `bytes` where given (they must be the source expected), else of
 /// the source expected.
 pub fn pdf_cache_key(bytes: Option<&[u8]>, options: &PdfRequest) -> Result<String> {
