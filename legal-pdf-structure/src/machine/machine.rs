@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 use crate::fences::Fences;
 use crate::machine::lines::LineTable;
-use crate::model::{Evidence, MarkerReading, Slot};
+use crate::decide::Opening;
+use crate::model::{Evidence, MarkerReading, Role, Rule, Slot};
 use crate::model::regions::{NOTE, QUOTE, TEXT};
 
 /// Regions whose lines set reference marks notes answer: the body's, and headings' and titles'.
@@ -18,15 +19,21 @@ pub(crate) const RANKED_BODY: [u8; 7] = [1, 16, 2, 4, 6, 8, 9];
 /// A stack holds at most this many open units; headings run nine levels deep.
 const DEPTH: usize = 8;
 
-/// One line's move: its region, whether it opens a unit, what the unit counts on (one of the line's
-/// grammar readings, `reading`, an index; or a note's number, `note`), and a heading's level.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// One line's move, the parse's one record of the line: its role and the rule whose reading won it, whether it goes on
+/// with the line above it in one heading, caption or unit, and the unit its marker opens (`decide::Decision`); its
+/// region, whether it opens a unit, what the unit counts on (one of the line's grammar readings, `reading`, an index; or
+/// a note's number, `note`), and a heading's level.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Move {
+    pub(crate) role: Role,
+    pub(crate) rule: Rule,
+    pub(crate) joined: bool,
+    pub(crate) unit: Option<Opening>,
     pub(crate) region: u8,
     pub(crate) opens: bool,
     pub(crate) reading: Option<u8>,
     pub(crate) note: Option<u32>,
-    pub(crate) level: i8,
+    pub(crate) level: u8,
     /// A body unit's depth in its document's body (0 for none): the move's own, not its numbering's,
     /// which is evidence for it.
     pub(crate) depth: u8,
@@ -52,7 +59,12 @@ pub(crate) struct Move {
 impl Move {
     /// A move making nothing but its region and whether it opens.
     pub(crate) fn plain(region: u8, opens: bool) -> Self {
-        Self { region, opens, reading: None, note: None, level: 0, depth: 0, resumes: None, rank: None, starts: false, answers: [None; 4], member: None, within: Vec::new() }
+        Self { role: Role::Open, rule: Rule::None, joined: false, unit: None, region, opens, reading: None, note: None, level: 0, depth: 0, resumes: None, rank: None, starts: false, answers: [None; 4], member: None, within: Vec::new() }
+    }
+
+    /// The line's grouping made anew (`made`), its decision kept: its role, rule, joining and unit.
+    pub(crate) fn regroup(&mut self, made: Move) {
+        *self = Move { role: self.role, rule: self.rule, joined: self.joined, unit: self.unit, ..made };
     }
 }
 

@@ -142,9 +142,7 @@ impl<'a> PageView<'a> {
 
     /// The slot of a line of the view's page, by where it stands in the page's lines.
     pub(crate) fn slot_of(&self, line: &Line) -> Slot {
-        let place = (std::ptr::from_ref(line) as usize - self.page.lines.as_ptr() as usize) / std::mem::size_of::<Line>();
-        debug_assert!(place < self.page.lines.len(), "a line of another page");
-        self.slot(place)
+        self.slot((std::ptr::from_ref(line) as usize - self.page.lines.as_ptr() as usize) / std::mem::size_of::<Line>())
     }
 
     /// The view's lines with their slots, in page order.

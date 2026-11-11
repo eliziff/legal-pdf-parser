@@ -41,6 +41,9 @@ pub(crate) enum Continuation {
     /// Set at its paragraph's leading under the line before it, a full line ending no sentence
     /// (`continues_prose_from`).
     Prose,
+    /// A page's first line of its stream, going on with the paragraph the page before ended, as the two pages set the
+    /// stream's lines (`continues_onto`).
+    Page,
 }
 
 /// The fences, contexts and reading order, by slot.

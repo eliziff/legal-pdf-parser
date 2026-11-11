@@ -62,7 +62,7 @@ pub(crate) fn write_lines(pages: &mut [Page], slots: &Slots, fences: &Fences, de
             page.lines[(slot.0 - range.start) as usize].reading_order = place + 1;
         }
         for (line, slot) in page.lines.iter_mut().zip(range.clone().map(Slot)) {
-            line.exclude_from_body = decision.role[slot.index()] == Role::LineLabel;
+            line.exclude_from_body = decision.line(slot.index()).role == Role::LineLabel;
         }
         match &fences.folios[page_slot] {
             Some((slot, label)) => {
@@ -95,7 +95,7 @@ pub(crate) fn zones(slots: &Slots, evidence: &Evidence, fences: &Fences, notes: 
                 Some(NoteKind::Endnote) => NoteMode::Endnote,
                 _ => NoteMode::Footnote,
             };
-            crate::model::regions::zone_of(decision.role[at], fences.edge[at], mode)
+            crate::model::regions::zone_of(decision.line(at).role, fences.edge[at], mode)
         })
         .collect()
 }
@@ -129,8 +129,8 @@ pub(crate) fn note_lines<'a>(
                 page: NotePage::of(&pages[slots.page(slot)]),
                 zone: zones[at],
                 block: Some(blocks[at]),
-                label_suppressed: notes.suppressed[at] || decision.role[at] == Role::Heading,
-                paragraph_label: matches!(decision.unit[at], Some((_, UnitRole::Paragraph))) || notes.paragraph_label[at],
+                label_suppressed: notes.suppressed[at] || decision.line(at).role == Role::Heading,
+                paragraph_label: matches!(decision.line(at).unit, Some((_, UnitRole::Paragraph))) || notes.paragraph_label[at],
                 part: 2 * usize::from(context.document) + usize::from(context.translation),
                 citations: citations.get(&line.id).map_or(&[], Vec::as_slice),
             }
@@ -147,8 +147,8 @@ fn same_row(evidence: &Evidence, slots: &Slots, a: Slot, b: Slot) -> bool {
 /// its own.
 pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, decision: &Decision) -> Vec<usize> {
     let count = slots.len();
-    let role = &decision.role;
-    let counted = |slot: Slot| matches!(class(role[slot.index()]), Class::Body | Class::Contents | Class::Table);
+    let role = |at: usize| decision.line(at).role;
+    let counted = |slot: Slot| matches!(class(role(slot.index())), Class::Body | Class::Contents | Class::Table);
     let group = |slot: Slot| (fences.at(slot.index()).document, fences.at(slot.index()).translation);
     // Each document and language's measure (`measure_of`), on its counted lines page by page.
     let mut lines_of: Vec<((u16, bool), Vec<Vec<&Line>>)> = Vec::new();
@@ -175,7 +175,7 @@ pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences:
     for (place, &slot) in fences.order.iter().enumerate() {
         let document = usize::from(fences.at(slot.index()).document);
         opening[document] = opening[document].min(slots.page(slot));
-        if decision.unit[slot.index()].is_some() {
+        if decision.moves[place].unit.is_some() {
             first_unit[document] = first_unit[document].min(place as u32);
         }
     }
@@ -186,7 +186,7 @@ pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences:
     let caption = |slot: Slot, bits: u32| {
         let at = slot.index();
         let document = usize::from(fences.at(at).document);
-        decision.rule[at] == Rule::FrontMatter
+        decision.line(at).rule == Rule::FrontMatter
             && (slots.page(slot) < opening[document].saturating_add(2) || fences.place[at] < first_unit[document])
             && (evidence.words[at] & bits != 0 || bits & WORD_FIELD != 0 && crate::text::paragraphs::field_label(slots.line(pages, slot)))
     };
@@ -216,11 +216,11 @@ pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences:
             }
         }
         // Its contents list's entries.
-        if order.iter().any(|&slot| role[slot.index()] == Role::Contents) {
-            let lines: Vec<Slot> = order.iter().copied().filter(|&slot| role[slot.index()] != Role::LineLabel).collect();
+        if order.iter().any(|&slot| role(slot.index()) == Role::Contents) {
+            let lines: Vec<Slot> = order.iter().copied().filter(|&slot| role(slot.index()) != Role::LineLabel).collect();
             let read: Vec<&Line> = lines.iter().map(|&slot| slots.line(pages, slot)).collect();
             let rows: Vec<u32> = lines.iter().map(|&slot| evidence.row(slots, slot)).collect();
-            let entries = headings::contents::entry_rows(page.width, &read, &rows, |at| role[lines[at].index()] == Role::Contents);
+            let entries = headings::contents::entry_rows(page.width, &read, &rows, |at| role(lines[at].index()) == Role::Contents);
             for (slot, number) in lines.into_iter().zip(entries) {
                 entry[slot.index()] = number;
             }
@@ -229,7 +229,7 @@ pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences:
         let mut previous: Option<Slot> = None;
         for &slot in order {
             let at = slot.index();
-            let kind = class(role[at]);
+            let kind = class(role(at));
             if kind == Class::Edge {
                 previous = Some(slot);
                 continue;
@@ -240,16 +240,16 @@ pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences:
                 if fences.margin_number[before] == Some(slot) {
                     return false;
                 }
-                let free = !decision.joined[at] && fences.continues[at].is_none();
-                class(role[before]) != kind
+                let free = !decision.line(at).joined && fences.continues[at].is_none();
+                class(role(before)) != kind
                     || fences.ctx[before] != fences.ctx[at]
                     || match kind {
                         Class::Body => {
-                            decision.unit[at].is_some()
-                                || (opens(slot) || closes(prior) && free) && !decision.joined[at] && !same_row(evidence, slots, prior, slot)
+                            decision.line(at).unit.is_some()
+                                || (opens(slot) || closes(prior) && free) && !decision.line(at).joined && !same_row(evidence, slots, prior, slot)
                                 || free && paragraph[at] != paragraph[before]
                         }
-                        Class::Heading | Class::Title | Class::MarginalNote => !decision.joined[at],
+                        Class::Heading | Class::Title | Class::MarginalNote => !decision.line(at).joined,
                         Class::Note => evidence.label[at].is_some(),
                         Class::Contents => entry[at] != entry[before],
                         Class::Table => paragraph[at] != paragraph[before] || fences.cell[at] != fences.cell[before],

@@ -258,12 +258,13 @@ pub(crate) fn weigh(pages: &[Page],
         spoken[slots.page(Slot(slot as u32))] = true;
     }
     for (context, sequence) in sequences.lines.iter().enumerate() {
-        let role = &decision.role;
-        let rule = &decision.rule;
+        let record = |at: usize| &decision.moves[decision.place[at] as usize];
+        let role = |at: usize| record(at).role;
+        let rule = |at: usize| record(at).rule;
         // Heard, a line a marker opens is weighed too, a heading its rival; a paragraph number is fixed.
         let unsettled = |at: usize| {
-            role[at] == Role::Open
-                || matches!(rule[at], Rule::Opener | Rule::Caption) && fences.paragraphs.count[at].is_none() && fences.paragraphs.held[at].is_empty()
+            role(at) == Role::Open
+                || matches!(rule(at), Rule::Opener | Rule::Caption) && fences.paragraphs.count[at].is_none() && fences.paragraphs.held[at].is_empty()
         };
         let eligible = |slot: Slot| {
             let at = slot.index();
@@ -277,7 +278,7 @@ pub(crate) fn weigh(pages: &[Page],
                 && fences.continues[at].is_none()
                 && !unnamed(slot)
         };
-        let prose = |slot: Slot| body_like(role[slot.index()]) && (width(slot) >= 0.7 || line(slot).text.trim().chars().count() >= 90);
+        let prose = |slot: Slot| body_like(role(slot.index())) && (width(slot) >= 0.7 || line(slot).text.trim().chars().count() >= 90);
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut k = 0;
         while k < sequence.len() {
@@ -347,7 +348,7 @@ pub(crate) fn weigh(pages: &[Page],
                 .filter(|&next| slots.page(next) == page)
                 .map(|next| ((line(next).bbox[1] - line(last).bbox[3]) / measure(last).height).clamp(-3.0, 3.0));
             let words = text.split_whitespace().count();
-            let opens_prose = next.is_some_and(|next| prose(next) || decision.unit[next.index()].is_some());
+            let opens_prose = next.is_some_and(|next| prose(next) || record(next.index()).unit.is_some());
             let fields_follow = next.zip(after).is_some_and(|(next, after)| {
                 !prose(next) && !prose(after) && slots.page(next) == page && width(next) < 0.5 && width(after) < 0.5
             });

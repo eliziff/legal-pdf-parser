@@ -3,46 +3,52 @@ use legal_pdf_core::model::Page;
 use crate::headings::{body_flow_edge, carries_a_sentence_onto, continues_prose_from};
 use crate::model::{Evidence, Role, Rule, Slot, Slots};
 use crate::notes::reference_wrapped_onto;
+use crate::text::paragraphs::continues_onto;
 use super::{Continuation, Fences};
 
 impl Fences {
     /// How each line no fence took goes on with the line before it, in its reading context and
-    /// stream, in reading order: on one page by any continuation, across a page by the text's flow.
+    /// stream, in reading order: on one page by any continuation, across a page by the text's flow or
+    /// as the two pages set the stream's lines (`continues_onto`).
     pub(crate) fn read_continuations(&mut self, pages: &[Page], slots: &Slots) {
-        self.continues = vec![None; slots.len()];
-        let mut last: Vec<Option<Slot>> = vec![None; self.contexts.len() * 2];
-        for &slot in &self.order {
-            if self.role[slot.index()] != Role::Open {
-                continue;
+        // Each stream's lines, page by page.
+        let mut streams: Vec<Vec<Vec<Slot>>> = vec![Vec::new(); self.contexts.len() * 2];
+        for &slot in self.order.iter().filter(|slot| self.role[slot.index()] == Role::Open) {
+            let runs = &mut streams[usize::from(self.ctx[slot.index()]) * 2 + usize::from(self.band[slot.index()])];
+            match runs.last_mut() {
+                Some(run) if slots.page(run[0]) == slots.page(slot) => run.push(slot),
+                _ => runs.push(vec![slot]),
             }
-            let band = self.band[slot.index()];
-            let stream = usize::from(self.ctx[slot.index()]) * 2 + usize::from(band);
-            let Some(prior) = last[stream].replace(slot) else {
-                continue;
-            };
-            let (line, before) = (slots.line(pages, slot), slots.line(pages, prior));
-            let page_slot = slots.page(slot);
-            self.continues[slot.index()] = if body_flow_edge(before, line) {
-                Some(Continuation::Flow)
-            } else if slots.page(prior) != page_slot {
-                None
-            } else {
-                let page = &pages[page_slot];
-                let range = slots.on(page_slot);
-                let start = range.start as usize;
-                let (at, prior_at) = (slot.index() - start, prior.index() - start);
-                let body = |other: usize| self.role[start + other] == Role::Open && self.band[start + other] == band;
-                if reference_wrapped_onto(&page.lines, at) {
-                    Some(Continuation::Reference)
-                } else if carries_a_sentence_onto(page, prior_at, at, body) {
-                    Some(Continuation::Sentence)
-                } else if continues_prose_from(page, prior_at, at, body) {
-                    Some(Continuation::Prose)
-                } else {
-                    None
-                }
-            };
         }
+        let mut continues = vec![None; slots.len()];
+        let read = |run: &[Slot]| run.iter().map(|&slot| slots.line(pages, slot)).collect::<Vec<_>>();
+        for runs in &streams {
+            for (k, run) in runs.iter().enumerate() {
+                for (j, &slot) in run.iter().enumerate() {
+                    let Some(prior) = (if j > 0 { Some(run[j - 1]) } else { k.checked_sub(1).map(|k| runs[k][runs[k].len() - 1]) }) else { continue };
+                    let (line, before) = (slots.line(pages, slot), slots.line(pages, prior));
+                    continues[slot.index()] = if body_flow_edge(before, line) {
+                        Some(Continuation::Flow)
+                    } else if j == 0 {
+                        continues_onto(&read(&runs[k - 1]), &read(run)).then_some(Continuation::Page)
+                    } else {
+                        let (page, start, band) = (&pages[slots.page(slot)], slots.on(slots.page(slot)).start as usize, self.band[slot.index()]);
+                        let (at, prior_at) = (slot.index() - start, prior.index() - start);
+                        let body = |other: usize| self.role[start + other] == Role::Open && self.band[start + other] == band;
+                        if reference_wrapped_onto(&page.lines, at) {
+                            Some(Continuation::Reference)
+                        } else if carries_a_sentence_onto(page, prior_at, at, body) {
+                            Some(Continuation::Sentence)
+                        } else if continues_prose_from(page, prior_at, at, body) {
+                            Some(Continuation::Prose)
+                        } else {
+                            None
+                        }
+                    };
+                }
+            }
+        }
+        self.continues = continues;
     }
 
     /// The statute's running heads naming their page's sections, where its spine bears them out

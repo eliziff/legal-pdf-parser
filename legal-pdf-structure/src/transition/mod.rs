@@ -141,7 +141,7 @@ fn read_gold(path: &Path) -> GoldLabels {
 /// readings in `table`; and the dump DOC is fitted on, where it is asked. None where neither reads: the output is tier 0's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, geometry: &crate::layout::Geometry, sha256: &str,
-    notes: &Notes, decision: &Decision, table: &LineTable, doc: Option<&Doc>) -> Option<Vec<Move>> {
+    notes: &Notes, decision: &Decision, table: &LineTable, views: &[LineView], doc: Option<&Doc>) -> Option<Vec<Move>> {
     let s = settings();
     let gold = s.gold.as_ref().and_then(|g| g.0.get(sha256));
     let oracle = s.doc_oracle && gold.is_some();
@@ -152,7 +152,6 @@ pub(crate) fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fen
     if reader.is_none() && !oracle && s.dump.is_none() { return None; }
     let measures = table.measure(pages, slots, evidence, fences, geometry, notes, decision);
     let sheet = Stylesheet::read(slots, fences, table, &measures, decision);
-    let views = LineView::all(evidence, fences, table);
     let texts: Vec<&str> = fences.order.iter().map(|&slot| slots.line(pages, slot).text.as_str()).collect();
     let ids: Vec<&str> = fences.order.iter().map(|&slot| slots.line(pages, slot).id.as_str()).collect();
     let line_pages: Vec<usize> = fences.order.iter().map(|&slot| slots.page(slot)).collect();
@@ -189,10 +188,10 @@ pub(crate) fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fen
     }
     // Detect-Order-Construct's decoding from the gold's answers, else its reading where its stages are given.
     if oracle {
-        return Some(doc::oracle(&gold_rows, &ranks, &views, &texts, &line_pages));
+        return Some(doc::oracle(&gold_rows, &ranks, views, &texts, &line_pages));
     }
     #[cfg(feature = "encoder")]
-    return reader.and_then(|reader| reader.read(table, &measures, &views, &texts, &line_pages, &doc::Style::of(&sheet, table, &measures))
+    return reader.and_then(|reader| reader.read(table, &measures, views, &texts, &line_pages, &doc::Style::of(&sheet, table, &measures))
         .map_err(|error| eprintln!("transition parser DOC {sha256}: {error}")).ok());
     #[cfg(not(feature = "encoder"))]
     None

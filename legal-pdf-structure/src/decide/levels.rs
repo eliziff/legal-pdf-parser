@@ -326,11 +326,11 @@ pub(crate) fn heading_levels(
         let mut units: Vec<Vec<Slot>> = Vec::new();
         let mut previous: Option<Slot> = None;
         for &slot in lines {
-            if decision.role[slot.index()] != Role::Heading {
+            if decision.line(slot.index()).role != Role::Heading {
                 previous = None;
                 continue;
             }
-            let joins = previous.is_some_and(|prior| slots.page(prior) == slots.page(slot)) && decision.joined[slot.index()];
+            let joins = previous.is_some_and(|prior| slots.page(prior) == slots.page(slot)) && decision.line(slot.index()).joined;
             match units.last_mut() {
                 Some(current) if joins => current.push(slot),
                 _ => units.push(vec![slot]),
@@ -425,7 +425,7 @@ pub(crate) fn heading_levels(
                 }
             };
             for &slot in unit {
-                decision.level[slot.index()] = level.min(usize::from(u8::MAX)) as u8;
+                decision.moves[decision.place[slot.index()] as usize].level = level.min(usize::from(u8::MAX)) as u8;
             }
             (prior_level, prior_read, prior_numbered) = (Some(level), Some(read), rung.is_some());
         }

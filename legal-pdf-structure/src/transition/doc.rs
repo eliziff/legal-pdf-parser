@@ -208,7 +208,7 @@ fn moves_of(lines: &Lines, regions: &Regions, units: &Units, views: &[LineView],
         if let Some(reading) = views[k].reading(chosen_reading) { open.count(reading, region); }
         mv.opens = true;
         if region == HEADING {
-            mv.level = units.level[i].clamp(1, 9) as i8;
+            mv.level = units.level[i].clamp(1, 9) as u8;
         } else if BODY.contains(&region) {
             mv.depth = units.level[i].clamp(1, 9) as u8;
         }

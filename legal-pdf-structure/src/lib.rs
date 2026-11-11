@@ -188,9 +188,13 @@ fn output(pages: &mut [Page],
     let mut diagnostics = std::mem::take(&mut fences.diagnostics);
     // One line table for both tiers: tier 0 reads it, and the walk measures it for DOC.
     let table = LineTable::plain(pages, slots, evidence, &fences, &runs.before, transition::confusions());
-    let (mut notes, decision) = tier0::decide(pages, slots, evidence, &mut fences, runs, geometry, outline, &table, trace.is_some());
+    let mut notes = decide::Notes::read(pages, slots, evidence, &fences, runs);
+    // The fences' roles are the decision's to fill from here.
+    let fenced = (std::mem::take(&mut fences.role), std::mem::take(&mut fences.rule));
+    let views = LineView::all(evidence, &fences, &table);
+    let mut decision = tier0::decide(pages, slots, evidence, &fences, runs, geometry, outline, &notes, &views, fenced, trace.is_some());
     // DOC's reading where it is given, read off the pages as they came, before this reading writes and orders them.
-    let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, &identity.source_sha256, &notes, &decision, &table, doc);
+    let doc = transition::over_tier0(pages, slots, evidence, &fences, geometry, &identity.source_sha256, &notes, &decision, &table, &views, doc);
     diagnostics.append(&mut notes.diagnostics);
     if let Some(folder) = trace {
         write_trace(folder, &identity.source_sha256, pages, slots, evidence, &fences, runs, &notes, &decision, &table.readings, &table.references);
@@ -201,7 +205,7 @@ fn output(pages: &mut [Page],
     // The lines are read in reading order from here on, the pairer's and the output's: each page's put in it once.
     slots.read_in_order(pages, &fences.order);
     let slots: &Slots = slots;
-    let decided = Decided::of(pages, slots, &fences.order, &fences.ctx, &fences.contexts, &fences.paragraphs.held);
+    let decided = Decided::of(pages, slots, &fences);
     let pages: &[Page] = pages;
     // A line joins the one before it where evidence reads that line's marker standing beside it (`Evidence::beside`).
     let index = PdfTextIndex::from_pages(pages, |before, line| slots.of_id(&before.id).and_then(|at| evidence.beside[at.index()]).is_some_and(|beside| slots.of_id(&line.id) == Some(beside)));
@@ -212,18 +216,16 @@ fn output(pages: &mut [Page],
     diagnostics.extend(pairing.diagnostics);
     give_back(&mut zones, slots, &notes);
     diagnostics.extend(unmatched_reference_diagnostics(fences.order.iter().map(|&slot| (slots.line(pages, slot), zones[slot.index()])), &notes, &index, &decided));
-    let views = LineView::all(evidence, &fences, &table);
-    let moves = tier0::moves_of(slots, &fences, runs, &views, &decision, &tier0::reading_regions(pages, slots, &fences, &zones, &blocks), &notes);
-    // The writer takes DOC's move for each line where DOC read one, but for the notes, the pairer's (a line either reads
-    // as a note keeps this reading's move). DOC reads the same table, so its reading of a marker names one of this
-    // reading's.
+    tier0::moves_of(slots, &fences, runs, &views, &mut decision, &tier0::reading_regions(pages, slots, &fences, &zones, &blocks), &notes);
     // The units the moves make, in one walk: each line opening one or in the one its move names, the state moved by
     // each move; as a line joins its unit the seam with the unit's line before it is written (`joining::seam`): a dropped
     // hyphen a manuscript edit, a join with no space a join, a page crossed a continuation; and each hyphen inside a line
-    // that splits a word (`joining::split_words`) an edit. A line's move is DOC's where it read one, but for the notes,
-    // the pairer's (a line either reads as a note keeps this reading's move); a body unit t0 opens takes its numbering's
-    // depth (`State::stack_depth`).
-    let (index, fences, decided, tier0) = (&index, &fences, &decided, &moves);
+    // that splits a word (`joining::split_words`) an edit. A line's move is DOC's where it read one, grouped in the line's
+    // record, the run members tier 0 opens on kept; but for the notes, the pairer's (a line either reads as a note keeps
+    // this reading's move). DOC reads the same table, so its reading of a marker names one of this reading's. A body unit
+    // t0 opens takes its numbering's depth (`State::stack_depth`).
+    let (index, fences, decided) = (&index, &fences, &decided);
+    let moves = &mut decision.moves;
     let mut notes = notes;
     let texts: Vec<String> = fences.order.iter().map(|&slot| slots.line(pages, slot).text.clone()).collect();
     let ids: Vec<String> = fences.order.iter().map(|&slot| slots.line(pages, slot).id.clone()).collect();
@@ -237,8 +239,6 @@ fn output(pages: &mut [Page],
     let mut continuations: Vec<SourceContinuation> = Vec::new();
     let place_of: HashMap<&str, usize> = ids.iter().enumerate().map(|(k, id)| (id.as_str(), k)).collect();
     let note_move = |m: &Move| matches!(m.region, NOTE | NOTE_QUOTE);
-    let doc = doc.filter(|read| read.len() == tier0.len());
-    let mut moves: Vec<Move> = Vec::with_capacity(tier0.len());
     // Units, each line opening one or in the one its move names.
     let mut state = State::default();
     let mut units: Vec<Unit> = Vec::new();
@@ -247,13 +247,13 @@ fn output(pages: &mut [Page],
     // The lines the parser opened a constituent document on; a start on a line of no region passes to the next unit.
     let mut started: Vec<usize> = Vec::new();
     for (k, line) in views.iter().enumerate() {
-        let read = doc.as_ref().and_then(|read| read.get(k)).filter(|read| !note_move(read) && !note_move(&tier0[k])).cloned();
-        let walked = read.is_none();
-        let mut chosen = read.unwrap_or_else(|| tier0[k].clone());
-        if walked && chosen.opens && RANKED_BODY.contains(&chosen.region) {
-            chosen.depth = state.stack_depth(line, &chosen).min(9) as u8;
+        let record = &mut moves[k];
+        if let Some(read) = doc.as_ref().and_then(|read| read.get(k)).filter(|read| !note_move(read) && !note_move(&*record)) {
+            let read = Move { member: record.member.take(), within: std::mem::take(&mut record.within), ..read.clone() };
+            record.regroup(read);
+        } else if record.opens && RANKED_BODY.contains(&record.region) {
+            record.depth = state.stack_depth(line, record).min(9) as u8;
         }
-        moves.push(chosen);
         let chosen = &moves[k];
         state.apply(line, chosen);
         if chosen.starts {
@@ -378,7 +378,7 @@ fn output(pages: &mut [Page],
         let region = if unit.region == TABLE { "text" } else { REGIONS[usize::from(unit.region)] };
         // The member a settled unit opens on (tier 0's move at its first line); a heading numbering a provision is that
         // provision, a heading still.
-        let opening = &tier0[unit.lines[0]];
+        let opening = &moves[unit.lines[0]];
         let member = opening.member.map(|(run, at)| &runs.runs[run as usize].members[at as usize]);
         let (kind, role) = match region {
             "heading" if member.is_some_and(|member| member.kind == Some(legal_structure_model::UnitRole::Section)) => (NodeKind::Section, Some(PrimaryRole::Heading)),

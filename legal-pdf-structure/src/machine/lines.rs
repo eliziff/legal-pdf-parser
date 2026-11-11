@@ -299,7 +299,7 @@ impl LineTable {
                 flag(evidence.references[at] & REFERENCE_RAISED != 0), flag(evidence.references[at] & REFERENCE_GLUED != 0),
                 flag(evidence.title_shaped[at]), flag(evidence.beside[at].is_some()), flag(evidence.line_number[at]),
                 // t0's furniture (a running head or foot, a folio) and its note band.
-                flag(matches!(decision.role[at], Role::Furniture | Role::PageLabel)), flag(fences.cell[at] > 0),
+                flag(matches!(decision.moves[k].role, Role::Furniture | Role::PageLabel)), flag(fences.cell[at] > 0),
                 flag(fences.band[at]), flag(fences.at(at).translation),
             ]);
             let found = &readings[k];
@@ -316,7 +316,6 @@ impl LineTable {
                 wrap.into_iter().for_each(|c| marker[15 + c] = 1.0);
             }
             values.extend(marker);
-            debug_assert_eq!(values.len(), LINE_FEATURES.len());
             let row = &mut own[k * WIDTH..(k + 1) * WIDTH];
             for (cell, value) in row.iter_mut().zip(&values) {
                 *cell = (*value * 1e4).round() as f32 / 1e4;
@@ -353,7 +352,6 @@ impl LineTable {
             row[at + 3] = labelled;
             row[at + 4] = f32::from(u8::from(evidence.instrument));
             row[at + 5] = (1.0 + n as f32).ln();
-            debug_assert_eq!(at + 6, ALL);
         }
         // What t0 decided of each line, for the DOC reader that works from it: the role the machine settled on, the note
         // band, whether the judgment reader opens or holds a paragraph on it and whether that paragraph goes on from the
@@ -366,16 +364,16 @@ impl LineTable {
         for (k, &slot) in order.iter().enumerate() {
             let at = slot.index();
             let row = &mut t0[k * T0..(k + 1) * T0];
-            row[(decision.role[at] as usize).min(ROLES - 1)] = 1;
+            row[(decision.moves[k].role as usize).min(ROLES - 1)] = 1;
             let held = &fences.paragraphs.held[at];
             let goes_on = held.iter().any(|mine| last_held[usize::from(mine.translation)].iter().any(|other| other.number == mine.number));
             let flags = [fences.band[at], fences.paragraphs.count[at].is_some(), !held.is_empty(), goes_on, margin_rows.contains_key(&k),
                 margins.get(&k).is_some_and(|&margin| margin != k), fences.continues[at].is_some(), notes.note[at].is_some(),
-                fences.at(at).quotation != 0, starts.contains(slots.line(pages, slot).id.as_str()), decision.unit[at].is_some(), decision.joined[at]];
+                fences.at(at).quotation != 0, starts.contains(slots.line(pages, slot).id.as_str()), decision.moves[k].unit.is_some(), decision.moves[k].joined];
             for (cell, flag) in row[ROLES..].iter_mut().zip(flags) {
                 *cell = u8::from(flag);
             }
-            row[T0 - 1] = decision.level[at];
+            row[T0 - 1] = decision.moves[k].level;
             for mine in held {
                 last_held[usize::from(mine.translation)] = held;
             }

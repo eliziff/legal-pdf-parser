@@ -1,6 +1,6 @@
 //! A stream's text, written as a provider writes a decision: a block to a line.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use legal_pdf_core::model::{sentence_ended, Line};
 use crate::model::Slot;
 use super::{Reading, Stream};
@@ -30,7 +30,6 @@ impl Written {
 /// What the page says of the lines a stream keeps.
 struct Flow {
     printed: HashMap<Slot, (usize, usize)>,
-    flows: HashSet<Slot>,
     to_number: Vec<usize>,
 }
 
@@ -38,7 +37,7 @@ impl Reading<'_> {
     fn flow(&self, kept: &[Slot], stream: Stream) -> Flow {
         let (pages, slots, evidence) = (self.pages, self.slots, self.evidence);
         // The printed paragraph each line stands in, as the page reader reads a page (its own leading, first lines
-        // set in, a short last line, a scan's blanks) and a paragraph over a page (`continues_onto`).
+        // set in, a short last line, a scan's blanks); a paragraph over a page is the fences' (`Fences::continues`).
         let mut runs = Vec::<&[Slot]>::new();
         let mut from = 0;
         for at in 1..=kept.len() {
@@ -50,14 +49,10 @@ impl Reading<'_> {
         let read: Vec<Vec<&Line>> = runs.iter().map(|run| run.iter().map(|&slot| slots.line(pages, slot)).collect()).collect();
         let measure = crate::text::paragraphs::measure_of(&read);
         let mut printed = HashMap::<Slot, (usize, usize)>::new();
-        let mut flows = HashSet::<Slot>::new();
         for (k, run) in runs.iter().enumerate() {
             let rows: Vec<u32> = run.iter().map(|&slot| evidence.row(slots, slot)).collect();
             let found = crate::text::paragraphs::paragraphs_of(&read[k], &rows, &vec![true; run.len()], measure);
             printed.extend(run.iter().zip(&found).filter_map(|(&slot, paragraph)| Some((slot, (k, (*paragraph)?)))));
-            if k > 0 && crate::text::paragraphs::continues_onto(&read[k - 1], &read[k]) {
-                flows.insert(run[0]);
-            }
         }
         // How many lines each line stands before the next that opens on a number (none after the last).
         let mut to_number = vec![usize::MAX; kept.len()];
@@ -68,7 +63,7 @@ impl Reading<'_> {
             }
             to_number[at] = number.map_or(usize::MAX, |number| number - at);
         }
-        Flow { printed, flows, to_number }
+        Flow { printed, to_number }
     }
 
     /// A first paragraph's number fused to its judge's drop capital: "1I" / "ACOBUCCI J. (dissenting) -- ...".
@@ -99,7 +94,7 @@ impl Reading<'_> {
         let figure = words.next().is_some_and(|first| first.chars().all(|c| c.is_ascii_digit())) && words.next().is_some_and(|word| word.starts_with(char::is_lowercase));
         let wrapped_figure = figure && !sentence_ended(&above.text) && !above.text.trim_end().ends_with(':');
         // A line goes on with the printed paragraph it stands in, unless it opens on a marker of its own.
-        let same = (evidence.marker[at].is_none() || wrapped_figure) && (flow.flows.contains(&slot) || flow.printed.get(&slot).is_some_and(|paragraph| flow.printed.get(&before) == Some(paragraph)));
+        let same = (evidence.marker[at].is_none() || wrapped_figure) && flow.printed.get(&slot).is_some_and(|paragraph| flow.printed.get(&before) == Some(paragraph));
         // The last few lines before a number, under a line ending a sentence, stand on their own, whatever the
         // page's geometry says: whether they head what follows is the reader's to say (`trailing_headings`).
         // A line in the body's own type ending as a sentence or a lead-in does is the paragraph's words, and so are the
