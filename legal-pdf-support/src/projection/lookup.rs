@@ -126,8 +126,6 @@ pub enum PdfLookupStatus {
 #[derive(Serialize)]
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct PdfStructureLookup {
-    #[cfg_attr(feature = "binding-types", ts(type = "\"legalpdf.structure-lookup.v1\""))]
-    pub schema_version: &'static str,
     pub requested: PdfLookupRequest,
     /// The kind of unit the request asks for: a page, a transcript's line, a paragraph, a note or a provision.
     #[cfg_attr(feature = "binding-types", ts(type = "\"page\" | \"line\" | \"paragraph\" | \"footnote\" | \"section\""))]
@@ -138,7 +136,6 @@ pub struct PdfStructureLookup {
     pub matches: Vec<String>,
     pub pages: Vec<PdfLookupPage>,
     pub status: PdfLookupStatus,
-    pub exact: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     #[cfg_attr(feature = "binding-types", ts(as = "Option<String>", optional))]
     pub payload_sha256: String,
@@ -160,7 +157,6 @@ pub(crate) fn result(
         requested.end_locator = None;
     }
     PdfStructureLookup {
-        schema_version: "legalpdf.structure-lookup.v1",
         kind: match input.locator_kind.as_str() {
             "page" => "page",
             "line" => "line",
@@ -175,7 +171,6 @@ pub(crate) fn result(
         matches: Vec::new(),
         pages: Vec::new(),
         status,
-        exact: status == PdfLookupStatus::Found,
         payload_sha256: String::new(),
         page_text_sha256: String::new(),
         error,
