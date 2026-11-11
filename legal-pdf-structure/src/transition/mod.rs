@@ -36,6 +36,12 @@ mod doc;
 pub use doc::Reader as Doc;
 #[cfg(not(feature = "encoder"))]
 pub enum Doc {}
+#[cfg(not(feature = "encoder"))]
+impl Doc {
+    pub fn load(_: &Path, _: Option<&Path>, _: bool, _: bool) -> Result<Self, String> {
+        Err("this parser was built without DOC (the encoder feature)".to_owned())
+    }
+}
 
 /// The region-and-opening classes (`region * 2 + opens`) DOC's line head scores.
 const CLASSES: usize = 34;

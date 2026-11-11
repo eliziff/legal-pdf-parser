@@ -304,40 +304,14 @@ fn cache_key(
     serialization_sha256(&value)
 }
 
-/// A PDF's mode, which the structure census grades apart: born digital, or read by recognition (any page of it).
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum PdfMode {
-    DigitalBorn,
-    Recognized,
-}
+/// The modes ("born-digital", or "recognized" where recognition read a page) whose census promoted DOC, the structure
+/// stage's tier 1, over tier 0: none yet, so a request naming DOC is read by tier 0 in every mode.
+const DOC_PROMOTED: &[&str] = &[];
 
-/// The modes whose census promoted DOC (the structure stage's tier 1) over tier 0: none yet, so a request naming DOC is
-/// read by tier 0 in every mode.
-const DOC_PROMOTED: &[PdfMode] = &[];
-
-impl PdfMode {
-    fn of(pages: &[legal_pdf_core::model::Page]) -> Self {
-        if pages.iter().any(|page| page.source != "native") { Self::Recognized } else { Self::DigitalBorn }
-    }
-}
-
-/// DOC's stages under a request's model pack, loaded once a process (each parse reads on sessions of its own), and their
-/// identity: their export's settings (`docparse.json`), which each fit writes anew.
-#[cfg(feature = "doc")]
-fn doc_reader(options: &crate::contract::DocOptions) -> Result<(std::sync::Arc<Doc>, String)> {
-    type Loaded = std::sync::Mutex<std::collections::HashMap<PathBuf, (std::sync::Arc<Doc>, String)>>;
-    static LOADED: OnceLock<Loaded> = OnceLock::new();
-    let mut loaded = LOADED.get_or_init(Loaded::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(found) = loaded.get(&options.model_pack) {
-        return Ok(found.clone());
-    }
-    let settings = options.model_pack.join("docparse.json");
-    let settings = fs::read(&settings).map_err(|source| Error::Io { path: settings, source })?;
-    let reader = Doc::load(&options.model_pack, options.runtime.as_deref(), false, false).map_err(Error::Message)?;
-    let found = (std::sync::Arc::new(reader), format!("{:x}", Sha256::digest(settings)));
-    loaded.insert(options.model_pack.clone(), found.clone());
-    Ok(found)
+/// What a request's DOC is keyed by: its export's settings (`docparse.json`), which each fit writes anew.
+fn doc_identity(doc: &crate::contract::DocOptions) -> Result<String> {
+    let path = doc.model_pack.join("docparse.json");
+    fs::read(&path).map(|settings| format!("{:x}", Sha256::digest(settings))).map_err(|source| Error::Io { path, source })
 }
 
 /// The extraction's structure, its moves DOC's where the request names `doc` and the PDF's mode is promoted, else tier 0's.
@@ -345,9 +319,11 @@ fn derive_extracted(
     extracted: &mut ExtractedPdf,
     source_hash: &str,
     semantic_profile: Option<DetectionProfile>,
-    doc: Option<&Doc>,
+    doc: Option<&crate::contract::DocOptions>,
 ) -> Result<StructureOutput> {
-    let doc = doc.filter(|_| DOC_PROMOTED.contains(&PdfMode::of(&extracted.pages)));
+    let mode = if extracted.pages.iter().any(|page| page.source != "native") { "recognized" } else { "born-digital" };
+    let doc = doc.filter(|_| DOC_PROMOTED.contains(&mode)).map(|doc| Doc::load(&doc.model_pack, doc.runtime.as_deref(), false, false))
+        .transpose().map_err(|error| Error::Message(error).failure(FailureKind::Parser))?;
     let mut derived = legal_pdf_structure::derive(
         &mut extracted.pages,
         &extracted.separators,
@@ -358,7 +334,7 @@ fn derive_extracted(
             page_labels: extracted.metadata.embedded_page_labels.clone(),
         },
         std::env::var_os("LEGALPDF_DECISION_TRACE").map(PathBuf::from).as_deref(),
-        doc,
+        doc.as_ref(),
     )?;
     extracted.diagnostics.append(&mut derived.diagnostics);
     Ok(derived)
@@ -405,7 +381,7 @@ fn derive_document(
     source_hash: &str,
     key: &str,
     semantic_profile: Option<DetectionProfile>,
-    doc: Option<&Doc>,
+    doc: Option<&crate::contract::DocOptions>,
     pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
 ) -> Result<PdfDocument> {
     // The witnesses passages read: the pages as extracted, before the structure stage rewrites their lines.
@@ -449,7 +425,6 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
     };
     let ocr = options.ocr.as_ref().map(OcrProvider::prepare).transpose()?;
     let providers = Providers {
-        doc: None,
         ocr_identity: ocr.as_ref().map(|provider| (provider.name().to_owned(), provider.identity().to_owned())),
         ocr,
         #[cfg(feature = "ppdoc")]
@@ -618,7 +593,7 @@ fn parsed_pdf(
         }
         return Ok(cached);
     }
-    let (key, mut providers) = reading(&source_hash, options)?;
+    let (key, providers) = reading(&source_hash, options)?;
     if let Some(cached) = cached_document(&cache_root, &key, &source_hash) {
         validate_output_size(&cached, options)?;
         return Ok(Some(cached));
@@ -626,9 +601,8 @@ fn parsed_pdf(
     let Some(bytes) = bytes else {
         return Ok(None);
     };
-    let doc = providers.doc.take();
     let extracted = recognized_extraction(bytes, &source_hash, options, Some(&cache_root), providers, progress, require_cache_write)?;
-    let parsed = derive_document(extracted, &source_hash, &key, options.profile, doc.as_deref(), None)?;
+    let parsed = derive_document(extracted, &source_hash, &key, options.profile, options.doc.as_ref(), None)?;
     validate_output_size(&parsed, options)?;
     let cache_path = parse_cache_root(&cache_root).join("documents").join(format!("{key}.json.gz"));
     match profile::measure("document_cache_write", || write_gzip_json(&cache_path, &parsed)) {
@@ -660,16 +634,10 @@ fn reading(source_hash: &str, options: &PdfRequest) -> Result<(String, Providers
         Some(supplied) => Some(("supplied".to_owned(), supplied.identity(source_hash)?)),
         None => ocr_identity,
     };
-    #[cfg(feature = "doc")]
-    let doc = profile::measure("provider_identity_doc", || options.doc.as_ref().map(doc_reader).transpose())
-        .map_err(|error| error.failure(FailureKind::Parser))?;
-    #[cfg(not(feature = "doc"))]
-    let doc: Option<(std::sync::Arc<Doc>, String)> = None;
+    let doc = options.doc.as_ref().map(doc_identity).transpose()?;
     let ocr_pair = ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
-    let key = cache_key(source_hash, document_identity(), ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile,
-        doc.as_ref().map(|(_, identity)| identity.as_str()));
+    let key = cache_key(source_hash, document_identity(), ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile, doc.as_deref());
     Ok((key, Providers {
-        doc: doc.map(|(reader, _)| reader),
         ocr_identity,
         #[cfg(feature = "ocr")]
         ocr: ocr_prepared,
@@ -703,9 +671,8 @@ fn source_hash(bytes: Option<&[u8]>, options: &PdfRequest) -> Result<String> {
 }
 
 /// The providers a parse reads its pages with, prepared: its recognizer and the identity its
-/// readings are cached under, its layout model, and DOC where the request names it.
+/// readings are cached under, and its layout model.
 struct Providers {
-    doc: Option<std::sync::Arc<Doc>>,
     ocr_identity: Option<(String, String)>,
     #[cfg(feature = "ocr")]
     ocr: Option<PreparedOcrProvider>,
