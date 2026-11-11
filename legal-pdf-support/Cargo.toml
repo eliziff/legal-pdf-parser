@@ -7,6 +7,8 @@ license = "MIT"
 [features]
 default = []
 ppdoc = ["dep:image", "dep:libloading", "legal-pdf-core/render"]
+# TypeScript declarations of the types the engine hands JavaScript (the engine's export-types), never a runtime build.
+binding-types = ["dep:ts-rs", "legal-pdf-core/binding-types", "legal-structure-model/binding-types"]
 
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
@@ -21,6 +23,7 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 sha2 = "0.10"
 unicode-normalization = "0.1"
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl"] }
 
 # Unit tests run the structure engine, which programs supply at run time.
 [dev-dependencies]

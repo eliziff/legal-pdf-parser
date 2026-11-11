@@ -20,6 +20,7 @@ pub enum Error {
 /// What kind of failure stopped a PDF's parse: the source (password-protected, unreadable, or changed while it was
 /// read), the runtime of recognition or of the layout model, or the parser itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     Encrypted,

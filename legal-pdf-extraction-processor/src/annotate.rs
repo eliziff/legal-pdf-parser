@@ -10,6 +10,7 @@ use std::collections::HashSet;
 /// A mark as `decodeAnnotationSet` (shared/pdf-annotations.mjs) returns it: rects are page fractions
 /// [left, top, right, bottom] with the origin at the top left of the page as it is displayed.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct AnnotationMark {
     pub id: String,
     pub kind: String,
@@ -19,6 +20,7 @@ pub struct AnnotationMark {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotationFragment {
     pub page_number: u32,

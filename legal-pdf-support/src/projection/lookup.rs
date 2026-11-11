@@ -10,6 +10,7 @@ use legal_document_query::{note_named, DocumentQuery, Provisions};
 pub type PrintedParagraph = (usize, Vec<usize>);
 
 #[derive(Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct PdfLookupRequest {
     pub locator_kind: String,
     pub locator: String,
@@ -24,6 +25,7 @@ pub struct PdfLookupRequest {
     /// The instrument a provision is of, where the PDF prints several ("Canadian Charter of Rights and Freedoms" in
     /// "The Constitution Acts 1867 to 1982").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "binding-types", ts(optional))]
     pub instrument: Option<String>,
 }
 
@@ -59,6 +61,7 @@ impl PdfLookupRequest {
 /// it, how far its pages' text is trusted, a numbered paragraph's other printings (a parallel report's columns), and a
 /// note's count of its label's printings up to it and the page its first call stands on.
 #[derive(Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct PdfLookupUnit {
     pub node: StructureNode,
     pub text: String,
@@ -68,10 +71,13 @@ pub struct PdfLookupUnit {
     pub ranges: Vec<ScalarRange>,
     pub confidence: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "binding-types", ts(as = "Option<Vec<StructureNode>>", optional))]
     pub printings: Vec<StructureNode>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "binding-types", ts(optional))]
     pub occurrence: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "binding-types", ts(optional))]
     pub reference_page: Option<u32>,
 }
 
@@ -94,12 +100,14 @@ impl PdfLookupUnit {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct PdfLookupPage {
     pub page_number: u32,
     pub text: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum PdfLookupStatus {
     Found,
@@ -110,10 +118,13 @@ pub enum PdfLookupStatus {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct PdfStructureLookup {
+    #[cfg_attr(feature = "binding-types", ts(type = "\"legalpdf.structure-lookup.v1\""))]
     pub schema_version: &'static str,
     pub requested: PdfLookupRequest,
     /// The kind of unit the request asks for: a page, a transcript's line, a paragraph, a note or a provision.
+    #[cfg_attr(feature = "binding-types", ts(type = "\"page\" | \"line\" | \"paragraph\" | \"footnote\" | \"section\""))]
     pub kind: &'static str,
     pub units: Vec<PdfLookupUnit>,
     pub before: Vec<PdfLookupUnit>,
@@ -123,10 +134,13 @@ pub struct PdfStructureLookup {
     pub status: PdfLookupStatus,
     pub exact: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "binding-types", ts(as = "Option<String>", optional))]
     pub payload_sha256: String,
     #[serde(skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "binding-types", ts(as = "Option<String>", optional))]
     pub page_text_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "binding-types", ts(optional))]
     pub error: Option<String>,
 }
 

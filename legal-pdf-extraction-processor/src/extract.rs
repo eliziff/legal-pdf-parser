@@ -97,6 +97,7 @@ pub fn extract_pdf(bytes: &[u8]) -> Result<ExtractedPdf> {
 
 /// Native opening-page witnesses for identifying a downloaded source. No recognition or structure inference.
 #[derive(serde::Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PdfOpening {
     pub page_count: usize,
@@ -104,6 +105,7 @@ pub struct PdfOpening {
 }
 
 #[derive(serde::Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PdfOpeningPage {
     #[serde(flatten)]

@@ -11,26 +11,32 @@ type Rect = [f64; 4];
 /// A passage asked for: its id, its locator (a page's is the PDF's page, from 1, unless `physical_pages` names the
 /// pages), the instrument the locator is of where the PDF prints several, and the quotations to place in it.
 #[derive(Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PassageTarget {
     pub id: String,
     #[serde(default)]
+    #[cfg_attr(feature = "binding-types", ts(optional))]
     pub physical_pages: Option<Vec<u32>>,
     pub locator_kind: String,
     pub locator: String,
     /// The instrument the locator is of, where the PDF prints several ("Canadian Charter of Rights and Freedoms" in
     /// "The Constitution Acts 1867 to 1982").
     #[serde(default)]
+    #[cfg_attr(feature = "binding-types", ts(optional))]
     pub instrument: Option<String>,
     /// The quotations to place in the passage: each whole, or the part of its text a selection names.
     #[serde(default)]
+    #[cfg_attr(feature = "binding-types", ts(as = "Option<Vec<String>>", optional))]
     pub exact_quotes: Vec<String>,
     #[serde(default)]
+    #[cfg_attr(feature = "binding-types", ts(as = "Option<Vec<QuoteSelection>>", optional))]
     pub quote_selections: Vec<QuoteSelection>,
 }
 
 /// A quotation's text and the part of it (UTF-16) that is placed: its words in their context.
 #[derive(Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct QuoteSelection {
     pub text: String,
     pub start: usize,
@@ -39,18 +45,24 @@ pub struct QuoteSelection {
 
 /// Every passage asked for, placed: the rectangles are the visible crop box's, from its top left, rotation applied.
 #[derive(Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PassageGeometry {
+    #[cfg_attr(feature = "binding-types", ts(type = "\"legalpdf.passage-geometry.v1\""))]
     pub schema_version: &'static str,
     pub source_sha256: String,
     pub parser_version: String,
+    #[cfg_attr(feature = "binding-types", ts(type = "\"visible_crop_box\""))]
     pub coordinate_space: &'static str,
+    #[cfg_attr(feature = "binding-types", ts(type = "\"top_left\""))]
     pub coordinate_origin: &'static str,
+    #[cfg_attr(feature = "binding-types", ts(type = "true"))]
     pub rotation_applied: bool,
     pub targets: Vec<PlacedPassage>,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PlacedPassage {
     pub id: String,
@@ -59,6 +71,7 @@ pub struct PlacedPassage {
     pub status: PdfLookupStatus,
     /// A paragraph's: its numbers are printed on the passage, not only counted.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "binding-types", ts(optional))]
     pub printed: Option<bool>,
     pub pages: Vec<PassagePage>,
     pub quotes: Vec<PlacedQuote>,
@@ -67,11 +80,13 @@ pub struct PlacedPassage {
 /// A page as the passage is marked on it: its lines' rectangles (none for a page asked for whole), and the start of
 /// its words (2,000 UTF-16 units at most). A page that cannot be read (a scan not yet recognized) is unavailable.
 #[derive(Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PassagePage {
     pub page_number: u32,
     pub width: f64,
     pub height: f64,
+    #[cfg_attr(feature = "binding-types", ts(type = "\"native\" | \"unavailable\""))]
     pub source: &'static str,
     pub passage_rects: Vec<Rect>,
     pub text: String,
@@ -81,19 +96,23 @@ pub struct PassagePage {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PlacedQuote {
     pub text: String,
     pub status: PdfLookupStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "binding-types", ts(optional))]
     pub page_number: Option<u32>,
     pub rects: Vec<Rect>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "binding-types", ts(optional))]
     pub fragments: Option<Vec<QuoteFragment>>,
 }
 
 /// One page's part of a quotation that crosses pages.
 #[derive(Serialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteFragment {
     pub page_number: u32,
@@ -347,6 +366,7 @@ fn place_quote(pages: &[ReadPage], status: PdfLookupStatus, quote: &QuoteSelecti
 /// A unit of a Word brief whose citations are placed on the pages of a PDF saved from it: whether it is a note, its
 /// text, and its citations, each by its id, its span of the text (UTF-16) and its own text.
 #[derive(Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct BriefUnit {
     note: bool,
     text: String,
@@ -354,6 +374,7 @@ pub struct BriefUnit {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct BriefOccurrence {
     id: String,
     start: usize,

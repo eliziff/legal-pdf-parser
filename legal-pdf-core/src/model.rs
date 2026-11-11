@@ -61,6 +61,7 @@ pub fn tagged_line_role<'a>(
 /// target may be stale. `level` counts from 1 at the outline's top; `page_index` is the target's
 /// physical page, counted from 0.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct PdfOutlineEntry {
     pub title: String,
     pub level: usize,

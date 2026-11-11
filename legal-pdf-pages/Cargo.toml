@@ -5,7 +5,12 @@ edition = "2021"
 license = "MIT"
 description = "A PDF's page map: each page's printed number from what its pages print, their sequence, the PDF's own labels and a citation's first page"
 
+[features]
+# TypeScript declarations of the types the engine hands JavaScript (the engine's export-types), never a runtime build.
+binding-types = ["dep:ts-rs"]
+
 # Data in, numbers out: no PDF reading, no structure stage. An edit here rebuilds this crate and relinks.
 [dependencies]
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl"] }

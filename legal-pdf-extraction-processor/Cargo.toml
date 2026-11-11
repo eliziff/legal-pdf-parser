@@ -4,12 +4,17 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+# TypeScript declarations of the types the engine hands JavaScript (the engine's export-types), never a runtime build.
+binding-types = ["dep:ts-rs", "legal-pdf-core/binding-types"]
+
 [dependencies]
 legal-pdf-core = { path = "../legal-pdf-core" }
 lopdf = { version = "0.45.0", default-features = false }
 pdf-inspector = { workspace = true }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl"] }
 
 # Native builds read a PDF's objects in parallel; the browser engine has one thread.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

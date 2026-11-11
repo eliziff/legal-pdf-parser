@@ -11,6 +11,8 @@ ort-runtime = ["dep:ort"]
 render = ["dep:hayro"]
 # Supply this checkout's structure engine by default, for tests and command-line tools.
 structure-analysis = ["dep:legal-structure"]
+# TypeScript declarations of the types the engine hands JavaScript (the engine's export-types), never a runtime build.
+binding-types = ["dep:ts-rs", "legal-layout/binding-types"]
 
 [dependencies]
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
@@ -22,3 +24,4 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "2.0"
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl"] }

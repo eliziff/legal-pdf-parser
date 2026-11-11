@@ -46,6 +46,7 @@ pub struct EdgeLine {
 
 /// One PDF page of the map.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PdfPageBinding {
     /// The PDF page, from 1.
@@ -61,11 +62,13 @@ pub struct PdfPageBinding {
     /// Every other numbering the page prints, as printed: a record's Bates number ("000208"), an exhibit's or
     /// appendix's page ("E-162"), a chapter's page ("5-1"), a second count of pages ("other"), the PDF's own count ("pdf").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "binding-types", ts(as = "Option<Vec<PrintedNumber>>", optional))]
     pub numbers: Vec<PrintedNumber>,
 }
 
 /// One numbering a page prints besides its page number.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 pub struct PrintedNumber {
     /// "bates", "exhibit", "chapter", "other" or "pdf".
     pub kind: String,

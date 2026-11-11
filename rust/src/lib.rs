@@ -38,7 +38,7 @@ pub use legal_pdf_extraction_processor::ExtractedPdf;
 #[doc(hidden)]
 pub use legal_pdf_core::model::*;
 #[cfg(feature = "pdf")]
-pub use legal_pdf_core::{Error, FailureKind, Result};
+pub use legal_pdf_core::{AuthorityTextUnit, Error, FailureKind, Result};
 
 /// Supplies the structure engine to the parsers: its document reading, and its services on
 /// laid-out text. The first one supplied stays.
