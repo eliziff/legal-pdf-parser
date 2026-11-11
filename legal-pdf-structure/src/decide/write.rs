@@ -65,16 +65,9 @@ pub(crate) fn write_lines(pages: &mut [Page], slots: &Slots, fences: &Fences, de
         for (line, slot) in page.lines.iter_mut().zip(range.clone().map(Slot)) {
             line.exclude_from_body = decision.line(slot.index()).role == Role::LineLabel;
         }
-        match &fences.folios[page_slot] {
-            Some((slot, label)) => {
-                page.printed_label = Some(label.clone());
-                page.printed_label_line_id = Some(page.lines[(slot.0 - range.start) as usize].id.clone());
-            }
-            None => {
-                page.printed_label = None;
-                page.printed_label_line_id = None;
-            }
-        }
+        let folio = fences.folios[page_slot].as_ref();
+        page.printed_label = folio.map(|(label, _)| label.clone());
+        page.printed_label_line_id = folio.and_then(|(_, slot)| *slot).map(|slot| page.lines[(slot.0 - range.start) as usize].id.clone());
     }
 }
 

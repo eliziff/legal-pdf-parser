@@ -1222,6 +1222,7 @@ name = "legal-pdf-structure"
 version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
+ "legal-pdf-pages",
  "legal-structure",
  "legal-structure-model",
  "ort",

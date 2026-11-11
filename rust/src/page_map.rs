@@ -1,33 +1,13 @@
-//! A document's page map (`legal_pdf_pages::page_map`) from what its pages print: each page's folio as the structure
-//! stage read it, the PDF's own labels, and its opening pages' lines for a citation's first page.
+//! A document's page map (`legal_pdf_pages::page_map`) from what its pages print: the same fit the structure stage
+//! numbers the pages by, over the same evidence, here with the first pages of the reports a caller cites.
 use crate::PdfDocument;
 pub use legal_pdf_pages::{EdgeLine, PageEvidence, PdfPageBinding};
 
-/// What each page of `document` tells of its number: its folio as the structure read it, the PDF's own label, and its
-/// lines, every one of them: a page's number may stand anywhere its layout puts it (a margin, a turned page), and the fit
-/// finds it by the run its pages' numbers make.
+/// What each page of `document` tells of its number (`legal_pdf_structure::page_evidence`): the PDF's own label, the
+/// page's size and its lines, a transcript's line numbers (the lines held out of the body) left blank.
 pub fn page_evidence(document: &PdfDocument) -> Vec<PageEvidence> {
-    let observed = document.page_labels();
-    let embedded = &document.summary().embedded_page_labels;
-    let read = document.passage_pages();
-    (0..observed.len().max(embedded.len()))
-        .map(|index| {
-            let number = index as u32 + 1;
-            let page = read.iter().find(|page| page.number == number);
-            let lines = page.map(|page| {
-                page.lines.iter()
-                    .map(|line| EdgeLine { text: line.text.clone(), rect: line.bbox })
-                    .collect()
-            }).unwrap_or_default();
-            PageEvidence {
-                observed: observed.get(index).cloned().flatten(),
-                embedded: embedded.get(index).cloned().flatten(),
-                width: page.map_or(0.0, |page| page.width),
-                height: page.map_or(0.0, |page| page.height),
-                lines,
-            }
-        })
-        .collect()
+    let pages = document.passage_pages();
+    legal_pdf_structure::page_evidence(&pages, &document.summary().embedded_page_labels, |page, at| pages[page].lines[at].exclude_from_body)
 }
 
 /// `page_evidence`, the pages `read_again` names read again in their heads and feet by `ocr` (`legal_pdf_pages::reread`

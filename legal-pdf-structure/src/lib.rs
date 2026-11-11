@@ -5,7 +5,8 @@
 //!    they were read into, a table's rulings cleared from under its words, each line given its slot.
 //! 1. Measured (`Evidence`): each page's words, rows and note separator; each line's type, its source's tag, its marker,
 //!    note label, reference tokens, words and citations; the document's bookmarks and whether it is an instrument.
-//! 2. Fenced and ordered (`Fences`): a transcript's line numbers, furniture and folios (`furniture`), each
+//! 2. Fenced and ordered (`Fences`): a transcript's line numbers, the pages' numbers and the lines printing them (the
+//!    page map's, `legal_pdf_pages::page_map`), furniture (`furniture`), each
 //!    page's columns, contents lists (`headings`), tables, the note band under a separator, the body's type,
 //!    the constituent documents (`constituents`), the reading order, quotations and reading contexts, and each
 //!    line's continuation of the one before.
@@ -52,6 +53,7 @@ use machine::lines::LineTable;
 use machine::machine::LineView;
 use std::path::Path;
 pub use transition::Doc;
+pub use furniture::page_evidence;
 
 use legal_pdf_core::model::{Diagnostic, LineZone, Page, PdfOutlineEntry};
 use legal_structure_model::StructureNode;

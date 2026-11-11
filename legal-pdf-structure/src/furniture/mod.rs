@@ -1,19 +1,17 @@
 //! A document's furniture: running heads and feet repeated page after page, or set apart at a
-//! short document's edges; folios and the printed page labels they carry; side stamps and print
-//! margins.
+//! short document's edges; the rows of its folios (the page map's, `legal_pdf_pages::page_map`);
+//! side stamps and print margins.
 
 use legal_pdf_core::model::{Line, Page};
 use legal_pdf_core::profile::measure;
 use legal_pdf_core::{quantile, regex};
+use legal_pdf_pages::{EdgeLine, PageEvidence};
 use crate::layout::{aligned_note_body, aligned_note_body_among, line_center_x, standalone_note_label};
 use crate::model::{Edge, PageView, Rows, Rule, Slot};
-use crate::text::text::{arabic_page_number, heading_standalone_re, scalar_suffix, standalone_paragraph_number};
+use crate::text::text::{heading_standalone_re, scalar_suffix, standalone_paragraph_number};
 use legal_structure_model::text::line_start_label_prefix;
 use std::collections::{HashMap, HashSet};
 
-const FOLIO_MIN_SEQUENCE_PAGES: usize = 4;
-const FOLIO_EDGE_MAX_FRAC: f64 = 0.25;
-const FOLIO_BOTTOM_MIN_FRAC: f64 = 0.92;
 const FURNITURE_Y_TOLERANCE_FRAC: f64 = 0.015;
 const FURNITURE_X_TOLERANCE_FRAC: f64 = 0.04;
 
@@ -42,103 +40,25 @@ struct Hit {
     x_ratio: f64,
 }
 
-/// A bare number at a page's foot: where it stands, the number, and the edge's left (-1), centre
-/// (0) or right (1).
-struct Folio {
-    hit: Hit,
-    printed: u32,
-    side: i8,
-}
-
-/// The page numbers the document prints at its pages' edges, wherever in the margin it sets them: a
-/// bare number on its page's top or bottom row (`rows`, by view) is a folio when the number less
-/// the page's place in the document is the same on at least three such pages (or half of a shorter
-/// document's). Returns each folio, by (view, line slot on the page), with whether it heads its
-/// page.
-fn edge_folios(views: &[PageView], rows: &[&Rows]) -> HashMap<(usize, usize), bool> {
-    let mut by_offset = HashMap::<i64, Vec<(usize, usize, bool)>>::new();
-    for (page_slot, (view, rows)) in views.iter().zip(rows).enumerate() {
-        for (slot, line) in view.iter() {
-            let line_slot = view.place(slot);
-            let row = rows.of[line_slot];
-            if row != 0 && Some(row) != rows.count.checked_sub(1) {
-                continue;
-            }
-            if let Some(printed) = arabic_page_number(&line.text) {
-                by_offset.entry(i64::from(printed) - i64::from(view.page.number)).or_default().push((page_slot, line_slot, row == 0));
-            }
-        }
+/// What each page of a document tells the page map of its number (`legal_pdf_pages::page_map`): the label the PDF
+/// declares for it (`embedded`, by page index), its size, and its lines by line slot on the page, those `line_label` holds
+/// (by page slot in `pages` and line slot) left blank: a transcript's line numbers number its lines, not the page.
+pub fn page_evidence(pages: &[Page], embedded: &[Option<String>], line_label: impl Fn(usize, usize) -> bool) -> Vec<PageEvidence> {
+    let count = pages.iter().map(|page| page.index + 1).max().unwrap_or(0).max(embedded.len());
+    let mut evidence = vec![PageEvidence::default(); count];
+    for (page_slot, page) in pages.iter().enumerate() {
+        let lines = page.lines.iter().enumerate();
+        evidence[page.index] = PageEvidence {
+            embedded: None,
+            width: page.width,
+            height: page.height,
+            lines: lines.map(|(at, line)| EdgeLine { text: if line_label(page_slot, at) { String::new() } else { line.text.clone() }, rect: line.bbox }).collect(),
+        };
     }
-    let needed = 3.min(views.len().div_ceil(2)).max(2);
-    by_offset
-        .into_values()
-        .filter(|folios| folios.iter().map(|folio| folio.0).collect::<HashSet<_>>().len() >= needed)
-        .flatten()
-        .map(|(page_slot, line_slot, top)| ((page_slot, line_slot), top))
-        .collect()
-}
-
-/// Text-Fidelity's alternating-folio witness. A singleton Arabic number at
-/// each outer bottom edge (its foot's band, or its last row) is furniture only when at least four
-/// consecutive PDF pages carry a +1 printed sequence, alternate sides, and remain aligned
-/// within each page parity. A number centred at the bottom is furniture on the
-/// same sequence without alternating, whatever its type: a statute sets its
-/// folio as small as its notes.
-fn alternating_folios(views: &[PageView], rows: &[&Rows]) -> HashSet<(usize, usize)> {
-    let mut singletons = Vec::new();
-    for (page_slot, (view, rows)) in views.iter().zip(rows).enumerate() {
-        let page = view.page;
-        if page.width <= 0.0 || page.height <= 0.0 {
-            continue;
-        }
-        let last = rows.count.checked_sub(1);
-        let mut candidates = view.iter().filter_map(|(slot, line)| {
-            let line_slot = view.place(slot);
-            let printed = arabic_page_number(&line.text)?;
-            let x_ratio = (line.bbox[0] + line.bbox[2]) / 2.0 / page.width;
-            let side = if x_ratio < FOLIO_EDGE_MAX_FRAC {
-                -1
-            } else if x_ratio > 1.0 - FOLIO_EDGE_MAX_FRAC {
-                1
-            } else if (x_ratio - 0.5).abs() <= FURNITURE_X_TOLERANCE_FRAC {
-                0
-            } else {
-                return None;
-            };
-            let hit = Hit { page_slot, line_slot, page_number: page.number, y_ratio: line.bbox[1] / page.height, x_ratio };
-            (line.bbox[1] > page.height * FOLIO_BOTTOM_MIN_FRAC || Some(rows.of[line_slot]) == last).then_some(Folio { hit, printed, side })
-        });
-        if let (Some(candidate), None) = (candidates.next(), candidates.next()) {
-            singletons.push(candidate);
-        }
+    for (page, label) in evidence.iter_mut().zip(embedded) {
+        page.embedded.clone_from(label);
     }
-    singletons.sort_by_key(|candidate| candidate.hit.page_number);
-    let spread = |values: &mut dyn Iterator<Item = f64>, first: f64| {
-        let (low, high) = values.fold((first, first), |(low, high), value| (low.min(value), high.max(value)));
-        high - low
-    };
-    let aligned = |run: &[Folio], candidate: &Folio| {
-        let previous = &run[run.len() - 1];
-        let centred = candidate.side == 0 || previous.side == 0;
-        candidate.hit.page_number == previous.hit.page_number + 1
-            && candidate.printed == previous.printed + 1
-            && if centred { candidate.side == previous.side } else { candidate.side != previous.side }
-            && !run.iter().any(|old| old.hit.page_number % 2 == candidate.hit.page_number % 2 && old.side != candidate.side)
-            && spread(&mut run.iter().map(|old| old.hit.y_ratio), candidate.hit.y_ratio) <= FURNITURE_Y_TOLERANCE_FRAC
-            && spread(&mut run.iter().filter(|old| old.side == candidate.side).map(|old| old.hit.x_ratio), candidate.hit.x_ratio)
-                <= FURNITURE_X_TOLERANCE_FRAC
-    };
-    let (mut admitted, mut run) = (HashSet::new(), Vec::<Folio>::new());
-    for candidate in singletons.into_iter().map(Some).chain([None]) {
-        if candidate.as_ref().is_none_or(|candidate| !run.is_empty() && !aligned(&run, candidate)) {
-            if run.len() >= FOLIO_MIN_SEQUENCE_PAGES {
-                admitted.extend(run.iter().map(|folio| (folio.hit.page_slot, folio.hit.line_slot)));
-            }
-            run.clear();
-        }
-        run.extend(candidate);
-    }
-    admitted
+    evidence
 }
 
 /// The hits of one repeated text that stand at one place: the cluster of tops spanning the most
@@ -267,8 +187,9 @@ pub(crate) fn section_heads(views: &[PageView], rows: &[&Rows]) -> Vec<(Slot, Ed
 /// The document's furniture, read once over its pages (`views`, each page's `rows`): running
 /// heads and feet repeated page after page at the page's edges (its head's and foot's bands, or its
 /// first and last rows where they stand apart from the body), or set apart at a short document's
-/// edges; folios; document identifiers and page numbers at the edges; a print driver's margins; the
-/// small lines a running head stacks; and the lines sharing a row with a running head or a folio.
+/// edges; the lines printing the pages' numbers (`folio`: the page map's, `legal_pdf_pages::page_map`);
+/// document identifiers at the edges; a print driver's margins; the small lines a running head
+/// stacks; and the lines sharing a row with a running head or a folio.
 /// Page-and-line locators with no word among them ("84:2 85:2, 12") are a running head only on half
 /// the document's pages or more: a word index's recur at one place on its own pages. A
 /// paragraph's or provision's marker alone on its line beside its text ("(1)", "15(4)", "12" at a
@@ -276,7 +197,7 @@ pub(crate) fn section_heads(views: &[PageView], rows: &[&Rows]) -> Vec<(Slot, Ed
 /// heading alone on its line ("PART 50") whose text no other line prints, and on a row of no other
 /// furniture, is no running head. Lines `line_label` holds are a transcript's line numbers, never
 /// furniture. Each line read as furniture, with its edge and the rule that read it.
-pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot) -> bool) -> Vec<(Slot, Edge, Rule)> {
+pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot) -> bool, folio: impl Fn(Slot) -> bool) -> Vec<(Slot, Edge, Rule)> {
     // LEGALPDF_ABLATE=furniture leaves the repeated-furniture reader out, for its measure under the tagger.
     if legal_structure_model::ablated("furniture") {
         return Vec::new();
@@ -322,23 +243,15 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
     if views.len() < 3 {
         repeated.extend(edge_furniture(views));
     }
-    let sequence_folios = measure("furniture.folios", || alternating_folios(views, rows));
-    let edge_folios = edge_folios(views, rows);
     // Each view's lines read as furniture, by line slot on the page.
     let mut found: Vec<Vec<Option<(Edge, Rule)>>> = views.iter().map(|view| vec![None; view.page.lines.len()]).collect();
     measure("furniture.apply", || {
         for (page_slot, view) in views.iter().enumerate() {
             let (page, found) = (view.page, &mut found[page_slot]);
             let is_repeated = |index: usize| repeated.contains(&(page_slot, index));
-            let is_folio = |index: usize| sequence_folios.contains(&(page_slot, index));
+            let is_folio = |index: usize| folio(view.slot(index));
             let page_rows = &rows[page_slot].of;
             let members: Vec<usize> = view.lines.iter().map(|&slot| view.place(slot)).collect();
-            // Without a sequence witness, a folio must sit beyond the remaining body text.
-            let (top, bottom) = members
-                .iter()
-                .map(|&index| (index, &page.lines[index]))
-                .filter(|(index, line)| !line.text.trim().is_empty() && !is_repeated(*index) && !is_folio(*index) && !edge_folios.contains_key(&(page_slot, *index)))
-                .fold((f64::INFINITY, f64::NEG_INFINITY), |(top, bottom), (_, line)| (top.min(line.bbox[1]), bottom.max(line.bbox[3])));
             let body_size = quantile(
                 members
                     .iter()
@@ -400,16 +313,12 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                 let (banded_top, banded_bottom) = (line.bbox[1] < page.height * 0.12, line.bbox[3] > page.height * 0.90);
                 let at_top = banded_top || frame == Some(Edge::Top);
                 let at_bottom = banded_bottom || frame == Some(Edge::Bottom);
-                let page_number_at_top = line.bbox[3] < page.height * 0.14;
                 let edge = |top: bool| if top { Edge::Top } else { Edge::Bottom };
                 let compact_note = at_bottom && line_size < body_size * 0.90 && compact_note_line(&line.text);
-                let gap = if page_number_at_top { line.bbox[1] - top } else { bottom - line.bbox[3] };
                 found[index] = if is_repeated(index) && furniture_edge(line, page.width, page.height).is_some_and(|edge| edge >= 2) {
                     Some((Edge::Top, Rule::RunningHead))
                 } else if is_folio(index) {
-                    Some((Edge::Bottom, Rule::Folio))
-                } else if let Some(&top) = edge_folios.get(&(page_slot, index)) {
-                    Some((edge(top), Rule::Folio))
+                    Some((edge(line.bbox[1] + line.bbox[3] < page.height), Rule::Folio))
                 } else if is_repeated(index)
                     && (at_top || at_bottom)
                     && (line_size >= body_size * 0.75 || normalize_furniture(&line.text) != "#")
@@ -419,13 +328,6 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                     Some((edge(at_top), if banded_top || banded_bottom { Rule::RunningHead } else { Rule::FrameRow }))
                 } else if (at_top || at_bottom) && document_id_line(&line.text) {
                     Some((edge(at_top), Rule::DocumentId))
-                } else if (line.bbox[3] < page.height * 0.14 || line.bbox[1] > page.height * 0.86)
-                    && footer_page_number(&line.text)
-                    && gap < (line.bbox[3] - line.bbox[1]) * 0.5
-                    && line_size >= body_size * 0.75
-                    && !attached.contains(&index)
-                {
-                    Some((edge(page_number_at_top), Rule::PageNumber))
                 } else {
                     None
                 };
@@ -487,7 +389,7 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
             .iter()
             .enumerate()
             .filter_map(|(index, read)| {
-                read.filter(|(_, rule)| matches!(rule, Rule::RunningHead | Rule::FrameRow | Rule::Folio | Rule::PageNumber)).map(|(edge, _)| (rows.of[index], edge))
+                read.filter(|(_, rule)| matches!(rule, Rule::RunningHead | Rule::FrameRow | Rule::Folio)).map(|(edge, _)| (rows.of[index], edge))
             })
             .filter(|(row, _)| *row != u32::MAX)
             .collect();
@@ -552,13 +454,6 @@ fn extend_running_heads(
     }
 }
 
-pub(crate) fn printed_label(value: &str) -> Option<String> {
-    regex!(r"(?i)^(?:(?:page\s+)?(\d{1,6}|[ivxlcdm]{1,12})(?:\s*(?:of|/|of\s*/\s*de|de|sur)\s*\d{1,6})?|-\s*(\d{1,6})\s*-)$")
-        .captures(value.trim())
-        .and_then(|capture| capture.get(1).or_else(|| capture.get(2)))
-        .map(|value| value.as_str().to_owned())
-}
-
 /// A browser or print driver sets the page's address and the time it was printed in the
 /// outer margins, with the page title and "1 of 3" on the same rows. They are furniture on
 /// a single page too, where nothing repeats to show it. Each such line of the view, by line slot
@@ -595,20 +490,6 @@ fn document_id_line(value: &str) -> bool {
     let visible = text.chars().filter(|c| !c.is_whitespace()).count();
     // (Eight figures: "1974.14" is a year and a note's call.)
     digits >= 8 && digits * 5 >= visible * 2 && text.chars().count() <= 40 && regex!(r"^[A-Z0-9][A-Z0-9 ._/-]*(?:v\d{1,3})?$").is_match(text)
-}
-
-fn footer_page_number(value: &str) -> bool {
-    regex!(r"(?i)^\s*-?\s*(?:page\s+)?[ivxlcdm\d]+(?:\s*(?:of|/|of\s*/\s*de|de|sur)\s*\d+)?\s*-?\s*$").is_match(value.trim())
-}
-
-/// The printed labels a page's furniture (`furniture`: line slots on the page, each with its edge)
-/// prints, each with the slot of the line printing it: the folios its running head and foot print
-/// (`printed_label`), the foot's first, then in reading order.
-pub(crate) fn page_labels_among(page: &Page, furniture: impl Iterator<Item = (usize, Edge)>) -> Vec<(String, usize)> {
-    let mut candidates: Vec<(String, usize, bool)> =
-        furniture.filter_map(|(index, edge)| Some((printed_label(&page.lines[index].text)?, index, edge == Edge::Bottom))).collect();
-    candidates.sort_by_key(|&(_, index, foot)| (!foot, page.lines[index].reading_order));
-    candidates.into_iter().map(|(label, index, _)| (label, index)).collect()
 }
 
 /// A paragraph's or provision's marker alone on its line: "[12]", "(1)", "(b)", "(iv)", "3.",

@@ -1,6 +1,7 @@
 //! What a page's geometry and a document's own lists settle before any run of numbers is read, and
 //! the order the lines read in. Each fence takes only the lines no fence before it took, in this
-//! order: a transcript's line numbers; the furniture and folios at the pages' edges; then each
+//! order: a transcript's line numbers; the lines printing the pages' numbers (the page map's); the
+//! furniture at the pages' edges; then each
 //! page's columns, read on the words the fences left; the parallel translation's lines; the
 //! contents lists (their title a heading; a table of authorities' lines left to the body); the
 //! tables' cells. Then the
@@ -64,10 +65,9 @@ pub(crate) struct Fences {
     pub(crate) testimony: Vec<bool>,
     /// A transcript's line beside its number column: on a row holding a line number.
     pub(crate) numbered_row: Vec<bool>,
-    /// Each page's printed label and the slot of the line printing it, by page slot.
-    pub(crate) folios: Vec<Option<(Slot, String)>>,
-    /// The printed page number less the page's own, where most folios agree on one.
-    pub(crate) folio_offset: Option<i64>,
+    /// Each page's number as the page map reads it and the slot of the line printing it, where the page prints it, by
+    /// page slot.
+    pub(crate) folios: Vec<Option<(String, Option<Slot>)>>,
     /// Edge lines naming their page's sections ("Section 63"), with their edge and the first
     /// section named, for the statute's spine to bear out (`confirm_section_heads`).
     pub(crate) section_heads: Vec<(Slot, Edge, u32)>,
@@ -173,7 +173,8 @@ impl Fences {
         for slot in (0..count).filter(|&slot| evidence.line_number[slot]) {
             fences.set(Slot(slot as u32), Role::LineLabel, Rule::LineNumber);
         }
-        fences.read_furniture(pages, slots, evidence, &views, &rows);
+        fences.read_page_numbers(pages, slots, evidence, page_labels);
+        fences.read_furniture(evidence, &views, &rows);
         let items = fences.read_columns(pages, slots, evidence);
         fences.read_translation(pages, slots, evidence, &views);
         let (tables, in_table, listed) = fences.find_tables(pages, slots, &items);

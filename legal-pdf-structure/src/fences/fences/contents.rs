@@ -22,8 +22,7 @@ impl Fences {
         in_table: &[bool],
         listed: &HashSet<String>,
     ) -> Vec<bool> {
-        // Each page's number: the label the PDF declares, else its folio's, else its place by the
-        // folios' offset.
+        // Each page's number: the label the PDF declares, else the page map's.
         let numbers: Vec<Option<u32>> = pages
             .iter()
             .zip(&self.folios)
@@ -32,12 +31,7 @@ impl Fences {
                     .get(page.index)
                     .and_then(Option::as_deref)
                     .and_then(contents_lists::page_numeral)
-                    .or_else(|| folio.as_ref().and_then(|(_, label)| contents_lists::page_numeral(label)))
-                    .or_else(|| {
-                        self.folio_offset
-                            .and_then(|offset| u32::try_from(i64::from(page.number) + offset).ok())
-                            .filter(|number| *number > 0)
-                    })
+                    .or_else(|| folio.as_ref().and_then(|(label, _)| contents_lists::page_numeral(label)))
             })
             .collect();
         let lists = legal_pdf_core::profile::measure("classify.contents_lists", || {

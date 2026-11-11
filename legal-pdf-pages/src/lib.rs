@@ -1,6 +1,9 @@
-//! A PDF's page map: each PDF page's printed number, from what the pages print (`PageEvidence`):
+//! A PDF's page map: each PDF page's printed number and the line printing it, from what the pages print
+//! (`PageEvidence`). It is the parser's one reader of page numbers: the structure stage sets each page's line apart as
+//! its label and gives the page its number from it.
 //!
-//! 1. What a page prints is its number (the structure stage's folio, as read).
+//! 1. What a page prints is its number, read on the page alone (`printed`: its outermost head or foot row in a page
+//!    number's shape).
 //! 2. The folio sequence decides (Text-Fidelity's sequence fit, which made the journals' page maps): the numbers each
 //!    page's head and foot lines print in a folio's shape (alone, set apart from a running head's title, a page counter)
 //!    vote for a shift (printed number less PDF page); the best supported shift numbers the document from its first
@@ -11,8 +14,10 @@
 //! 4. Where a caller holds citations to the report the PDF prints (`starts`, their first pages): an opening page with no
 //!    number is read at its edge for one (`margin_labels`), each page printing one is an anchor, and from each anchor to
 //!    the next every page takes the anchor's number at its distance where most of the run's numbers agree.
+//! 5. Each numbered page's line is the one it was read from, else the outermost line of its head or foot printing the
+//!    number the map gives it (`printing_lines`).
 //!
-//! The engine's `pdfPageMap`, the backend's page map and the tools all read this.
+//! The structure stage, the engine's `pdfPageMap`, the backend's page map and the tools all read this.
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -22,14 +27,12 @@ use std::sync::OnceLock;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageEvidence {
-    /// The number the page prints, as the structure stage read its folio.
-    #[serde(default)]
-    pub observed: Option<String>,
     /// The PDF's own label for the page (its /PageLabels).
     #[serde(default)]
     pub embedded: Option<String>,
-    /// The page's size, and its lines with their boxes ([x0, top, x1, bottom], display space): an opening page's
-    /// alone are read (`margin_labels`).
+    /// The page's size, and its lines with their boxes ([x0, top, x1, bottom], display space), every one of them: a
+    /// page's number may stand anywhere its layout puts it (a margin, a turned page). A line that numbers no page (a
+    /// transcript's line number) comes blank.
     #[serde(default)]
     pub width: f64,
     #[serde(default)]
@@ -51,9 +54,12 @@ pub struct EdgeLine {
 pub struct PdfPageBinding {
     /// The PDF page, from 1.
     pub pdf_page: u32,
-    /// The number the page prints as the structure read it, where it read one.
+    /// The number the page prints, read on the page alone (`printed`), where it reads one.
     pub observed: Option<String>,
     pub label: Option<String>,
+    /// The line printing `label` (its index among the page's evidence lines), where the page prints it.
+    #[serde(skip)]
+    pub line: Option<usize>,
     /// "detected" (what the page prints), "sequence" (its place in the folio sequence), "embedded" (the PDF's own
     /// label), "reporter" (a citation's first page at its distance); none where the page has no number.
     pub source: Option<String>,
@@ -121,16 +127,101 @@ fn merge_bands(page: &mut PageEvidence, bands: Bands) {
 
 /// The page map (see the crate).
 pub fn page_map(pages: &[PageEvidence], starts: &[u32], is_citation: &dyn Fn(&str, &str) -> bool) -> Vec<PdfPageBinding> {
-    let mut observed: Vec<Option<String>> = pages.iter().map(|page| page.observed.as_deref().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned)).collect();
-    if !starts.is_empty() && !observed.iter().flatten().any(|label| label.parse::<u32>().is_ok_and(|n| starts.contains(&n))) {
-        margin_labels(&mut observed, pages, starts, is_citation);
+    let mut read: Vec<Option<(String, usize)>> = pages.iter().map(printed).collect();
+    if !starts.is_empty() && !read.iter().flatten().any(|(label, _)| label.parse::<u32>().is_ok_and(|n| starts.contains(&n))) {
+        margin_labels(&mut read, pages, starts, is_citation);
     }
+    let observed: Vec<Option<String>> = read.iter().map(|read| read.as_ref().map(|(label, _)| label.clone())).collect();
     let mut bindings = resolve(&observed, &pages.iter().map(|page| page.embedded.clone()).collect::<Vec<_>>());
     sequence(&mut bindings, pages, starts);
     counters(&mut bindings, pages);
     anchor(&mut bindings, starts);
     numberings(&mut bindings, pages);
+    printing_lines(&mut bindings, pages, &read);
     bindings
+}
+
+/// Each page's number read on the page alone (`printed`), for the fit's helpers.
+fn observed(pages: &[PageEvidence]) -> Vec<Option<String>> {
+    pages.iter().map(|page| printed(page).map(|(label, _)| label)).collect()
+}
+
+/// What a page prints as its number, read on the page alone (the page-number rule the structure stage's furniture
+/// read): a line of its outermost row at its foot or head (the page's bottom or top 14%) in a page number's shape
+/// ("12", "- 12 -", "Page 12", "Page 2 of 30", "xiv"), the foot's before the head's; not a bare number beside a line of
+/// the page's prose (twenty letters or more, no running head's words: a law report's paragraph number in its margin),
+/// nor one opening a foot row that goes on in text (a note's). With the line printing it.
+fn printed(page: &PageEvidence) -> Option<(String, usize)> {
+    static SHAPE: OnceLock<Regex> = OnceLock::new();
+    let shape = SHAPE.get_or_init(|| {
+        Regex::new(r"(?i)^-?\s*(?:page\s+)?(\d{1,6}|[ivxlc]{1,12})(?:\s*(?:of|/|of\s*/\s*de|de|sur)\s*\d{1,6})?\s*-?$").unwrap()
+    });
+    let height = page.height;
+    if height <= 0.0 {
+        return None;
+    }
+    let p = patterns();
+    let rows = rows(page);
+    let foot = rows.last().filter(|row| row.whole.rect[1] > height * 0.86);
+    let head = rows.first().filter(|row| row.whole.rect[3] < height * 0.14);
+    for (row, at_foot) in foot.map(|row| (row, true)).into_iter().chain(head.map(|row| (row, false))) {
+        for (k, cell) in row.cells.iter().enumerate() {
+            let beside: String = row.cells.iter().enumerate().filter(|(j, _)| *j != k).map(|(_, other)| other.text.as_str()).collect::<Vec<_>>().join(" ");
+            let running = p.header_context.is_match(&beside) || p.report_head.is_match(&beside);
+            let prose = beside.chars().filter(|c| c.is_alphabetic()).count() >= 20;
+            let note = at_foot && row.cells[k + 1..].iter().any(|cell| cell.text.chars().any(char::is_alphabetic));
+            if isolated_number(&cell.text).is_some() && !running && (prose || note) {
+                continue;
+            }
+            for (line, piece) in &row.pieces[k] {
+                let Some(found) = shape.captures(piece.text.trim()) else { continue };
+                let number = &found[1];
+                if number.bytes().all(|b| b.is_ascii_digit()) || roman_value(number).is_some() {
+                    return Some((number.to_owned(), *line));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Each numbered page's line printing its number: the line it was read from where the map gives the page the number it
+/// reads there (`printed`, `margin_labels`), else the outermost line of its head or foot printing that number (a
+/// sequence's folio beside a running head's title, a counter, a typed numbering); none where it prints it nowhere there.
+fn printing_lines(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], read: &[Option<(String, usize)>]) {
+    for ((binding, page), read) in bindings.iter_mut().zip(pages).zip(read) {
+        let Some(label) = binding.label.as_deref() else { continue };
+        binding.line = match read {
+            Some((own, line)) if own.eq_ignore_ascii_case(label) => Some(*line),
+            _ => printing_line(page, label),
+        };
+    }
+}
+
+/// The outermost line of a page's head or foot (its top or bottom 28%) printing `label`: a number among the line's
+/// folio candidates, a roman numeral alone, a typed numbering ("E-162") as printed.
+fn printing_line(page: &PageEvidence, label: &str) -> Option<usize> {
+    let height = page.height.max(1.0);
+    let number = label.parse::<i64>().ok();
+    let compact = |text: &str| text.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect::<String>();
+    let wanted = compact(label);
+    rows(page)
+        .iter()
+        .filter_map(|row| {
+            let y = (row.whole.rect[1] + row.whole.rect[3]) / 2.0 / height;
+            let zone = if y <= 0.28 { Zone::Top } else if y >= 0.72 { Zone::Bottom } else { return None };
+            let prints = |text: &str| match number {
+                Some(number) => line_candidates(text, zone, Some(y), 0).iter().any(|c| c.number == number),
+                None => {
+                    let bare: String = text.trim().chars().filter(|c| !EDGE_PUNCT.contains(*c)).collect();
+                    bare.eq_ignore_ascii_case(label) || compact(text).contains(&wanted)
+                }
+            };
+            let (line, _) = row.pieces.iter().flatten().find(|(_, piece)| prints(&piece.text))?;
+            Some((y.min(1.0 - y), *line))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, line)| line)
 }
 
 /// A page the sequence leaves without a number that names its place itself ("Page 1 of 1", "Page: 2", "1/4") is that
@@ -169,7 +260,7 @@ fn resolve(observed: &[Option<String>], embedded: &[Option<String>]) -> Vec<PdfP
                 (false, None, None) => (None, None),
             };
             let status = if conflict { "ambiguous" } else if label.is_some() { "resolved" } else { "unknown" };
-            PdfPageBinding { pdf_page: index as u32 + 1, observed: detected, label, source: source.map(str::to_owned), status: status.to_owned(), numbers: Vec::new() }
+            PdfPageBinding { pdf_page: index as u32 + 1, observed: detected, label, line: None, source: source.map(str::to_owned), status: status.to_owned(), numbers: Vec::new() }
         })
         .collect()
 }
@@ -224,7 +315,7 @@ struct Candidate {
     score: f64,
     year_like: bool,
     citation_like: bool,
-    /// The line's middle, as a share of the page's height; none for the folio the structure read.
+    /// The line's middle, as a share of the page's height; none for the number the page prints as read (`printed`).
     y: Option<f64>,
     line: usize,
     text: String,
@@ -588,46 +679,47 @@ fn structural(c: &Candidate) -> bool {
 /// height.
 struct Row {
     cells: Vec<EdgeLine>,
-    /// Each cell's pieces as the reader split them ("PAGE 6" beside "Mis à jour : 10 févr. 2012").
-    pieces: Vec<Vec<EdgeLine>>,
+    /// Each cell's pieces as the reader split them ("PAGE 6" beside "Mis à jour : 10 févr. 2012"), each with its index
+    /// among the page's lines.
+    pieces: Vec<Vec<(usize, EdgeLine)>>,
     /// The row whole, its cells three spaces apart.
     whole: EdgeLine,
 }
 
 fn rows(page: &PageEvidence) -> Vec<Row> {
-    let mut lines: Vec<&EdgeLine> = page.lines.iter().filter(|l| !l.text.trim().is_empty()).collect();
-    lines.sort_by(|a, b| a.rect[1].total_cmp(&b.rect[1]).then(a.rect[0].total_cmp(&b.rect[0])));
-    let mut rows: Vec<Vec<&EdgeLine>> = Vec::new();
-    for line in lines {
-        let same_row = |other: &&EdgeLine| {
+    let mut lines: Vec<(usize, &EdgeLine)> = page.lines.iter().enumerate().filter(|(_, l)| !l.text.trim().is_empty()).collect();
+    lines.sort_by(|(_, a), (_, b)| a.rect[1].total_cmp(&b.rect[1]).then(a.rect[0].total_cmp(&b.rect[0])));
+    let mut rows: Vec<Vec<(usize, &EdgeLine)>> = Vec::new();
+    for (at, line) in lines {
+        let same_row = |(_, other): &(usize, &EdgeLine)| {
             let overlap = line.rect[3].min(other.rect[3]) - line.rect[1].max(other.rect[1]);
             let height = (line.rect[3] - line.rect[1]).min(other.rect[3] - other.rect[1]).max(0.1);
             overlap >= height * 0.5
         };
         match rows.iter_mut().find(|row| row.iter().any(same_row)) {
-            Some(row) => row.push(line),
-            None => rows.push(vec![line]),
+            Some(row) => row.push((at, line)),
+            None => rows.push(vec![(at, line)]),
         }
     }
-    let bounds = |pieces: &[&EdgeLine]| pieces.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |r, l| {
+    let bounds = |pieces: &[(usize, &EdgeLine)]| pieces.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |r, (_, l)| {
         [r[0].min(l.rect[0]), r[1].min(l.rect[1]), r[2].max(l.rect[2]), r[3].max(l.rect[3])]
     });
     let mut out: Vec<Row> = rows.into_iter().map(|mut row| {
-        row.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
-        let mut groups: Vec<Vec<&EdgeLine>> = Vec::new();
-        for piece in row.iter().copied() {
-            let wide = groups.last().and_then(|group| group.last()).is_none_or(|before| {
+        row.sort_by(|(_, a), (_, b)| a.rect[0].total_cmp(&b.rect[0]));
+        let mut groups: Vec<Vec<(usize, &EdgeLine)>> = Vec::new();
+        for (at, piece) in row.iter().copied() {
+            let wide = groups.last().and_then(|group| group.last()).is_none_or(|(_, before)| {
                 let height = (piece.rect[3] - piece.rect[1]).min(before.rect[3] - before.rect[1]).max(0.1);
                 piece.rect[0] - before.rect[2] > height
             });
-            if wide { groups.push(vec![piece]) } else { groups.last_mut().unwrap().push(piece) }
+            if wide { groups.push(vec![(at, piece)]) } else { groups.last_mut().unwrap().push((at, piece)) }
         }
         let cells: Vec<EdgeLine> = groups.iter().map(|group| EdgeLine {
-            text: group.iter().map(|l| l.text.trim()).collect::<Vec<_>>().join(" "),
+            text: group.iter().map(|(_, l)| l.text.trim()).collect::<Vec<_>>().join(" "),
             rect: bounds(group),
         }).collect();
         let whole = EdgeLine { text: cells.iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>().join("   "), rect: bounds(&row) };
-        let pieces = groups.iter().map(|group| group.iter().map(|&piece| piece.clone()).collect()).collect();
+        let pieces = groups.iter().map(|group| group.iter().map(|&(at, piece)| (at, piece.clone())).collect()).collect();
         Row { cells, pieces, whole }
     }).collect();
     out.sort_by(|a, b| ((a.whole.rect[1] * 10.0).round()).total_cmp(&((b.whole.rect[1] * 10.0).round())).then(a.whole.rect[0].total_cmp(&b.whole.rect[0])));
@@ -668,7 +760,7 @@ fn page_candidates(binding: &PdfPageBinding, page: Option<&PageEvidence>) -> Vec
                 // beside "Mis à jour : 10 févr. 2012")
                 let group = &row.pieces[k];
                 if group.len() > 1 {
-                    for piece in group {
+                    for (_, piece) in group {
                         candidates.extend(line_candidates(&piece.text, zone, Some(y), index + 1).into_iter().filter(|c| c.kind == Kind::Counter).map(|mut c| {
                             c.context = line.text.clone();
                             c
@@ -980,7 +1072,7 @@ fn chains(pages: &[PageEvidence]) -> Vec<Chain> {
         for (index, row) in rows.iter().enumerate() {
             let y = (row.whole.rect[1] + row.whole.rect[3]) / 2.0 / height;
             let outer = index < 2 || index + 2 >= count;
-            for piece in row.pieces.iter().flatten() {
+            for (_, piece) in row.pieces.iter().flatten() {
                 let x = (piece.rect[0] + piece.rect[2]) / 2.0 / width;
                 let text = piece.text.trim();
                 for capture in token.captures_iter(text) {
@@ -1222,7 +1314,7 @@ fn roman_value(label: &str) -> Option<i64> {
 /// places (two or more at one shift) number the pages from the first to the last of them; a roman folio read alone, or
 /// at odds with its neighbours, is no page number. Returns which pages a roman run holds.
 fn roman_runs(bindings: &mut [PdfPageBinding], pages: &[PageEvidence]) -> Vec<bool> {
-    // each page's roman folios: the one the structure read, and a cell of its head or foot that is a numeral alone, between
+    // each page's roman folios: the one it prints as read (`printed`), and a cell of its head or foot that is a numeral alone, between
     // marks perhaps ("(iv)", "- xii -"; `roman_candidate_text`)
     let mut by_shift: HashMap<i64, Vec<usize>> = HashMap::new();
     let mut heights: HashMap<(i64, usize), f64> = HashMap::new();
@@ -1328,14 +1420,14 @@ fn unconfirmed(bindings: &mut [PdfPageBinding], numbered: std::ops::Range<usize>
 /// from): what the fit weighed, for a person checking a page map.
 #[doc(hidden)]
 pub fn weighed(pages: &[PageEvidence]) -> Vec<(i64, Vec<(usize, i64, String)>)> {
-    let observed: Vec<Option<String>> = pages.iter().map(|page| page.observed.clone()).collect();
-    let (_, ranked) = ranked_sequences(&resolve(&observed, &vec![None; pages.len()]), pages);
+    let (_, ranked) = ranked_sequences(&resolve(&observed(pages), &vec![None; pages.len()]), pages);
     ranked.into_iter().map(|row| (row.shift, row.anchors.into_iter().map(|(at, c)| (at + 1, c.number, c.text)).collect())).collect()
 }
 
-/// Whether a page's lines print a number in a folio's shape (or the structure read its folio).
+/// Whether a page's lines print a number in a folio's shape.
 pub fn prints_a_folio(page: &PageEvidence) -> bool {
-    let binding = PdfPageBinding { pdf_page: 1, observed: page.observed.clone(), label: None, source: None, status: String::new(), numbers: Vec::new() };
+    let observed = printed(page).map(|(label, _)| label);
+    let binding = PdfPageBinding { pdf_page: 1, observed, label: None, line: None, source: None, status: String::new(), numbers: Vec::new() };
     page_candidates(&binding, Some(page)).iter().any(sequence_anchor)
 }
 
@@ -1343,8 +1435,7 @@ pub fn prints_a_folio(page: &PageEvidence) -> bool {
 /// person checking a page map.
 #[doc(hidden)]
 pub fn candidates_of(pages: &[PageEvidence]) -> Vec<Vec<String>> {
-    let observed: Vec<Option<String>> = pages.iter().map(|page| page.observed.clone()).collect();
-    let bindings = resolve(&observed, &vec![None; pages.len()]);
+    let bindings = resolve(&observed(pages), &vec![None; pages.len()]);
     bindings.iter().zip(pages).map(|(binding, page)| page_candidates(binding, Some(page)).iter()
         .map(|c| format!("{} {:?} {:?} {:.2} {} | {}", c.number, c.kind, c.zone, c.score, if sequence_anchor(c) { "ANCHOR" } else { "-" }, c.text))
         .collect()).collect()
@@ -1353,8 +1444,7 @@ pub fn candidates_of(pages: &[PageEvidence]) -> Vec<Vec<String>> {
 /// The parts the fit finds (shift, first and last PDF page, anchors), for a person checking a page map.
 #[doc(hidden)]
 pub fn parts_of(pages: &[PageEvidence]) -> Vec<(i64, usize, usize, usize)> {
-    let observed: Vec<Option<String>> = pages.iter().map(|page| page.observed.clone()).collect();
-    let (_, ranked) = ranked_sequences(&resolve(&observed, &vec![None; pages.len()]), pages);
+    let (_, ranked) = ranked_sequences(&resolve(&observed(pages), &vec![None; pages.len()]), pages);
     parts(&ranked, pages.len()).iter().map(|part| (part.shift, part.anchors[0].0 + 1, part.anchors.last().unwrap().0 + 1, part.anchors.len())).collect()
 }
 
@@ -1363,8 +1453,7 @@ pub fn parts_of(pages: &[PageEvidence]) -> Vec<(i64, usize, usize, usize)> {
 /// own count of its pages at the foot (`local_article_count`), as a repository's copy prints over the journal's page whose
 /// folio is in the image of its head. A page the body's numbers seem to number is no page whose folio was read.
 pub fn read_again(pages: &[PageEvidence]) -> Vec<bool> {
-    let observed: Vec<Option<String>> = pages.iter().map(|page| page.observed.clone()).collect();
-    let (_, ranked) = ranked_sequences(&resolve(&observed, &vec![None; pages.len()]), pages);
+    let (_, ranked) = ranked_sequences(&resolve(&observed(pages), &vec![None; pages.len()]), pages);
     let local = ranked.first().is_some_and(|best| best.local_article_count(pages.len()));
     pages.iter().map(|page| {
         let band = PageEvidence {
@@ -1539,8 +1628,8 @@ fn anchor(bindings: &mut [PdfPageBinding], starts: &[u32]) {
 /// The folio an opening page (the first three) prints at its edge where none was read (Text-Fidelity's edge-folio rule):
 /// a citation's first page (`starts`) alone at the start or end of a line in the page's outer bands or outermost rows, at
 /// the page's side, the citation parser's veto (`is_citation`) taking out a line that cites it. Recognition can space a
-/// folio ("74 1" for 741); only a known start, alone at a page's side, repairs it.
-fn margin_labels(labels: &mut [Option<String>], pages: &[PageEvidence], starts: &[u32], is_citation: &dyn Fn(&str, &str) -> bool) {
+/// folio ("74 1" for 741); only a known start, alone at a page's side, repairs it. Each with the line printing it.
+fn margin_labels(labels: &mut [Option<(String, usize)>], pages: &[PageEvidence], starts: &[u32], is_citation: &dyn Fn(&str, &str) -> bool) {
     static SPACED: OnceLock<Regex> = OnceLock::new();
     static LEADING: OnceLock<Regex> = OnceLock::new();
     static TRAILING: OnceLock<Regex> = OnceLock::new();
@@ -1558,8 +1647,8 @@ fn margin_labels(labels: &mut [Option<String>], pages: &[PageEvidence], starts: 
         }
         let top = page.lines.iter().map(|line| line.rect[3]).fold(f64::INFINITY, f64::min);
         let bottom = page.lines.iter().map(|line| line.rect[1]).fold(f64::NEG_INFINITY, f64::max);
-        let mut candidates = std::collections::BTreeSet::new();
-        for line in &page.lines {
+        let mut candidates = std::collections::BTreeMap::new();
+        for (at, line) in page.lines.iter().enumerate() {
             let (rect, width, height) = (line.rect, page.width, page.height);
             if !(rect[3] <= height * 0.14 || rect[1] >= height * 0.86 || rect[1] <= top || rect[3] >= bottom) {
                 continue;
@@ -1571,7 +1660,7 @@ fn margin_labels(labels: &mut [Option<String>], pages: &[PageEvidence], starts: 
             if spaced.is_match(value) {
                 let joined: String = value.split_whitespace().collect();
                 if is_start(&joined) && (rect[0] <= width * 0.2 || rect[2] >= width * 0.8) && !is_citation(value, &joined) {
-                    candidates.insert(joined);
+                    candidates.entry(joined).or_insert(at);
                 }
             }
             let at_start = leading.captures(value).map(|found| found.get(1).unwrap()).filter(|digits| digits.as_str().len() <= 5);
@@ -1588,7 +1677,7 @@ fn margin_labels(labels: &mut [Option<String>], pages: &[PageEvidence], starts: 
                 {
                     continue;
                 }
-                candidates.insert(number.to_owned());
+                candidates.entry(number.to_owned()).or_insert(at);
             }
         }
         if candidates.len() == 1 {

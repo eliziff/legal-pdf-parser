@@ -27,7 +27,7 @@ pub(crate) enum Rule {
     None,
     /// A transcript's line number (`split_line_numbers`).
     LineNumber,
-    /// A folio (`edge_folios`, `alternating_folios`), or the line printing its page's label.
+    /// The line printing its page's number (`legal_pdf_pages::page_map`).
     Folio,
     /// A running head or foot repeated at the edge bands, or a short document's edge.
     RunningHead,
@@ -39,8 +39,6 @@ pub(crate) enum Rule {
     PrintMargin,
     /// A document management identifier (`document_id_line`).
     DocumentId,
-    /// A page number at the edge (`footer_page_number`).
-    PageNumber,
     /// A statute's running head naming its page's sections (`section_heads`), borne out by its spine.
     SectionHead,
     /// A contents list's or word index's line (`contents_lists::read`, pdf-inspector's contents).
