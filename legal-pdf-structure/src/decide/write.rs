@@ -201,7 +201,8 @@ pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences:
             }
             let read: Vec<&Line> = lines.iter().map(|&slot| slots.line(pages, slot)).collect();
             let flags: Vec<bool> = lines.iter().map(|&slot| counted(slot)).collect();
-            for (slot, number) in lines.into_iter().zip(paragraphs_of(&read, &flags, measure)) {
+            let rows: Vec<u32> = lines.iter().map(|&slot| evidence.row(slots, slot)).collect();
+            for (slot, number) in lines.into_iter().zip(paragraphs_of(&read, &rows, &flags, measure)) {
                 paragraph[slot.index()] = number;
             }
         }
@@ -209,7 +210,8 @@ pub(crate) fn blocks(pages: &[Page], slots: &Slots, evidence: &Evidence, fences:
         if order.iter().any(|&slot| role[slot.index()] == Role::Contents) {
             let lines: Vec<Slot> = order.iter().copied().filter(|&slot| role[slot.index()] != Role::LineLabel).collect();
             let read: Vec<&Line> = lines.iter().map(|&slot| slots.line(pages, slot)).collect();
-            let entries = headings::contents::entry_rows(page.width, &read, |at| role[lines[at].index()] == Role::Contents);
+            let rows: Vec<u32> = lines.iter().map(|&slot| evidence.row(slots, slot)).collect();
+            let entries = headings::contents::entry_rows(page.width, &read, &rows, |at| role[lines[at].index()] == Role::Contents);
             for (slot, number) in lines.into_iter().zip(entries) {
                 entry[slot.index()] = number;
             }

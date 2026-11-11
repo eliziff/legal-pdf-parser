@@ -99,21 +99,20 @@ pub(crate) fn label_is_raised(line: &Line, prefix: &LabelPrefix, line_size: f64)
 
 /// Whether the line just above `index`, in its type and at its leading, ends on a counted
 /// enactment's noun ("s", "c", "art") still waiting for its number.
-pub(crate) fn reference_wrapped_onto(lines: &[Line], sizes: &[f64], index: usize) -> bool {
+pub(crate) fn reference_wrapped_onto(lines: &[Line], index: usize) -> bool {
     let line = &lines[index];
     let height = line.bbox[3] - line.bbox[1];
     lines
         .iter()
-        .zip(sizes)
-        .filter(|(above, size)| {
-            (**size - sizes[index]).abs() <= 0.5
+        .filter(|above| {
+            (above.size - line.size).abs() <= 0.5
                 && above.bbox[3] <= line.bbox[1] + height * 0.5
                 && line.bbox[1] - above.bbox[3] < height * 0.6
                 && above.bbox[0] < line.bbox[2]
                 && line.bbox[0] < above.bbox[2]
         })
-        .max_by(|(left, _), (right, _)| left.bbox[3].total_cmp(&right.bbox[3]))
-        .and_then(|(above, _)| above.text.split_whitespace().last())
+        .max_by(|left, right| left.bbox[3].total_cmp(&right.bbox[3]))
+        .and_then(|above| above.text.split_whitespace().last())
         .is_some_and(|word| {
             matches!(
                 word.trim_end_matches('.'),

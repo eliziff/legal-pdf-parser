@@ -103,6 +103,7 @@ fn grow(area: [f64; 4], bbox: [f64; 4]) -> [f64; 4] {
 /// rows that `set_aside` leaves (running heads and feet, lines held out of the body).
 pub(crate) fn margin_note_model(
     lines: &[Line],
+    rows: &[u32],
     members: &[usize],
     set_aside: impl Fn(usize) -> bool,
     labels: &[usize],
@@ -124,7 +125,7 @@ pub(crate) fn margin_note_model(
             // The notes' box: each label's, with the note body set level with a label standing alone.
             let [note_left, note_top, note_right, note_bottom] = lane.iter().fold([page_width, f64::INFINITY, 0.0, 0.0], |area, &index| {
                 let area = grow(area, lines[index].bbox);
-                let body = standalone_note_label(&lines[index]).then(|| aligned_note_body_among(lines, members.iter().copied(), index)).flatten();
+                let body = standalone_note_label(&lines[index]).then(|| aligned_note_body_among(lines, rows, members.iter().copied(), index)).flatten();
                 body.map_or(area, |body| grow(area, lines[body].bbox))
             });
             let prose: Vec<_> = members
@@ -134,7 +135,7 @@ pub(crate) fn margin_note_model(
                     !label_set.contains(&index)
                         && has_valid_bbox(line)
                         && !set_aside(index)
-                        && line_font_size(line) >= body_size * 0.90
+                        && line.size >= body_size * 0.90
                         && line_width(line) >= page_width * 0.25
                         && line.bbox[3] >= note_top
                         && line.bbox[1] <= note_bottom

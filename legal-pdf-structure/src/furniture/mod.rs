@@ -4,7 +4,7 @@
 
 use legal_pdf_core::model::{Line, Page};
 use legal_pdf_core::profile::measure;
-use legal_pdf_core::{line_font_size, quantile, regex};
+use legal_pdf_core::{quantile, regex};
 use crate::layout::{aligned_note_body, aligned_note_body_among, line_center_x, standalone_note_label};
 use crate::model::{Edge, PageView, Rows, Rule, Slot};
 use crate::text::text::{arabic_page_number, heading_standalone_re, scalar_suffix, standalone_paragraph_number};
@@ -331,8 +331,8 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
             let (page, found) = (view.page, &mut found[page_slot]);
             let is_repeated = |index: usize| repeated.contains(&(page_slot, index));
             let is_folio = |index: usize| sequence_folios.contains(&(page_slot, index));
+            let page_rows = &rows[page_slot].of;
             let members: Vec<usize> = view.lines.iter().map(|&slot| view.place(slot)).collect();
-            let line_sizes: Vec<_> = page.lines.iter().map(line_font_size).collect();
             // Without a sequence witness, a folio must sit beyond the remaining body text.
             let (top, bottom) = members
                 .iter()
@@ -343,7 +343,7 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                 members
                     .iter()
                     .filter(|&&index| (page.height * 0.10..=page.height * 0.75).contains(&page.lines[index].bbox[1]))
-                    .map(|&index| line_sizes[index])
+                    .map(|&index| page.lines[index].size)
                     .filter(|size| (4.0..=24.0).contains(size))
                     .collect(),
                 0.75,
@@ -359,7 +359,7 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                     let label = &page.lines[index];
                     !(is_repeated(index) && label.bbox[1] < page.height * 0.12)
                         && standalone_note_label(label)
-                        && members.iter().any(|&body| !is_repeated(body) && aligned_note_body(label, &page.lines[body]))
+                        && members.iter().any(|&body| !is_repeated(body) && aligned_note_body(&page.lines, page_rows, index, body))
                 })
                 .collect();
             // A printed paragraph number or a provision's marker opening the body under a running
@@ -373,7 +373,7 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                 (heading || structure_marker(&label.text))
                     && members.iter().any(|&body_index| {
                         let body = &page.lines[body_index];
-                        (heading || !is_repeated(body_index) && body.text.chars().any(char::is_alphabetic)) && aligned_note_body(label, body)
+                        (heading || !is_repeated(body_index) && body.text.chars().any(char::is_alphabetic)) && aligned_note_body(&page.lines, page_rows, index, body_index)
                     })
             }));
             // Repeated shortforms such as "Ibid." remain note bodies when a small
@@ -384,9 +384,9 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                 if !standalone_note_label(label) || label.bbox[1] <= page.height * 0.86 || is_folio(index) {
                     return None;
                 }
-                let body_index = aligned_note_body_among(&page.lines, members.iter().copied(), index)?;
+                let body_index = aligned_note_body_among(&page.lines, page_rows, members.iter().copied(), index)?;
                 let body = &page.lines[body_index];
-                (body.bbox[1] > page.height * 0.86 && line_sizes[body_index] < body_size * 0.90 && legal_structure_model::structure_analysis().has_citation_signal(&body.text))
+                (body.bbox[1] > page.height * 0.86 && page.lines[body_index].size < body_size * 0.90 && legal_structure_model::structure_analysis().has_citation_signal(&body.text))
                     .then_some([index, body_index])
             }).flatten());
             for (&slot, &index) in view.lines.iter().zip(&members) {
@@ -395,7 +395,7 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                     continue;
                 }
                 let line = &page.lines[index];
-                let line_size = line_sizes[index];
+                let line_size = page.lines[index].size;
                 let frame = frame_edge(rows[page_slot], index);
                 let (banded_top, banded_bottom) = (line.bbox[1] < page.height * 0.12, line.bbox[3] > page.height * 0.90);
                 let at_top = banded_top || frame == Some(Edge::Top);
@@ -455,7 +455,7 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
             for (index, edge) in print_margins(view, &line_label) {
                 found[index] = Some((edge, Rule::PrintMargin));
             }
-            extend_running_heads(page, &members, found, &line_sizes, body_size, |index| line_label(view.slot(index)));
+            extend_running_heads(page, &members, found, body_size, |index| line_label(view.slot(index)));
         }
     });
     // A division's heading the edge bands took for a running head: its own text, alone on its line,
@@ -515,7 +515,6 @@ fn extend_running_heads(
     page: &Page,
     members: &[usize],
     found: &mut [Option<(Edge, Rule)>],
-    line_sizes: &[f64],
     body_size: f64,
     line_label: impl Fn(usize) -> bool,
 ) {
@@ -527,7 +526,7 @@ fn extend_running_heads(
             .iter()
             .copied()
             .filter(|&index| {
-                let (line, size) = (&page.lines[index], line_sizes[index]);
+                let (line, size) = (&page.lines[index], page.lines[index].size);
                 !header(found, index)
                     && !line_label(index)
                     && line.bbox[3] < top_band
@@ -538,7 +537,7 @@ fn extend_running_heads(
                         let height = (head.bbox[3] - head.bbox[1]).max(line.bbox[3] - line.bbox[1]);
                         header(found, head_index)
                             && head.bbox[3] < top_band
-                            && (line_sizes[head_index] - size).abs() <= 0.5
+                            && (page.lines[head_index].size - size).abs() <= 0.5
                             && ((head.bbox[0] - line.bbox[0]).abs() <= tolerance || (line_center_x(head) - line_center_x(line)).abs() <= tolerance)
                             && (line.bbox[1] - head.bbox[3]).max(head.bbox[1] - line.bbox[3]) <= height * 0.5
                     })

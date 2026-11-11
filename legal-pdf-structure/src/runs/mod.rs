@@ -59,6 +59,8 @@ fn repair_markers(pages: &mut [Page], fences: &Fences) -> Vec<(Slot, String)> {
         legal_structure_model::structure_analysis().repair_label_dropouts(&mut view);
         for ((line, _), (slot, text)) in view.into_iter().zip(before) {
             if line.text != text {
+                // (A rewritten line's type size is read again with its text.)
+                line.size = legal_pdf_core::line_font_size(line);
                 repaired.push((slot, text));
             }
         }

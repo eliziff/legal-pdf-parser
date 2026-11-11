@@ -5,7 +5,7 @@
 //! they mark its body.
 
 use legal_pdf_core::model::{Line, Page};
-use legal_pdf_core::{flag_share, line_font_size, off_grid_sizes, BOLD};
+use legal_pdf_core::{flag_share, off_grid_sizes, BOLD};
 use legal_pdf_core::model::sentence_ended;
 use crate::model::SourceTag;
 use crate::text::text::{
@@ -149,7 +149,7 @@ fn opens_after_dangling(previous: &Line, current: &Line) -> bool {
     let named = regex!(r"(?i)(?:(?:delivered|given|rendered|written) by|rendue? par):?$");
     let judge = regex!(r"\b(?:J|JJ|C\.J|J\.A|JJ\.A|C\.J\.[A-Z]+|J\.C\.[A-Z])\.?(?:\s*[-\u{2014}\u{2013}:]\s*)?$|^(?:LE |LA |LES )?JUGES?\b");
     let text = current.text.trim();
-    let (size, before) = (line_font_size(current), line_font_size(previous));
+    let (size, before) = (current.size, previous.size);
     crate::text::paragraphs::opens_item(text)
         || crate::layout::opens_turn(current)
         || named.is_match(previous.text.trim())

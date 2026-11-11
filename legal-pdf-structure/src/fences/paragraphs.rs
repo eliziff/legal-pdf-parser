@@ -55,20 +55,20 @@ impl<'a> Reading<'a> {
         // (Each line's printed number, read once.)
         let printed: Vec<Option<usize>> = (0..slots.len()).map(|at| legal_structure_model::structure_analysis().printed_paragraph_number(&slots.line(pages, Slot(at as u32)).text)).collect();
         let stream_of = fences.streams(&printed);
-        let marker_of = fences.marker_rows(evidence, slots, &stream_of);
+        let marker_of = fences.marker_rows(pages, evidence, slots, &stream_of);
         let attached = marker_of.values().filter(|(_, added)| !added).map(|(marker, _)| *marker).collect();
-        let measures = PageMeasures::of(fences, pages, slots, evidence);
+        let measures = PageMeasures::of(fences, pages, slots);
         let numbers = Numbers::of(fences, pages, slots, evidence, &printed, &stream_of, &measures.edge);
-        let counts = Counts::of(fences, pages, slots, evidence, &stream_of, &numbers);
+        let counts = Counts::of(fences, pages, slots, &stream_of, &numbers);
         Self { fences, pages, slots, evidence, stream_of, marker_of, attached, measures, numbers, counts }
     }
 
     fn small(&self, at: usize) -> bool {
-        self.fences.below_body(self.evidence, at, 0.9)
+        self.fences.below_body(self.slots.line(self.pages, Slot(at as u32)).size, at, 0.9)
     }
 
     fn smaller(&self, at: usize) -> bool {
-        self.fences.below_body(self.evidence, at, 0.95)
+        self.fences.below_body(self.slots.line(self.pages, Slot(at as u32)).size, at, 0.95)
     }
 
     fn read(self) -> Paragraphs {
@@ -201,8 +201,8 @@ impl Fences {
     /// A figure in far smaller type than the body is a note's label, however it lines up: a page's labels count on as
     /// margin numbers do, and a scan's layer boxes its lines alike. Beside a line in the body's own type it numbers that
     /// line: a tribunal's word processor sets its paragraph numbers small.
-    fn note_label(&self, evidence: &Evidence, at: usize, row: Option<Slot>) -> bool {
-        evidence.size[at] * 2.0 < self.label_size() && !row.is_some_and(|row| self.body.is_some_and(|(_, size)| evidence.half_points[row.index()] == size))
+    fn note_label(&self, evidence: &Evidence, size: f64, row: Option<Slot>) -> bool {
+        size * 2.0 < self.label_size() && !row.is_some_and(|row| self.body.is_some_and(|(_, size)| evidence.half_points[row.index()] == size))
     }
 
     fn label_size(&self) -> f64 {
@@ -219,7 +219,7 @@ impl Fences {
     /// storing are apart: only the margin's small figures are cleared before it, and the answer is stored once after.
     pub(crate) fn read_paragraphs(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
         for at in 0..slots.len() {
-            if self.note_label(evidence, at, self.margin_number[at]) {
+            if self.note_label(evidence, slots.line(pages, Slot(at as u32)).size, self.margin_number[at]) {
                 self.margin_number[at] = None;
                 self.margin_twin[at] = None;
             }
@@ -248,12 +248,12 @@ impl Fences {
     }
 
     /// Each row's marker, standing alone on its line: the margin's numbers by their rows, other markers by theirs.
-    fn marker_rows(&self, evidence: &Evidence, slots: &Slots, stream_of: &[Stream]) -> HashMap<(Slot, Stream), (Slot, bool)> {
+    fn marker_rows(&self, pages: &[Page], evidence: &Evidence, slots: &Slots, stream_of: &[Stream]) -> HashMap<(Slot, Stream), (Slot, bool)> {
         let mut marker_of = HashMap::<(Slot, Stream), (Slot, bool)>::new();
         for at in 0..slots.len() {
             let marker = Slot(at as u32);
             // (A marker takes one row: the margin's, where it has one.)
-            let rows = [self.margin_number[at], self.margin_twin[at], evidence.beside[at].filter(|&row| !self.note_label(evidence, at, Some(row)) && self.margin_number[at].is_none())];
+            let rows = [self.margin_number[at], self.margin_twin[at], evidence.beside[at].filter(|&row| !self.note_label(evidence, slots.line(pages, marker).size, Some(row)) && self.margin_number[at].is_none())];
             for (k, row) in rows.into_iter().enumerate().filter_map(|(k, row)| Some((k, row?))) {
                 // A marker's row is the line beside it in its own language (the nearest line on a parallel report's
                 // row may be the other column's); only a margin number serves the other language's row.
@@ -272,8 +272,8 @@ impl Fences {
     }
 
     /// Set smaller than the body by the share: a margin's number stands in its own type.
-    fn below_body(&self, evidence: &Evidence, at: usize, share: f64) -> bool {
-        evidence.size[at] > 0.0 && self.margin_number[at].is_none() && self.body.is_some_and(|(_, size)| evidence.size[at] * 2.0 < f64::from(size) * share)
+    fn below_body(&self, size: f64, at: usize, share: f64) -> bool {
+        size > 0.0 && self.margin_number[at].is_none() && self.body.is_some_and(|(_, body)| size * 2.0 < f64::from(body) * share)
     }
 
     /// A line of the running text.

@@ -4,7 +4,7 @@ use super::*;
 impl Fences {
     /// How each line no fence took goes on with the line before it, in its reading context and
     /// stream, in reading order: on one page by any continuation, across a page by the text's flow.
-    pub(crate) fn read_continuations(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence) {
+    pub(crate) fn read_continuations(&mut self, pages: &[Page], slots: &Slots) {
         self.continues = vec![None; slots.len()];
         let mut last: Vec<Option<Slot>> = vec![None; self.contexts.len() * 2];
         for &slot in &self.order {
@@ -28,7 +28,7 @@ impl Fences {
                 let start = range.start as usize;
                 let (at, prior_at) = (slot.index() - start, prior.index() - start);
                 let body = |other: usize| self.role[start + other] == Role::Open && self.band[start + other] == band;
-                if reference_wrapped_onto(&page.lines, &evidence.size[start..range.end as usize], at) {
+                if reference_wrapped_onto(&page.lines, at) {
                     Some(Continuation::Reference)
                 } else if carries_a_sentence_onto(page, prior_at, at, body) {
                     Some(Continuation::Sentence)
@@ -63,7 +63,7 @@ impl Fences {
             }
         }
         if fenced {
-            self.read_continuations(pages, slots, evidence);
+            self.read_continuations(pages, slots);
         }
     }
 }

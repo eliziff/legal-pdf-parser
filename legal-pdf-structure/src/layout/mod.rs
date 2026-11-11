@@ -4,7 +4,7 @@
 use crate::model::{PageView, Slot};
 use crate::tables::has_table_caption;
 use legal_structure_model::text::{is_note_symbol, MAX_SYMBOL_LABEL_LEN};
-use legal_pdf_core::{line_font_size, median, Columns, Diagnostic, Line, Page, PageMeasure};
+use legal_pdf_core::{median, Columns, Diagnostic, Line, Page, PageMeasure};
 use std::{
     cell::OnceCell,
     collections::{HashMap, HashSet},

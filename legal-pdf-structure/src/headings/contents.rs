@@ -11,7 +11,7 @@
 //! enumerated or all set at one indent, else from the list's indents.
 
 use super::bookmarks::normalize_title;
-use crate::headings::contents_lists::{row_bands, row_of, Entry};
+use crate::headings::contents_lists::{row_of, Entry};
 use super::rules::numbered;
 use super::rules::ladder_levels;
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
@@ -27,13 +27,23 @@ const MAX_LEVEL: usize = 6;
 /// Each contents line's entry, numbered from 0 in order, of a page `width` wide whose `lines` (in
 /// reading order) `listed` names as contents: a printed marker or a completed locator starts the
 /// next entry, a row without one goes on with the entry its locator left open, and a row holding
-/// another line closes it.
-pub(crate) fn entry_rows(width: f64, lines: &[&Line], listed: impl Fn(usize) -> bool) -> Vec<Option<usize>> {
+/// another line closes it. `rows` is each line's row on its page (`Evidence::row`, `u32::MAX` for none): the lines of
+/// one row that follow one another in reading order are one row, read left to right.
+pub(crate) fn entry_rows(width: f64, lines: &[&Line], rows: &[u32], listed: impl Fn(usize) -> bool) -> Vec<Option<usize>> {
     let mut entries = vec![None; lines.len()];
     let mut next: Option<usize> = None;
     let mut open = false;
-    let places: Vec<usize> = (0..lines.len()).collect();
-    for band in row_bands(&places, |at| lines[at].bbox) {
+    let mut bands: Vec<Vec<usize>> = Vec::new();
+    for at in 0..lines.len() {
+        match bands.last_mut().filter(|band| rows[at] != u32::MAX && rows[band[0]] == rows[at]) {
+            Some(band) => band.push(at),
+            None => bands.push(vec![at]),
+        }
+    }
+    for band in &mut bands {
+        band.sort_by(|&a, &b| lines[a].bbox[0].total_cmp(&lines[b].bbox[0]));
+    }
+    for band in bands {
         if band.iter().any(|&at| !listed(at)) {
             open = false;
             continue;

@@ -7,30 +7,22 @@ pub(crate) fn band_geometry_top(line: &Line) -> f64 {
     line.words.iter().map(|word| word.bbox[1]).min_by(f64::total_cmp).unwrap_or(line.bbox[1])
 }
 
-/// Lines (`members`, slots of `lines`) in rows, top to bottom, each row left to right: taken by
-/// `top`, a line joins the row whose middle its own sits within half the lines' median height of,
-/// so a skewed scan's row (each word a line, the tops rising across the page) reads left to right.
-pub(crate) fn read_rows(lines: &[Line], members: &mut Vec<usize>, top: impl Fn(usize) -> f64) {
-    let height = |slot: usize| (lines[slot].bbox[3] - lines[slot].bbox[1]).max(0.0);
-    let half = median(members.iter().map(|&slot| height(slot)).collect()) / 2.0;
+/// Lines (`members`, slots of `lines`) in rows, top to bottom by `top`, each row left to right: a row is the lines of
+/// one of the page's rows (`rows`, each line's, `u32::MAX` for none, a row of its own).
+pub(crate) fn read_rows(lines: &[Line], rows: &[u32], members: &mut Vec<usize>, top: impl Fn(usize) -> f64) {
     let mut keyed: Vec<(usize, f64)> = members.iter().map(|&slot| (slot, top(slot))).collect();
     keyed.sort_by(|left, right| left.1.total_cmp(&right.1).then(lines[left.0].bbox[0].total_cmp(&lines[right.0].bbox[0])));
-    let mut rows: Vec<(f64, Vec<usize>)> = Vec::new();
-    for (slot, top) in keyed {
-        let middle = top + height(slot) / 2.0;
-        match rows.last_mut() {
-            Some((sum, row)) if (middle - *sum / row.len() as f64).abs() <= half => {
-                *sum += middle;
-                row.push(slot);
-            }
-            _ => rows.push((middle, vec![slot])),
+    let mut read: Vec<Vec<usize>> = Vec::new();
+    for (slot, _) in keyed {
+        match read.iter_mut().find(|row| rows[slot] != u32::MAX && rows[row[0]] == rows[slot]) {
+            Some(row) => row.push(slot),
+            None => read.push(vec![slot]),
         }
     }
-    let row = |(_, mut row): (f64, Vec<usize>)| {
+    for row in &mut read {
         row.sort_by(|&left, &right| lines[left].bbox[0].total_cmp(&lines[right].bbox[0]));
-        row
-    };
-    *members = rows.into_iter().flat_map(row).collect();
+    }
+    *members = read.into_iter().flatten().collect();
 }
 
 pub(crate) fn standalone_note_label(line: &Line) -> bool {
@@ -40,45 +32,42 @@ pub(crate) fn standalone_note_label(line: &Line) -> bool {
         || ((1..=4).contains(&length) && text.chars().all(|character| character.is_ascii_digit()))
 }
 
-pub(crate) fn aligned_note_body(label: &Line, body: &Line) -> bool {
-    if standalone_note_label(body) || body.bbox[0] < label.bbox[0] {
-        return false;
-    }
-    let overlap = label.bbox[3].min(body.bbox[3]) - label.bbox[1].max(body.bbox[1]);
-    let minimum_height = (label.bbox[3] - label.bbox[1]).min(body.bbox[3] - body.bbox[1]);
-    overlap > 0.0 && minimum_height > 0.0 && overlap / minimum_height >= 0.5
+/// Whether the line at `body` carries the text of the label at `label` printed apart from it: on the label's row (`rows`,
+/// the page's, by line), at or right of it, and no label itself.
+pub(crate) fn aligned_note_body(lines: &[Line], rows: &[u32], label: usize, body: usize) -> bool {
+    !standalone_note_label(&lines[body]) && lines[body].bbox[0] >= lines[label].bbox[0] && rows[label] != u32::MAX && rows[label] == rows[body]
 }
 
 /// The line among the lines `among` names (slots of `lines`) that a label printed apart from its
 /// note's text stands beside: on the label's row, at or right of it, nearest it.
-pub(crate) fn aligned_note_body_among(lines: &[Line], among: impl IntoIterator<Item = usize>, label_index: usize) -> Option<usize> {
+pub(crate) fn aligned_note_body_among(lines: &[Line], rows: &[u32], among: impl IntoIterator<Item = usize>, label_index: usize) -> Option<usize> {
     let label = &lines[label_index];
     let (gap, drop) = (|body: &Line| (body.bbox[0] - label.bbox[2]).max(0.0), |body: &Line| (body.bbox[1] - label.bbox[1]).abs());
     among
         .into_iter()
         .map(|index| (index, &lines[index]))
-        .filter(|(_, body)| aligned_note_body(label, body))
+        .filter(|&(index, _)| aligned_note_body(lines, rows, label_index, index))
         .min_by(|(_, left), (_, right)| gap(left).total_cmp(&gap(right)).then(drop(left).total_cmp(&drop(right))))
         .map(|(index, _)| index)
 }
 
 /// A page's note band (`note`, slots of `lines`) in reading order: column by column, row by row
 /// (`read_rows`), a label set apart on its note's first line. `items` are the page's (on page `number`).
-pub(crate) fn order_note_lines(lines: &[Line], note: &mut Vec<usize>, items: &crate::tables::PageItems, number: u32) {
+pub(crate) fn order_note_lines(lines: &[Line], rows: &[u32], note: &mut Vec<usize>, items: &crate::tables::PageItems, number: u32) {
     let mut tops: HashMap<usize, f64> = note.iter().map(|&slot| (slot, band_geometry_top(&lines[slot]))).collect();
     for &label in note.iter() {
         if !standalone_note_label(&lines[label]) {
             continue;
         }
-        if let Some(body) = aligned_note_body_among(lines, note.iter().copied(), label) {
+        if let Some(body) = aligned_note_body_among(lines, rows, note.iter().copied(), label) {
             tops.insert(label, tops[&body]);
         }
     }
     let columns = note_column_model(lines, note, items, number);
     let right = |slot: &usize| columns.kind == ColumnKind::Two && line_center_x(&lines[*slot]) >= columns.split_x;
     let (mut left_column, mut right_column): (Vec<usize>, Vec<usize>) = note.iter().copied().partition(|slot| !right(slot));
-    read_rows(lines, &mut left_column, |slot| tops[&slot]);
-    read_rows(lines, &mut right_column, |slot| tops[&slot]);
+    read_rows(lines, rows, &mut left_column, |slot| tops[&slot]);
+    read_rows(lines, rows, &mut right_column, |slot| tops[&slot]);
     left_column.extend(right_column);
     *note = left_column;
 }

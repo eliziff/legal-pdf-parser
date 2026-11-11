@@ -15,7 +15,7 @@
 //! as a short line before a wider blank does; a line going on with a sentence or a hyphened word
 //! opens nothing.
 
-use legal_pdf_core::{flag_share, line_font_size, quantile, regex, upper_median as median, Line, BOLD, ITALIC};
+use legal_pdf_core::{flag_share, quantile, regex, upper_median as median, Line, BOLD, ITALIC};
 use regex::Regex;
 use std::collections::HashMap;
 
@@ -64,7 +64,7 @@ pub(crate) fn contents_leader_re() -> &'static Regex {
 }
 
 fn size(line: &Line) -> f64 {
-    let size = line_font_size(line);
+    let size = line.size;
     if size > 0.0 { size } else { height(line) }
 }
 
@@ -83,10 +83,6 @@ fn width(line: &Line) -> f64 {
 
 fn char_width(line: &Line) -> f64 {
     width(line) / line.text.trim().chars().count().max(1) as f64
-}
-
-fn centre(line: &Line) -> f64 {
-    (line.bbox[1] + line.bbox[3]) / 2.0
 }
 
 /// The leftmost of the lines' left edges.
@@ -120,11 +116,6 @@ pub(crate) fn field_label(line: &Line) -> bool {
         return false;
     };
     text.chars().count() <= 24 && text.split_whitespace().count() <= 3 && !name.contains([':', ';']) && !name.trim_end_matches('.').contains('.')
-}
-
-pub(crate) fn same_row(a: &Line, b: &Line) -> bool {
-    let overlap = a.bbox[3].min(b.bbox[3]) - a.bbox[1].max(b.bbox[1]);
-    overlap > 0.5 * height(a).min(height(b))
 }
 
 /// Line advance, read from whichever box edge moved less: a recognized line's top
@@ -174,10 +165,6 @@ pub(crate) struct Measure {
     /// The median blank between two scanned lines stacked in one column, counted up to 1.25 line
     /// heights: a paragraph's own leading, not the space between paragraphs.
     gap: f64,
-    /// The median distance between the centres of two scanned lines stacked in one column, counted
-    /// from a quarter to 1.75 line heights: the line pitch, which a scan's text layer can set
-    /// closer than its boxes are tall (boxes overlapping the next line's).
-    pitch: f64,
 }
 
 /// The measures a document's counted lines show (`pages`: each page's, in their order on it): the
@@ -197,8 +184,7 @@ pub(crate) fn measure_of(pages: &[Vec<&Line>]) -> Measure {
         )
     };
     let gap = between(&|a, b| b.bbox[1] - a.bbox[3], 0.0, 1.25 * line_height);
-    let pitch = between(&|a, b| centre(b) - centre(a), 0.25 * line_height, 1.75 * line_height);
-    Measure { width, line: line_height, gap, pitch }
+    Measure { width, line: line_height, gap }
 }
 
 impl Pitch {
@@ -235,12 +221,6 @@ impl Pitch {
         width(line) < 0.6 * self.measure.width
     }
 
-    /// Are two lines on one row? A scan's boxes swell and overlap their neighbours, so there its
-    /// lines share a row when their centres are within half the document's line pitch.
-    fn same_row(&self, a: &Line, b: &Line) -> bool {
-        if !self.scan || self.measure.pitch <= 0.0 { same_row(a, b) } else { (centre(a) - centre(b)).abs() < 0.5 * self.measure.pitch }
-    }
-
     /// Does a column of the page start within `tolerance` of `x`?
     fn at_edge(&self, x: f64, tolerance: f64) -> bool {
         self.edges.iter().any(|edge| (edge - x).abs() <= tolerance)
@@ -248,9 +228,9 @@ impl Pitch {
 }
 
 /// Does `b` begin a new visual block after `a`? The rule that says so, by name.
-fn starts_block(a: &Line, b: &Line, pitch: &Pitch) -> Option<&'static str> {
+fn starts_block(a: &Line, b: &Line, same_row: bool, pitch: &Pitch) -> Option<&'static str> {
     let both_short = pitch.short(a) && pitch.short(b);
-    if pitch.same_row(a, b) {
+    if same_row {
         // A marker set apart from its text on the text's row ("1." then the paragraph).
         let text = a.text.trim();
         let marker = marker_only_re().is_match(&a.text) || (text.chars().count() <= 4 && !text.contains(' '));
@@ -334,8 +314,8 @@ fn indents_first_lines(block: &[&Line]) -> bool {
 /// Does `b` begin a new paragraph after `a` inside one visual block? The rule that says so,
 /// by name. Where first lines are set in from the `margin`, every line set in begins one and
 /// a short line ends none by itself.
-fn starts_paragraph(a: &Line, b: &Line, block: &[&Line], after: Option<&Line>, margin: Option<f64>, pitch: &Pitch) -> Option<&'static str> {
-    if pitch.same_row(a, b) {
+fn starts_paragraph(a: &Line, b: &Line, same_row: bool, block: &[&Line], after: Option<&Line>, margin: Option<f64>, pitch: &Pitch) -> Option<&'static str> {
+    if same_row {
         return None;
     }
     if bullet_re().is_match(&b.text) || marker_only_re().is_match(&b.text) {
@@ -450,8 +430,9 @@ pub(crate) fn continues_onto(previous: &[&Line], next: &[&Line]) -> bool {
 }
 
 /// Each of a page's `lines` (in reading order) `counted` holds numbered by its printed paragraph,
-/// from 0 in order; none for the others, which part the runs of counted lines.
-pub(crate) fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure) -> Vec<Option<usize>> {
+/// from 0 in order; none for the others, which part the runs of counted lines. `rows` is each line's row on its page
+/// (`Evidence::row`, `u32::MAX` for none): two lines on one row stand side by side.
+pub(crate) fn paragraphs_of(lines: &[&Line], rows: &[u32], counted: &[bool], measure: Measure) -> Vec<Option<usize>> {
     let body: Vec<&Line> = lines.iter().zip(counted).filter(|(_, counted)| **counted).map(|(line, _)| *line).collect();
     let pitch = Pitch::of(&body, measure);
     let (mut assigned, mut next, mut start) = (vec![None; lines.len()], 0, 0);
@@ -462,9 +443,10 @@ pub(crate) fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure)
             continue;
         }
         let run = &lines[from..start];
+        let same_row = |k: usize| rows[from + k - 1] != u32::MAX && rows[from + k - 1] == rows[from + k];
         let mut block_start = 0;
         for k in 1..=run.len() {
-            if k < run.len() && starts_block(run[k - 1], run[k], &pitch).is_none() {
+            if k < run.len() && starts_block(run[k - 1], run[k], same_row(k), &pitch).is_none() {
                 continue;
             }
             let block = &run[block_start..k];
@@ -472,7 +454,7 @@ pub(crate) fn paragraphs_of(lines: &[&Line], counted: &[bool], measure: Measure)
             let indented = indents_first_lines(block);
             for j in 1..block.len() {
                 let margin = indented.then(|| margin_at(block, j));
-                next += usize::from(starts_paragraph(block[j - 1], block[j], block, block.get(j + 1).copied(), margin, &pitch).is_some());
+                next += usize::from(starts_paragraph(block[j - 1], block[j], same_row(block_start + j), block, block.get(j + 1).copied(), margin, &pitch).is_some());
                 assigned[from + block_start + j] = Some(next);
             }
             next += 1;

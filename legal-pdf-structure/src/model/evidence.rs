@@ -37,7 +37,7 @@ pub(crate) const SUPPRESS_COMMA: u8 = 4;
 /// Under a line ending on an enactment's noun, not raised: that reference's number, wrapped.
 pub(crate) const SUPPRESS_WRAPPED: u8 = 8;
 
-/// A page's rows, lines sharing a baseline band (`contents_lists::row_bands`): each line's row, top
+/// A page's rows, lines sharing a baseline band (`evidence::row_bands`): each line's row, top
 /// row 0 (`u32::MAX` for a line with no text or box, or set on its side); the number of rows; and
 /// how many of its first and of its last rows stand apart from the rest by at least one and a half
 /// of the page's typical step from row to row (frame rows: where a running head or foot sits
@@ -169,7 +169,6 @@ pub(crate) struct Evidence {
     #[serde(skip)]
     pub(crate) items: Vec<PageItems>,
     pub(crate) line_number: Vec<bool>,
-    pub(crate) size: Vec<f64>,
     /// The line's commonest face (an index into `faces`; `u16::MAX` for none) and its size in half
     /// points (`dominant_face`).
     pub(crate) face: Vec<u16>,

@@ -55,12 +55,12 @@ pub(crate) struct Notes {
 /// which a scan's lines carry too) holding a tenth or more of the characters of its lines no fence
 /// took outside the note band, so that a note's or a quotation's type, however common, never
 /// becomes the body's; 0 where no line carries a size.
-fn body_size(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, lines: &[Slot]) -> f64 {
+fn body_size(pages: &[Page], slots: &Slots, fences: &Fences, lines: &[Slot]) -> f64 {
     let mut mass: HashMap<i64, usize> = HashMap::new();
     for &slot in lines {
         let at = slot.index();
-        if fences.role[at] == Role::Open && !fences.band[at] && evidence.size[at] > 0.0 {
-            *mass.entry((evidence.size[at] * 100.0).round() as i64).or_default() += slots.line(pages, slot).text.chars().count();
+        if fences.role[at] == Role::Open && !fences.band[at] && slots.line(pages, Slot(at as u32)).size > 0.0 {
+            *mass.entry((slots.line(pages, Slot(at as u32)).size * 100.0).round() as i64).or_default() += slots.line(pages, slot).text.chars().count();
         }
     }
     let total: usize = mass.values().sum();
@@ -117,13 +117,13 @@ impl Notes {
             }
         }
         let body_sizes: BTreeMap<(u16, bool), f64> =
-            groups.iter().map(|(key, (lines, _))| (*key, body_size(pages, slots, evidence, fences, lines))).collect();
+            groups.iter().map(|(key, (lines, _))| (*key, body_size(pages, slots, fences, lines))).collect();
         // A counted run's member that opens a unit, its text set in its document's body type.
         let mut unit = vec![false; count];
         for member in runs.members().filter(|member| member.counted && member.kind.is_some()) {
             let body_size = body_sizes.get(&group(member.slot)).copied().unwrap_or(0.0);
             let text = member.beside.unwrap_or(member.slot);
-            if body_size > 0.0 && evidence.size[text.index()] >= body_size * 0.90 {
+            if body_size > 0.0 && slots.line(pages, text).size >= body_size * 0.90 {
                 unit[member.slot.index()] = true;
             }
         }
@@ -189,7 +189,7 @@ impl Notes {
             for &slot in &lines_of {
                 let at = slot.index();
                 let Some(&(read_here, cut)) = noted.get(&slots.page(slot)) else { continue };
-                let typed = read_here || body > 0.0 && evidence.size[at] > 0.0 && evidence.size[at] < body * 0.90;
+                let typed = read_here || body > 0.0 && slots.line(pages, Slot(at as u32)).size > 0.0 && slots.line(pages, Slot(at as u32)).size < body * 0.90;
                 if fences.band[at]
                     && typed
                     && !document.paragraph(at)

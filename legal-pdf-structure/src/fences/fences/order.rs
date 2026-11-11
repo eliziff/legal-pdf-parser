@@ -30,6 +30,7 @@ impl Fences {
                 let table_page = (0..page.lines.len()).any(|line| self.cell[start + line] != 0);
                 let (order, diagnostics) = page_order(
                     page,
+                    &evidence.pages[page_slot].rows.of,
                     stream,
                     |slot| self.role[start + slot] == Role::LineLabel,
                     &evidence.items[page_slot],
@@ -99,7 +100,7 @@ impl Fences {
             // (A PDF that gives its lines no height gives them their type's.)
             let mut heights: Vec<f64> = body.iter().map(|&slot| {
                 let line = slots.line(pages, slot);
-                Some(line.bbox[3] - line.bbox[1]).filter(|height| *height >= 1.0).unwrap_or_else(|| legal_pdf_core::line_font_size(line))
+                Some(line.bbox[3] - line.bbox[1]).filter(|height| *height >= 1.0).unwrap_or_else(|| line.size)
             }).filter(|h| *h >= 1.0).collect();
             heights.sort_by(f64::total_cmp);
             let text_height = heights.get(heights.len() / 2).copied().unwrap_or(10.0);

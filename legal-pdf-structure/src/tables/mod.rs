@@ -10,7 +10,7 @@
 //! of the next page, or under its repeated caption and head row, when its columns stand where
 //! they stood.
 
-use legal_pdf_core::{flag_share, line_font_size, BOLD};
+use legal_pdf_core::{flag_share, BOLD};
 use legal_pdf_core::model::{Line, Page, Span, ITALIC, MONOSPACED};
 use pdf_inspector::tables::{
     detect_tables, detect_tables_from_lines, detect_tables_from_rects, try_build_rect_guided_table,
@@ -157,7 +157,7 @@ pub(crate) fn line_items(lines: &[Line], number: u32, height: f64) -> PageItems 
         font: span.map_or(String::new(), |span| span.font.clone()),
         font_tag: String::new(),
         legacy_symbol_rewrite: false,
-        font_size: line_font_size(line).max(bbox[3] - bbox[1]) as f32,
+        font_size: line.size.max(bbox[3] - bbox[1]) as f32,
         page: number,
         is_bold: span.map_or_else(|| bold(line), |span| span.flags & BOLD != 0),
         is_italic: span.is_some_and(|span| span.flags & ITALIC != 0),

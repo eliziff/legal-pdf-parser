@@ -299,7 +299,7 @@ impl LineTable {
             values.extend([
                 flag(label.is_some()), flag(label.is_some_and(|l| l.raised)),
                 label.map_or(0.0, |l| f64::from(l.value.min(999)) / 100.0),
-                label.map_or(0.0, |l| f64::from(l.size) / evidence.size[at].max(1.0)),
+                label.map_or(0.0, |l| f64::from(l.size) / slots.line(pages, Slot(at as u32)).size.max(1.0)),
                 flag(label.is_some_and(|l| l.suppress != 0)),
                 flag(evidence.references[at] & REFERENCE_SUPERSCRIPT != 0), flag(evidence.references[at] & REFERENCE_DETACHED != 0),
                 flag(evidence.references[at] & REFERENCE_RAISED != 0), flag(evidence.references[at] & REFERENCE_GLUED != 0),
@@ -407,7 +407,7 @@ impl LineTable {
             let word = evidence.words[slot.index()] & WORD_DIVISION != 0;
             line_readings(slots.line(pages, slot), word, recognized.get(&slot).copied(), confusions)
         }).collect();
-        let mut references: Vec<Vec<(u32, u32, u32)>> = order.iter().map(|&slot| reference_spans(slots.line(pages, slot), evidence.size[slot.index()])).collect();
+        let mut references: Vec<Vec<(u32, u32, u32)>> = order.iter().map(|&slot| reference_spans(slots.line(pages, slot), slots.line(pages, slot).size)).collect();
         unmarked_notes(order, slots, pages, evidence, &mut references);
         let looks = order.iter().map(|slot| look_id(evidence, slot.index())).collect();
         let (margin_rows, margins) = margin_lines(order, &readings, fences);

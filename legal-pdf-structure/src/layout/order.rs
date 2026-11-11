@@ -144,7 +144,7 @@ pub(crate) fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &c
 /// A drop cap (a single large letter beside the start of its paragraph) moved to before the line it
 /// begins; `members` are slots of `lines`.
 pub(crate) fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
-    let body_size = median(members.iter().map(|&slot| line_font_size(&lines[slot])).filter(|size| (4.0..=24.0).contains(size)).collect());
+    let body_size = median(members.iter().map(|&slot| lines[slot].size).filter(|size| (4.0..=24.0).contains(size)).collect());
     if body_size <= 0.0 {
         return;
     }
@@ -152,7 +152,7 @@ pub(crate) fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
     for (index, &slot) in members.iter().enumerate() {
         let line = &lines[slot];
         let text = line.text.trim();
-        if text.chars().count() != 1 || !text.chars().all(char::is_alphabetic) || line_font_size(line) < body_size * 1.8 {
+        if text.chars().count() != 1 || !text.chars().all(char::is_alphabetic) || line.size < body_size * 1.8 {
             continue;
         }
         let target = members
@@ -161,7 +161,7 @@ pub(crate) fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
             .filter(|&(other, &candidate)| {
                 let candidate = &lines[candidate];
                 other != index
-                    && line_font_size(candidate) <= body_size * 1.4
+                    && candidate.size <= body_size * 1.4
                     && candidate.bbox[0] >= line.bbox[2] - body_size
                     && candidate.bbox[0] - line.bbox[2] <= body_size * 3.0
                     && candidate.bbox[1] < line.bbox[3]
@@ -184,6 +184,7 @@ pub(crate) fn repair_drop_caps(lines: &[Line], members: &mut Vec<usize>) {
 /// is a contents list's (contents_lists).
 pub(crate) fn page_order(
     page: &Page,
+    rows: &[u32],
     stream: impl Fn(usize) -> Stream,
     line_label: impl Fn(usize) -> bool,
     items: &crate::tables::PageItems,
@@ -221,10 +222,10 @@ pub(crate) fn page_order(
         uncertain
     };
     let diagnostics = uncertain.then(|| Diagnostic::new("COLUMN_ORDER_UNCERTAIN", Some(page.index))).into_iter().collect();
-    order_note_lines(lines, &mut note, items, number);
+    order_note_lines(lines, rows, &mut note, items, number);
     // A running head and foot read row by row.
-    read_rows(lines, &mut header, |slot| band_geometry_top(&lines[slot]));
-    read_rows(lines, &mut footer, |slot| band_geometry_top(&lines[slot]));
+    read_rows(lines, rows, &mut header, |slot| band_geometry_top(&lines[slot]));
+    read_rows(lines, rows, &mut footer, |slot| band_geometry_top(&lines[slot]));
     let mut ordered = header;
     ordered.extend(weave_note_columns(lines, body, note, items, page.width, number));
     ordered.extend(footer);

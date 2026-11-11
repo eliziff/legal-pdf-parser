@@ -7,7 +7,7 @@
 //! document's bookmarks, the page labels it declares and whether it is an instrument.
 
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
-use legal_pdf_core::{flag_share, layout_analysis, line_font_size, median};
+use legal_pdf_core::{flag_share, layout_analysis, median};
 use crate::furniture::compact_note_line;
 use crate::headings::native::{bold_char_share, date_line};
 use crate::headings::{self, captions, contents_lists};
@@ -22,6 +22,30 @@ use crate::model::{Slot, Slots};
 use legal_pdf_core::{dominant_face, regex, CitationSpan, ITALIC};
 use crate::tables::PageItems;
 
+/// Lines in one baseline band are one row, the one row model every reader of rows reads (`Rows`, `Evidence::row`): the
+/// bands of `lines` (each line's box by `bbox`) in their
+/// order, each read left to right.
+fn row_bands<T: Copy>(lines: &[T], bbox: impl Fn(T) -> [f64; 4]) -> Vec<Vec<T>> {
+    let mut bands: Vec<Vec<T>> = Vec::new();
+    for &line in lines {
+        let [_, top, _, bottom] = bbox(line);
+        let middle = (top + bottom) / 2.0;
+        match bands.last_mut().filter(|band| {
+            let first = bbox(band[0]);
+            let height = (first[3] - first[1]).max(1.0);
+            ((first[1] + first[3]) / 2.0 - middle).abs() <= height / 2.0
+        }) {
+            Some(band) => band.push(line),
+            None => bands.push(vec![line]),
+        }
+    }
+    for band in &mut bands {
+        band.sort_by(|&a, &b| bbox(a)[0].total_cmp(&bbox(b)[0]));
+    }
+    bands
+}
+
+
 pub(crate) fn page_rows(page: &Page) -> Rows {
     let lines = &page.lines;
     let mut order: Vec<usize> = (0..lines.len())
@@ -33,7 +57,7 @@ pub(crate) fn page_rows(page: &Page) -> Rows {
         })
         .collect();
     order.sort_by(|&a, &b| lines[a].bbox[1].total_cmp(&lines[b].bbox[1]).then(lines[a].bbox[0].total_cmp(&lines[b].bbox[0])));
-    let bands = contents_lists::row_bands(&order, |slot| lines[slot].bbox);
+    let bands = row_bands(&order, |slot| lines[slot].bbox);
     let mut of = vec![u32::MAX; lines.len()];
     let mut tops = Vec::with_capacity(bands.len());
     for (row, band) in bands.iter().enumerate() {
@@ -76,6 +100,8 @@ pub(crate) struct Normalized {
 /// words (`clear_table_underlines`), and every line's slot.
 pub(crate) fn normalize(pages: &mut [Page]) -> (Slots, Normalized) {
     let numbers = crate::text::line_numbers::split_line_numbers(pages);
+    // Each line's type size, read once its line numbers are parted from it, for every reader after.
+    legal_pdf_core::read_sizes(pages);
     let mut items: Vec<PageItems> = pages.iter().map(crate::tables::page_items).collect();
     for (page, items) in pages.iter_mut().zip(&mut items) {
         crate::tables::clear_table_underlines(page, items);
@@ -343,9 +369,8 @@ fn opening_marker(line: &Line, families: &mut Names) -> Option<Marker> {
     })
 }
 
-/// The page's line at `slot` opening with a note label (`NoteLabel`), the page's lines' type sizes
-/// `sizes`.
-pub(crate) fn note_label(page: &Page, sizes: &[f64], slot: usize) -> Option<NoteLabel> {
+/// The page's line at `slot` opening with a note label (`NoteLabel`).
+pub(crate) fn note_label(page: &Page, slot: usize) -> Option<NoteLabel> {
     let line = &page.lines[slot];
     // A label glued to its note's first word ("27Ibid", "1\u{201c}significant") is one where its figures
     // are set as a label's: raised, or smaller than the line's type.
@@ -369,7 +394,7 @@ pub(crate) fn note_label(page: &Page, sizes: &[f64], slot: usize) -> Option<Note
             }
         }
     };
-    let size = sizes[slot];
+    let size = line.size;
     let raised = label_is_raised(line, &prefix, size);
     let label_size = label_spans(line, &prefix)
         .filter_map(|span| (span.size > 0.0).then_some(span.size))
@@ -382,7 +407,7 @@ pub(crate) fn note_label(page: &Page, sizes: &[f64], slot: usize) -> Option<Note
         (SUPPRESS_FOOT, line.bbox[1] >= page.height * 0.94),
         (SUPPRESS_CORNER, line.bbox[1] >= page.height * 0.91 && line.bbox[0] >= page.width * 0.50 && !compact_note_line(&line.text)),
         (SUPPRESS_COMMA, line.text.chars().nth(prefix.end) == Some(',') && !raised),
-        (SUPPRESS_WRAPPED, !raised && reference_wrapped_onto(&page.lines, sizes, slot)),
+        (SUPPRESS_WRAPPED, !raised && reference_wrapped_onto(&page.lines, slot)),
     ]);
     Some(NoteLabel {
         value: normalize_label(&prefix.label).parse().unwrap_or(0),
@@ -422,11 +447,9 @@ pub(crate) fn measure(pages: &[Page],
     for (page_slot, page) in pages.iter().enumerate() {
         let first = slots.on(page_slot).start as usize;
         let rows = page_rows(page);
-        let sizes: Vec<f64> = page.lines.iter().map(line_font_size).collect();
         for (at, line) in page.lines.iter().enumerate() {
             let text = line.text.trim();
             let face = dominant_face(line);
-            evidence.size.push(sizes[at]);
             evidence.face.push(face.map_or(u16::MAX, |(face, _)| faces.id(face)));
             evidence.half_points.push(face.map_or(0, |(_, size)| (size * 2.0).round().clamp(0.0, f64::from(u16::MAX)) as u16));
             let underlined = !line.words.is_empty() && line.words.iter().filter(|word| word.underlined).count() * 2 > line.words.len();
@@ -438,8 +461,8 @@ pub(crate) fn measure(pages: &[Page],
             ]));
             evidence.tag.push(SourceTag::of(line));
             evidence.marker.push(opening_marker(line, &mut families));
-            evidence.label.push(note_label(page, &sizes, at));
-            evidence.references.push(reference_tokens(line, sizes[at]));
+            evidence.label.push(note_label(page, at));
+            evidence.references.push(reference_tokens(line, line.size));
             evidence.title_shaped.push(title_shaped(text));
             evidence.words.push(lexicon(line));
             if !line_numbers[first + at] {
@@ -468,7 +491,6 @@ pub(crate) fn measure(pages: &[Page],
                     other != at
                         && !line_numbers[first + other]
                         && !line.text.trim().is_empty()
-                        && crate::text::paragraphs::same_row(marker, line)
                         && line.bbox[0] >= marker.bbox[2] - if line.recognized() { line.bbox[3] - line.bbox[1] } else { 1.0 }
                 })
                 .min_by(|&a, &b| page.lines[a].bbox[0].total_cmp(&page.lines[b].bbox[0]))
@@ -637,7 +659,7 @@ pub(crate) fn reread(evidence: &mut Evidence, pages: &[Page], slots: &Slots, rep
         let line = slots.line(pages, *slot);
         let text = line.text.trim();
         evidence.marker[at] = opening_marker(line, &mut families);
-        evidence.label[at] = note_label(page, &evidence.size[range.start as usize..range.end as usize], (slot.0 - range.start) as usize);
+        evidence.label[at] = note_label(page, (slot.0 - range.start) as usize);
         evidence.title_shaped[at] = title_shaped(text);
         evidence.words[at] = lexicon(line) | evidence.words[at] & WORD_CITATION_TITLE;
         // The words after the rewritten marker keep their citations, moved by what the marker

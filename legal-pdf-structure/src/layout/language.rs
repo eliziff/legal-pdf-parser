@@ -97,7 +97,7 @@ pub(crate) fn translation_lines(views: &[PageView], models: &[ColumnModel], set_
                 .filter(|pair| {
                     let (above, below) = (pair[0].1, pair[1].1);
                     // (A line a PDF gives no height, its box a baseline alone, stands as high as its type.)
-                    let height = Some(above.bbox[3] - above.bbox[1]).filter(|height| *height >= 1.0).unwrap_or_else(|| line_font_size(above));
+                    let height = Some(above.bbox[3] - above.bbox[1]).filter(|height| *height >= 1.0).unwrap_or_else(|| above.size);
                     let bottom = above.bbox[1] + height;
                     bottom <= top && below.bbox[1] - bottom >= height * 2.0
                 })

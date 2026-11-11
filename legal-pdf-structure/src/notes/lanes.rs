@@ -15,7 +15,6 @@
 
 use legal_pdf_core::model::sentence_ended;
 use legal_pdf_core::{
-    line_font_size,
     model::{Line, Page},
     regex,
 };
@@ -208,7 +207,7 @@ impl<'a> DocumentLines<'a> {
 }
 
 fn note_text_size(line: &Line) -> f64 {
-    if line.spans.is_empty() { line.bbox[3] - line.bbox[1] } else { line_font_size(line) }
+    if line.spans.is_empty() { line.bbox[3] - line.bbox[1] } else { line.size }
 }
 
 /// The document's note type, smaller than its body's. Learn font sizes and recognized glyph

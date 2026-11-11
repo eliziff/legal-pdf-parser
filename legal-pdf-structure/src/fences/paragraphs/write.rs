@@ -49,7 +49,8 @@ impl Reading<'_> {
         let mut printed = HashMap::<Slot, (usize, usize)>::new();
         let mut flows = HashSet::<Slot>::new();
         for (k, run) in runs.iter().enumerate() {
-            let found = crate::text::paragraphs::paragraphs_of(&read[k], &vec![true; run.len()], measure);
+            let rows: Vec<u32> = run.iter().map(|&slot| evidence.row(slots, slot)).collect();
+            let found = crate::text::paragraphs::paragraphs_of(&read[k], &rows, &vec![true; run.len()], measure);
             printed.extend(run.iter().zip(&found).filter_map(|(&slot, paragraph)| Some((slot, (k, (*paragraph)?)))));
             if k > 0 && crate::text::paragraphs::continues_onto(&read[k - 1], &read[k]) {
                 flows.insert(run[0]);

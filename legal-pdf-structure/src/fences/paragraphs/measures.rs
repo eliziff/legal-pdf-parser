@@ -19,13 +19,13 @@ pub(crate) struct PageMeasures<'a> {
 }
 
 impl<'a> PageMeasures<'a> {
-    pub(crate) fn of(fences: &Fences, pages: &'a [Page], slots: &Slots, evidence: &Evidence) -> Self {
+    pub(crate) fn of(fences: &Fences, pages: &'a [Page], slots: &Slots) -> Self {
         // (Where a page's note band opens: small type above it is a quotation, whatever it numbers.)
         let (mut body_end, mut band_top) = (vec![[f64::MIN; 2]; pages.len()], vec![[f64::MAX; 2]; pages.len()]);
         let mut cells_end = vec![[None::<f64>; 2]; pages.len()];
         for &slot in &fences.order {
             let (page, language) = (slots.page(slot), usize::from(fences.at(slot.index()).translation));
-            if !fences.below_body(evidence, slot.index(), 0.95) && slots.line(pages, slot).text.split_whitespace().count() > 3 {
+            if !fences.below_body(slots.line(pages, slot).size, slot.index(), 0.95) && slots.line(pages, slot).text.split_whitespace().count() > 3 {
                 let end = slots.line(pages, slot).bbox[3];
                 match fences.role[slot.index()] {
                     Role::Open => body_end[page][language] = body_end[page][language].max(end),
@@ -76,7 +76,7 @@ impl<'a> PageMeasures<'a> {
             under[slots.page(slot)] = under[slots.page(slot)].min(slots.line(pages, slot).bbox[1]);
         }
         let mut heads = HashMap::<&str, HashSet<usize>>::new();
-        for &slot in fences.order.iter().filter(|&&slot| top_row(slot) && fences.below_body(evidence, slot.index(), 0.95)) {
+        for &slot in fences.order.iter().filter(|&&slot| top_row(slot) && fences.below_body(slots.line(pages, slot).size, slot.index(), 0.95)) {
             let (line, page) = (slots.line(pages, slot), slots.page(slot));
             if under[page] - line.bbox[3] > line.bbox[3] - line.bbox[1] {
                 heads.entry(line.text.trim()).or_default().insert(page);
@@ -155,7 +155,7 @@ pub(crate) struct Counts {
 }
 
 impl Counts {
-    pub(crate) fn of(fences: &Fences, pages: &[Page], slots: &Slots, evidence: &Evidence, stream_of: &[Stream], numbers: &Numbers) -> Self {
+    pub(crate) fn of(fences: &Fences, pages: &[Page], slots: &Slots, stream_of: &[Stream], numbers: &Numbers) -> Self {
         let (mut count_of, mut printed_numbers, mut counts) = (vec![[0u16; 2]; slots.len()], [0usize; 2], [0u16; 2]);
         // Notes listed after the reasons in the body's own type open no decision: the reasons' lines call their numbers in
         // turn ("... of violence.[1]"), and the list is no one's paragraphs.
@@ -175,7 +175,7 @@ impl Counts {
             if let Some(&place) = numbers.place_in.get(&slot) {
                 let sequence = &numbers.sequence[language];
                 let goes_on = (1..5).all(|step| sequence.get(place + step).is_some_and(|(_, number)| *number == Some(step + 1)));
-                if sequence[place].1 == Some(1) && goes_on && !fences.below_body(evidence, at, 0.95) && !numbers.further.contains(&slot) && printed_numbers[language] >= 5 {
+                if sequence[place].1 == Some(1) && goes_on && !fences.below_body(slots.line(pages, slot).size, at, 0.95) && !numbers.further.contains(&slot) && printed_numbers[language] >= 5 {
                     counts[language] += 1;
                     printed_numbers[language] = 0;
                     if called(reading_place, stream_of[at]) {

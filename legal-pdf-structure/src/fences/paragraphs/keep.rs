@@ -15,7 +15,7 @@ impl Reading<'_> {
             let at = slot.index();
                 // The notes a fence took keep the count, and may go on onto the next page: a note left among the words goes on from them.
                 if fences.role[at] == Role::Note && self.stream_of[at] == stream {
-                    notes.fenced(evidence.label[at].map(|label| (label.value, label.raised)), &slots.line(pages, slot).text, evidence.size[at], slots.page(slot));
+                    notes.fenced(evidence.label[at].map(|label| (label.value, label.raised)), &slots.line(pages, slot).text, slots.line(pages, slot).size, slots.page(slot));
                 }
                 if self.counts.count_of[at][stream.index()] != document || self.stream_of[at] != stream || fences.set_apart(at) || self.attached.contains(&slot) {
                     continue;
@@ -89,12 +89,12 @@ impl Reading<'_> {
     /// (A letterhead, far larger than the body, is no one's: "Federal Court" / "of Appeal" at twice its type. One letter so large
     /// is a first paragraph's drop capital, at the text's left; further in it is a mark on the page, a rule in the margin read "I".)
     fn text_words(&self, slot: Slot, kept: &[Slot]) -> bool {
-        let (fences, pages, slots, evidence) = (self.fences, self.pages, self.slots, self.evidence);
+        let (fences, pages, slots) = (self.fences, self.pages, self.slots);
         let (at, line, bbox) = (slot.index(), &slots.line(pages, slot).text, slots.line(pages, slot).bbox);
-        let text = evidence.size[at] * 2.0 >= fences.label_size() || evidence.size[at] == 0.0 || legal_structure_model::structure_analysis().editorial_line(line)
+        let text = slots.line(pages, Slot(at as u32)).size * 2.0 >= fences.label_size() || slots.line(pages, Slot(at as u32)).size == 0.0 || legal_structure_model::structure_analysis().editorial_line(line)
     || slots.line(pages, slot).recognized() && (!self.edge_line(slot) || kept.last().is_some_and(|last| !sentence_ended(&slots.line(pages, *last).text)));
         let further_in = bbox[0] - self.measures.column(slots.page(slot), fences.at(at).translation) > QUOTED_INDENT;
-        let wordmark = fences.body.is_some_and(|(_, size)| evidence.size[at] * 2.0 >= f64::from(size) * 1.6) && (line.trim().chars().count() > 1 || further_in) && line.split_whitespace().count() <= 6;
+        let wordmark = fences.body.is_some_and(|(_, size)| slots.line(pages, Slot(at as u32)).size * 2.0 >= f64::from(size) * 1.6) && (line.trim().chars().count() > 1 || further_in) && line.split_whitespace().count() <= 6;
         // (A layer may print one line twice, the second a suffix of the first in its box.)
         let repeated = kept.last().is_some_and(|last| {
             let above = slots.line(pages, *last);

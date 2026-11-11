@@ -200,10 +200,10 @@ impl Fences {
         if repaired {
             self.read_margin_numbers(pages, slots);
         }
-        self.read_continuations(pages, slots, evidence);
+        self.read_continuations(pages, slots);
         self.read_paragraphs(pages, slots, evidence);
         if self.read_quotations(pages, slots) {
-            self.read_continuations(pages, slots, evidence);
+            self.read_continuations(pages, slots);
         }
     }
 }

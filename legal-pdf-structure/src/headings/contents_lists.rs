@@ -12,7 +12,7 @@
 //! 0.91 F1, the gold's contents found 97% of the time.
 
 use crate::headings::bookmarks::normalize_title;
-use crate::model::{PageView, Role, Slot, SourceTag};
+use crate::model::{Evidence, PageView, Role, Slot, Slots, SourceTag};
 use legal_pdf_core::Line;
 use legal_pdf_core::regex;
 use std::collections::{HashMap, HashSet};
@@ -120,34 +120,22 @@ fn own_title<'a>(row: &'a Row) -> &'a str {
     row.lines.iter().map(|line| line.text.trim()).find(|text| text.chars().any(char::is_alphabetic)).unwrap_or("")
 }
 
-/// Lines in one baseline band are one row: the bands of `lines` (each line's box by `bbox`) in their
-/// order, each read left to right.
-pub(crate) fn row_bands<T: Copy>(lines: &[T], bbox: impl Fn(T) -> [f64; 4]) -> Vec<Vec<T>> {
-    let mut bands: Vec<Vec<T>> = Vec::new();
-    for &line in lines {
-        let [_, top, _, bottom] = bbox(line);
-        let middle = (top + bottom) / 2.0;
-        match bands.last_mut().filter(|band| {
-            let first = bbox(band[0]);
-            let height = (first[3] - first[1]).max(1.0);
-            ((first[1] + first[3]) / 2.0 - middle).abs() <= height / 2.0
-        }) {
-            Some(band) => band.push(line),
-            None => bands.push(vec![line]),
+/// A page's rows top to bottom: its lines grouped by their row on the page (`Evidence::row`; a line no row holds is a
+/// row of its own), each read left to right; a locator alone on its row closing the title on the row above it.
+fn rows<'a>(view: &PageView<'a>, input: &ListInput) -> Vec<Row<'a>> {
+    let mut lines: Vec<(Slot, &Line)> = view.iter().filter(|(slot, line)| !line.text.trim().is_empty() && !input.line_label(*slot)).collect();
+    lines.sort_by(|(_, a), (_, b)| a.bbox[1].total_cmp(&b.bbox[1]).then(a.bbox[0].total_cmp(&b.bbox[0])));
+    let mut bands: Vec<(u32, Vec<&Line>)> = Vec::new();
+    for (slot, line) in lines {
+        let row = input.evidence.row(input.slots, slot);
+        match bands.iter_mut().find(|(seen, _)| row != u32::MAX && *seen == row) {
+            Some((_, band)) => band.push(line),
+            None => bands.push((row, vec![line])),
         }
     }
-    for band in &mut bands {
-        band.sort_by(|&a, &b| bbox(a)[0].total_cmp(&bbox(b)[0]));
-    }
-    bands
-}
-
-/// A page's rows top to bottom, a locator alone on its row closing the title on the row above it.
-fn rows<'a>(view: &PageView<'a>, input: &ListInput) -> Vec<Row<'a>> {
-    let mut lines: Vec<&Line> = view.iter().filter(|(slot, line)| !line.text.trim().is_empty() && !input.line_label(*slot)).map(|(_, line)| line).collect();
-    lines.sort_by(|a, b| a.bbox[1].total_cmp(&b.bbox[1]).then(a.bbox[0].total_cmp(&b.bbox[0])));
     let mut rows: Vec<Row> = Vec::new();
-    for band in row_bands(&lines, |line: &Line| line.bbox) {
+    for (_, mut band) in bands {
+        band.sort_by(|a, b| a.bbox[0].total_cmp(&b.bbox[0]));
         let row = row_of(band);
         if let (Some(found), Some(prior)) = (row.locator.clone().filter(|_| row.title.is_empty()), rows.last_mut()) {
             let stacked = paragraph_range(&row.text);
@@ -307,7 +295,8 @@ pub(crate) struct Lists {
 /// each view's page number (the label the PDF declares for it, else its folio's).
 pub(crate) struct ListInput<'a> {
     pub(crate) role: &'a [Role],
-    pub(crate) tag: &'a [SourceTag],
+    pub(crate) slots: &'a Slots,
+    pub(crate) evidence: &'a Evidence,
     pub(crate) in_table: &'a [bool],
     pub(crate) numbers: &'a [Option<u32>],
 }
@@ -322,7 +311,7 @@ impl ListInput<'_> {
     }
 
     fn heading(&self, slot: Slot) -> bool {
-        matches!(self.tag[slot.index()], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle)
+        matches!(self.evidence.tag[slot.index()], SourceTag::Heading(_) | SourceTag::Title | SourceTag::ParagraphTitle)
     }
 
     /// A transcript's line number or the page's furniture: no entry of a list.

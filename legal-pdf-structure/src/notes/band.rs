@@ -103,7 +103,7 @@ impl Document<'_> {
 }
 
 /// A page with its lines' measures, each by its line's place on the page: the document's lines on it
-/// (`members`, in page order, and `member` by place), their sizes and labels, and the document it is read in.
+/// (`members`, in page order, and `member` by place), their labels, and the document it is read in.
 struct Sheet<'a> {
     page: &'a Page,
     /// The page's slot among the document's pages.
@@ -113,7 +113,6 @@ struct Sheet<'a> {
     view: &'a PageView<'a>,
     members: Vec<usize>,
     member: Vec<bool>,
-    sizes: &'a [f64],
     labels: &'a [Option<NoteLabel>],
     document: Document<'a>,
 }
@@ -134,7 +133,6 @@ impl<'a> Sheet<'a> {
             view,
             members,
             member,
-            sizes: &document.evidence.size[first..first + count],
             labels: &document.evidence.label[first..first + count],
             document,
         }
@@ -155,6 +153,8 @@ impl<'a> Sheet<'a> {
     fn columns(&self) -> ColumnModel { self.document.fences.columns[self.at] }
     /// The page's words' text items.
     fn items(&self) -> &'a crate::tables::PageItems { &self.document.evidence.items[self.at] }
+    /// Each of the page's lines' row (`Rows`).
+    fn rows(&self) -> &'a [u32] { &self.document.evidence.pages[self.at].rows.of }
     /// Whether the page is a contents page.
     fn contents(&self) -> bool { self.document.fences.contents_pages[self.at] }
 
@@ -165,7 +165,7 @@ impl<'a> Sheet<'a> {
 
     /// The type sizes of the page's lines `keep` holds (by place and line), those set from 4 to 24 points.
     fn sizes_where(&self, keep: impl Fn(usize, &Line) -> bool) -> Vec<f64> {
-        self.lines().filter(|&(place, line)| keep(place, line)).map(|(place, _)| self.sizes[place]).filter(|size| (4.0..=24.0).contains(size)).collect()
+        self.lines().filter(|&(place, line)| keep(place, line)).map(|(place, _)| self.page.lines[place].size).filter(|size| (4.0..=24.0).contains(size)).collect()
     }
 }
 
@@ -197,7 +197,7 @@ impl EndnoteRun {
         if let Some(last) = endnotes.iter().rev().filter_map(|&place| label_prefix(&sheet.line(place).text)?.label.parse::<u32>().ok()).next() {
             self.expected = Some(last + 1);
         }
-        let size = median(endnotes.iter().map(|&place| sheet.sizes[place]).filter(|size| *size > 0.0).collect());
+        let size = median(endnotes.iter().map(|&place| sheet.page.lines[place].size).filter(|size| *size > 0.0).collect());
         if size > 0.0 {
             self.size = Some(size);
         }
@@ -220,7 +220,7 @@ struct PageReading {
 fn page_reading(sheet: &Sheet, separator: Option<f64>, document_body: f64) -> PageReading {
     let page = sheet.page;
     let table_cells: Vec<bool> = (0..page.lines.len()).map(|place| sheet.member[place] && sheet.cell(place)).collect();
-    let body_size = if document_body > 0.0 && sheet.members.iter().any(|&place| sheet.sizes[place] > 0.0) {
+    let body_size = if document_body > 0.0 && sheet.members.iter().any(|&place| sheet.page.lines[place].size > 0.0) {
         document_body
     } else {
         median(sheet.sizes_where(|place, line| {
@@ -299,11 +299,11 @@ fn label_candidates(sheet: &Sheet, reading: &PageReading, paragraph: &[bool]) ->
         let (Some(label), Some(prefix)) = (sheet.labels[place], label_prefix(&line.text)) else { continue };
         let typographic = label.typographic(body_size)
             || (standalone_note_label(line)
-                && aligned_note_body_among(&page.lines, sheet.members.iter().copied(), place).is_some_and(|body| {
-                    let size = sheet.sizes[body];
+                && aligned_note_body_among(&page.lines, sheet.rows(), sheet.members.iter().copied(), place).is_some_and(|body| {
+                    let size = sheet.page.lines[body].size;
                     size > 0.0 && size <= body_size * 0.90
                 }));
-        let size = if sheet.sizes[place] > 0.0 { sheet.sizes[place] } else { body_size };
+        let size = if sheet.page.lines[place].size > 0.0 { sheet.page.lines[place].size } else { body_size };
         let bottom_right = reading.separator.is_none() && label.suppress & SUPPRESS_CORNER != 0;
         // A number followed by a comma is the line's text ("1991, c. 43, s. 4" in a statute's
         // small-type history note), unless it is raised above its line.
@@ -350,7 +350,7 @@ fn columns_among(sheet: &Sheet, keep: &[bool]) -> ColumnModel {
 
 fn page_facts(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate]) -> PageFacts {
     let page = sheet.page;
-    let (sizes, body_size) = (sheet.sizes, reading.body_size);
+    let body_size = reading.body_size;
     let numeric: Vec<u32> = candidates.iter().filter_map(|(_, prefix, _)| prefix.label.parse().ok()).collect();
     let columns = {
         let page_model = if sheet.members.len() == page.lines.len() { sheet.columns() } else { columns_among(sheet, &sheet.member) };
@@ -397,15 +397,15 @@ fn page_facts(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate]) ->
             let line = sheet.line(place);
             (sheet.headed(place) || line.bbox[1] >= page.height * 0.08) && structural_reset_heading(&line.text)
         });
-    let label_sizes: Vec<f64> = candidates.iter().map(|(place, _, _)| sizes[*place]).filter(|size| *size > 0.0).collect();
+    let label_sizes: Vec<f64> = candidates.iter().map(|(place, _, _)| sheet.page.lines[*place].size).filter(|size| *size > 0.0).collect();
     let label_size = (!label_sizes.is_empty()).then(|| median(label_sizes));
     let early_labels = candidates.iter().any(|(place, _, typographic)| {
-        sheet.line(*place).bbox[1] < page.height * 0.48 && (*typographic || sizes[*place] <= body_size * 0.90)
+        sheet.line(*place).bbox[1] < page.height * 0.48 && (*typographic || sheet.page.lines[*place].size <= body_size * 0.90)
     });
     let lower_numeric: Vec<u32> = candidates
         .iter()
         .filter(|(place, _, _)| {
-            sheet.line(*place).bbox[1] >= page.height * 0.48 && sizes[*place] > 0.0 && sizes[*place] <= body_size * 0.90
+            sheet.line(*place).bbox[1] >= page.height * 0.48 && sheet.page.lines[*place].size > 0.0 && sheet.page.lines[*place].size <= body_size * 0.90
         })
         .filter_map(|(_, prefix, _)| prefix.label.parse().ok())
         .collect();
@@ -469,7 +469,7 @@ fn continue_endnotes(sheet: &Sheet, candidates: &[Candidate], facts: &PageFacts,
             }
         }
     }
-    let content_sizes: Vec<f64> = sheet.lines().filter(|&(place, _)| !sheet.furniture(place) && !sheet.excluded(place)).map(|(place, _)| sheet.sizes[place]).filter(|size| *size > 0.0).collect();
+    let content_sizes: Vec<f64> = sheet.lines().filter(|&(place, _)| !sheet.furniture(place) && !sheet.excluded(place)).map(|(place, _)| sheet.page.lines[place].size).filter(|size| *size > 0.0).collect();
     let content_size = (!content_sizes.is_empty()).then(|| median(content_sizes));
     let size_matches = run.size.is_none_or(|size| content_size.is_none_or(|content| content <= size * 1.15));
     let label_free = run.expected.is_some() && candidates.is_empty() && !facts.structural_reset && size_matches;
@@ -488,7 +488,7 @@ fn margin_notes(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate]) 
     let note_size = reading.note_size;
     let margin_candidates: Vec<_> = candidates
         .iter()
-        .filter_map(|(place, _, _)| (sheet.sizes[*place] <= note_size * 0.90 && line_width(sheet.line(*place)) <= page.width * 0.30).then_some(*place))
+        .filter_map(|(place, _, _)| (sheet.page.lines[*place].size <= note_size * 0.90 && line_width(sheet.line(*place)) <= page.width * 0.30).then_some(*place))
         .collect();
     let margin_numeric: Vec<u32> = candidates
         .iter()
@@ -504,7 +504,7 @@ fn margin_notes(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate]) 
         .collect();
     let margin_labels = if longest_label_run(&margin_numeric) >= 3 { &margin_candidates } else { &supported };
     let set_aside = |place| sheet.furniture(place) || sheet.excluded(place);
-    let model = margin_note_model(&page.lines, &sheet.members, set_aside, margin_labels, page.width, note_size, if margin_labels.len() >= 3 { 3 } else { 2 })?;
+    let model = margin_note_model(&page.lines, sheet.rows(), &sheet.members, set_aside, margin_labels, page.width, note_size, if margin_labels.len() >= 3 { 3 } else { 2 })?;
     let side = usize::from(margin_labels.iter().filter(|place| line_center_x(sheet.line(**place)) >= model.split_x).count() * 2 >= margin_labels.len());
     Some((model, side))
 }
@@ -516,12 +516,12 @@ fn margin_notes(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate]) 
 /// reference stands above it, anywhere on the page.
 fn labels(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate], facts: &PageFacts, endnote_page: bool, margin: Option<(ColumnModel, usize)>, mut next_label: u32) -> Vec<usize> {
     let page = sheet.page;
-    let (sizes, body_size, separator) = (sheet.sizes, reading.body_size, reading.separator);
+    let (body_size, separator) = (reading.body_size, reading.separator);
     candidates
         .iter()
         .filter_map(|(place, prefix, typographic)| {
             let line = sheet.line(*place);
-            let size = sizes[*place];
+            let size = sheet.page.lines[*place].size;
             let lower = line.bbox[1] >= page.height * 0.48;
             let small = size > 0.0 && size <= body_size * 0.90;
             let referenced = || has_prior_reference(sheet.lines().map(|(_, line)| line), &prefix.label, line.bbox[1]);
@@ -583,7 +583,7 @@ fn running_heads(sheet: &Sheet, labels: &[usize]) -> Vec<usize> {
 #[allow(clippy::too_many_arguments)]
 fn note_cut(sheet: &Sheet, reading: &PageReading, labels: &[usize], contents_page: bool, endnote_page: bool, continuation: &Continuation, run: &EndnoteRun, furniture: &dyn Fn(usize) -> bool, diagnostics: &mut Vec<Diagnostic>) -> Option<f64> {
     let page = sheet.page;
-    let (sizes, body_size, separator, tolerance) = (sheet.sizes, reading.body_size, reading.separator, reading.tolerance);
+    let (body_size, separator, tolerance) = (reading.body_size, reading.separator, reading.tolerance);
     let eligible_top = || {
         sheet
             .lines()
@@ -597,7 +597,7 @@ fn note_cut(sheet: &Sheet, reading: &PageReading, labels: &[usize], contents_pag
     if labels.is_empty() {
         return None;
     }
-    let selected_sizes: Vec<f64> = labels.iter().map(|place| sizes[*place]).filter(|size| *size > 0.0).collect();
+    let selected_sizes: Vec<f64> = labels.iter().map(|place| sheet.page.lines[*place].size).filter(|size| *size > 0.0).collect();
     let selected_size = (!selected_sizes.is_empty()).then(|| median(selected_sizes));
     let separator_starts_small_text = separator.is_some_and(|cut| {
         !contents_page
@@ -607,7 +607,7 @@ fn note_cut(sheet: &Sheet, reading: &PageReading, labels: &[usize], contents_pag
                     !reading.table_cells[place] && !sheet.excluded(place) && !furniture(place) && line.bbox[1] >= cut - tolerance
                 })
                 .min_by(|(_, left), (_, right)| left.bbox[1].total_cmp(&right.bbox[1]))
-                .is_some_and(|(place, line)| line.bbox[1] - cut <= page.height * 0.06 && sizes[place] > 0.0 && sizes[place] <= body_size * 0.90)
+                .is_some_and(|(place, line)| line.bbox[1] - cut <= page.height * 0.06 && sheet.page.lines[place].size > 0.0 && sheet.page.lines[place].size <= body_size * 0.90)
     });
     let first_label = labels.iter().map(|place| sheet.line(*place).bbox[1]).min_by(f64::total_cmp).unwrap_or(page.height);
     if endnote_page && run.expected.is_some() {
@@ -638,7 +638,7 @@ fn column_cuts(sheet: &Sheet, labels: &[usize], columns: ColumnModel, has_margin
     for &place in labels {
         let label = sheet.line(place);
         let column = usize::from(line_center_x(label) >= columns.split_x);
-        let label_top = aligned_note_body_among(lines, sheet.members.iter().copied(), place)
+        let label_top = aligned_note_body_among(lines, sheet.rows(), sheet.members.iter().copied(), place)
             .map(|body| band_geometry_top(&lines[body]))
             .unwrap_or_else(|| band_geometry_top(label))
             .min(band_geometry_top(label));
