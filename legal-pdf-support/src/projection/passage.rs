@@ -43,16 +43,17 @@ pub struct QuoteSelection {
     pub end: usize,
 }
 
-/// Every passage asked for, placed: the rectangles are the visible crop box's, from its top left, rotation applied.
+/// Every passage asked for, placed: the rectangles are fractions of the page as it is displayed (its visible crop box,
+/// rotation applied), from its top left, what marks and links are placed by.
 #[derive(Serialize)]
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PassageGeometry {
-    #[cfg_attr(feature = "binding-types", ts(type = "\"legalpdf.passage-geometry.v1\""))]
+    #[cfg_attr(feature = "binding-types", ts(type = "\"legalpdf.passage-geometry.v2\""))]
     pub schema_version: &'static str,
     pub source_sha256: String,
     pub parser_version: String,
-    #[cfg_attr(feature = "binding-types", ts(type = "\"visible_crop_box\""))]
+    #[cfg_attr(feature = "binding-types", ts(type = "\"visible_page_fraction\""))]
     pub coordinate_space: &'static str,
     #[cfg_attr(feature = "binding-types", ts(type = "\"top_left\""))]
     pub coordinate_origin: &'static str,
@@ -153,10 +154,10 @@ impl PdfDocument {
             .filter(|index| pages.get(*index).is_none_or(|page| page.lines.is_empty()))
             .collect::<HashSet<_>>();
         PassageGeometry {
-            schema_version: "legalpdf.passage-geometry.v1",
+            schema_version: "legalpdf.passage-geometry.v2",
             source_sha256: self.summary.sha256.clone(),
             parser_version: self.summary.parser_version.clone(),
-            coordinate_space: "visible_crop_box",
+            coordinate_space: "visible_page_fraction",
             coordinate_origin: "top_left",
             rotation_applied: true,
             targets: targets.into_iter().map(|target| self.place(query, target, &pages, &unavailable)).collect(),
@@ -249,7 +250,7 @@ impl PdfDocument {
                 width: page.page.width,
                 height: page.page.height,
                 source: if page.available { "native" } else { "unavailable" },
-                passage_rects: if whole_page { Vec::new() } else { page.lines.iter().map(|line| line.rect).collect() },
+                passage_rects: if whole_page { Vec::new() } else { page.lines.iter().map(|line| fraction(line.rect, page.page)).collect() },
                 text,
                 lines: page.lines,
             }
@@ -304,6 +305,11 @@ fn read_lines(page: &Page, whole_page: bool, selected: &HashMap<&str, Vec<Scalar
     lines
 }
 
+/// A rectangle as a fraction of its page as it is displayed, clamped to it.
+fn fraction(rect: Rect, page: &Page) -> Rect {
+    [rect[0] / page.width, rect[1] / page.height, rect[2] / page.width, rect[3] / page.height].map(|value| value.clamp(0.0, 1.0))
+}
+
 fn union(a: Rect, b: Rect) -> Rect {
     [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
 }
@@ -356,8 +362,9 @@ fn place_quote(pages: &[ReadPage], status: PdfLookupStatus, quote: &QuoteSelecti
             None => lines.push((line, *rect)),
         }
     }
+    let page = |number: u32| pages.iter().find(|page| page.page.number == number).expect("a quotation's page").page;
     let fragments = fragments.into_iter()
-        .map(|(page_number, lines)| QuoteFragment { page_number, rects: lines.into_iter().map(|(_, rect)| rect).collect() })
+        .map(|(page_number, lines)| QuoteFragment { page_number, rects: lines.into_iter().map(|(_, rect)| fraction(rect, page(page_number))).collect() })
         .collect::<Vec<_>>();
     PlacedQuote { text: text.to_owned(), status: PdfLookupStatus::Found, page_number: Some(fragments[0].page_number),
         rects: fragments[0].rects.clone(), fragments: Some(fragments) }
