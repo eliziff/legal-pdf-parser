@@ -14,7 +14,7 @@ pub(crate) mod note_lines;
 pub(crate) use note_lines::*;
 
 /// What a page's columns are: one, two of like width, a body beside a narrower margin's, or more than two.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ColumnKind {
     Single,
     Two,
@@ -23,7 +23,7 @@ pub(crate) enum ColumnKind {
 }
 
 /// A page's columns: their kind, where they split, and the lines on either side.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ColumnModel {
     pub(crate) kind: ColumnKind,
     pub(crate) split_x: f64,
@@ -48,11 +48,6 @@ pub(crate) fn line_center_x(line: &Line) -> f64 {
 
 pub(crate) fn line_center_y(line: &Line) -> f64 {
     (line.bbox[1] + line.bbox[3]) / 2.0
-}
-
-/// Whether a page layout model labelled the line: its region is one of the model's.
-pub(crate) fn layout_labelled(line: &Line) -> bool {
-    line.region_id.contains("-ppdoc-r")
 }
 
 /// Each page's measures and columns, read once, when a stage first asks for them, and kept for every stage that reads

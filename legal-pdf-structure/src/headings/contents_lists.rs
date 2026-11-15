@@ -270,7 +270,7 @@ fn echoed(titles: &[&str], list_slot: usize, recurrences: &HashMap<String, Vec<(
 
 /// One entry of a contents list as the heading outline reads it: its title (the rows it wraps over
 /// joined), the locator it prints, where it starts, and the page it is on.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Entry {
     pub(crate) title: String,
     pub(crate) locator: Option<String>,

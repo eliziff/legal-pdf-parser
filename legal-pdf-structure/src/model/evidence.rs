@@ -8,7 +8,7 @@ use crate::tables::PageItems;
 /// A line opening with a note label (`label_prefix`): the label's value (0 for a symbol), where it
 /// ends in the line's text (in characters), its type size, whether it is raised or set smaller
 /// than its line (`label_is_raised`), and why a note band would read it as no label (`SUPPRESS_*`).
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct NoteLabel {
     pub(crate) value: u32,
     pub(crate) end: u16,
@@ -43,7 +43,7 @@ pub(crate) const SUPPRESS_WRAPPED: u8 = 8;
 /// of the page's typical step from row to row (frame rows: where a running head or foot sits
 /// outside the edge bands): its first or last row alone, or a stack of two in the page's fifth at
 /// that edge ("RSA 2000" over "Section 1 | OIL AND GAS CONSERVATION ACT | Chapter O-6").
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Rows {
     pub(crate) of: Vec<u32>,
     pub(crate) count: u32,
@@ -52,7 +52,7 @@ pub(crate) struct Rows {
 
 /// The source's own reading of a line, before anything else reads it: a tagged PDF's heading (its
 /// level, 0 for H) or list item, or a page layout model's label.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SourceTag {
     #[default]
     None,
@@ -133,7 +133,7 @@ impl SourceTag {
 /// A line's opening marker as the numbering grammar reads it (`numbering_marker`): its family (an
 /// index into the families read), its value, the depth of its dotted prefix, where it ends in the
 /// line's text (in bytes), and whether it is all the line holds.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Marker {
     pub(crate) family: u16,
     pub(crate) value: u32,
@@ -145,7 +145,7 @@ pub(crate) struct Marker {
 /// A citation on a line, as the citation grammar reads the window holding the line: its byte range
 /// in the line's text, and that of the citation itself without its signal and style; a span the
 /// grammar protects (`protected`) is its own citation.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Cited {
     pub(crate) slot: Slot,
     pub(crate) range: (u32, u32),
@@ -154,14 +154,14 @@ pub(crate) struct Cited {
 }
 
 /// A page's measures: its rows, and the note separator rule the extraction found on it.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PageEvidence {
     pub(crate) rows: Rows,
     pub(crate) separator: Option<f64>,
 }
 
 /// Each line's measures by slot, each page's by page slot, and the document's.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Evidence {
     pub(crate) pages: Vec<PageEvidence>,
     /// Each page's words as text items (`page_items`), a transcript's line numbers left out.
@@ -177,11 +177,22 @@ pub(crate) struct Evidence {
     pub(crate) look: Vec<u8>,
     pub(crate) tag: Vec<SourceTag>,
     pub(crate) marker: Vec<Option<Marker>>,
+    /// Each line's opening as the numbering grammar reads it, every reading (`evidence::marker_readings`): read once.
+    #[serde(skip)]
+    pub(crate) readings: Vec<Vec<MarkerReading>>,
     /// The line on a marker's row carrying its text, where the marker stands alone on its line.
     pub(crate) beside: Vec<Option<Slot>>,
     pub(crate) label: Vec<Option<NoteLabel>>,
     /// `REFERENCE_*`.
     pub(crate) references: Vec<u8>,
+    /// Each line's reference marks, read once (`evidence::references`): value (0 for a note symbol), first and past-last
+    /// UTF-16 code unit. The note band and the line table read them here.
+    pub(crate) marks: Vec<Vec<(u32, u32, u32)>>,
+    /// Each line's marks set apart from its text: its marks less the figures recognition runs straight on from a word
+    /// (`evidence::references`' calls). In a scan those are as often its garble ("e4", "n9", "3.1") as a call, so what
+    /// settles a whole count or run as notes (`notes::band`'s endnote runs and released counts) reads these.
+    #[serde(skip)]
+    pub(crate) calls: Vec<Vec<(u32, u32, u32)>>,
     /// Twelve words or fewer, ending no sentence nor on a comma, semicolon or colon.
     pub(crate) title_shaped: Vec<bool>,
     /// `WORD_*`.
@@ -196,20 +207,32 @@ pub(crate) struct Evidence {
     pub(crate) outline_usable: bool,
     pub(crate) outline_complete: bool,
     /// An instrument: its operative words (`OPERATIVE`) six in a thousand of its words or more, over
-    /// two hundred words; or its caller's profile says so.
+    /// two hundred words, and no proceeding's document (`captions::proceeding`); or its caller's profile says so.
     pub(crate) instrument: bool,
-    /// The operative words in a thousand of the document's words (0 under two hundred words), what
-    /// `instrument` thresholds; a thousand where the caller's profile says instrument.
-    pub(crate) operative: f32,
 }
 
 /// A reading of a line's opening marker by the numbering grammar: its family, the value it counts and
 /// its dotted prefix; a number after a division word ("PART II") reads under the word.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MarkerReading {
     pub(crate) family: String,
     pub(crate) value: u32,
     pub(crate) prefix: Vec<u32>,
+}
+
+impl MarkerReading {
+    /// Read under a division's word ("PART II": "part:.:I").
+    pub(crate) fn worded(&self) -> bool {
+        self.family.matches(':').count() > 1
+    }
+
+    /// A number a heading opens on: under its word, before a stop or a bracket ("4.", "B)"), in brackets ("(a)"), or
+    /// dotted ("4.1"). A bare figure, a bracketed "[12]" and a bullet are none.
+    pub(crate) fn heading(&self) -> bool {
+        let (wrap, count) = self.family.split_once(':').unwrap_or_default();
+        let dotted = count.starts_with("1.1");
+        self.worded() || matches!(wrap, "." | ")") || (wrap == "()" && !dotted) || (wrap.is_empty() && dotted)
+    }
 }
 
 /// A span set as a superscript.

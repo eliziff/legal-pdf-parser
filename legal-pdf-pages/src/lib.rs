@@ -125,23 +125,47 @@ fn merge_bands(page: &mut PageEvidence, bands: Bands) {
 
 /// The page map (see the crate).
 pub fn page_map(pages: &[PageEvidence], starts: &[u32], is_citation: &dyn Fn(&str, &str) -> bool) -> Vec<PdfPageBinding> {
-    let mut read: Vec<Option<(String, usize)>> = pages.iter().map(printed).collect();
+    page_map_rowed(pages, &PageRows::of(pages), starts, is_citation)
+}
+
+/// Each page's rows (`rows`), read once for every reading of the page a page map makes, and carried to the next page
+/// map of the same pages where a page's lines are unchanged.
+pub struct PageRows(Vec<Vec<Row>>);
+
+impl PageRows {
+    pub fn of(pages: &[PageEvidence]) -> Self {
+        Self(legal_pdf_core::profile::tally("pages.rows", || pages.iter().map(rows).collect()))
+    }
+
+    /// Page `at`'s rows read again, its lines changed.
+    pub fn reread(&mut self, pages: &[PageEvidence], at: usize) {
+        if let (Some(rows_at), Some(page)) = (self.0.get_mut(at), pages.get(at)) {
+            *rows_at = legal_pdf_core::profile::tally("pages.rows", || rows(page));
+        }
+    }
+}
+
+/// The page map over pages whose rows are read (`PageRows`).
+pub fn page_map_rowed(pages: &[PageEvidence], rowed: &PageRows, starts: &[u32], is_citation: &dyn Fn(&str, &str) -> bool) -> Vec<PdfPageBinding> {
+    let rowed: &[Vec<Row>] = &rowed.0;
+    let mut read: Vec<Option<(String, usize)>> = legal_pdf_core::profile::tally("pages.printed", || pages.iter().zip(rowed).map(|(page, rows)| printed(page, rows)).collect());
     if !starts.is_empty() && !read.iter().flatten().any(|(label, _)| label.parse::<u32>().is_ok_and(|n| starts.contains(&n))) {
         margin_labels(&mut read, pages, starts, is_citation);
     }
     let observed: Vec<Option<String>> = read.iter().map(|read| read.as_ref().map(|(label, _)| label.clone())).collect();
-    let mut bindings = resolve(&observed, &pages.iter().map(|page| page.embedded.clone()).collect::<Vec<_>>());
-    sequence(&mut bindings, &observed, pages, starts);
-    counters(&mut bindings, pages);
-    anchor(&mut bindings, &observed, starts);
-    numberings(&mut bindings, pages);
-    printing_lines(&mut bindings, pages, &read);
+    let chained = legal_pdf_core::profile::tally("pages.chains", || chains(pages, rowed));
+    let mut bindings = legal_pdf_core::profile::tally("pages.resolve", || resolve(&observed, &pages.iter().map(|page| page.embedded.clone()).collect::<Vec<_>>()));
+    legal_pdf_core::profile::tally("pages.sequence", || sequence(&mut bindings, &observed, pages, rowed, starts, &chained));
+    legal_pdf_core::profile::tally("pages.counters", || counters(&mut bindings, pages, rowed));
+    legal_pdf_core::profile::tally("pages.anchor", || anchor(&mut bindings, &observed, starts));
+    legal_pdf_core::profile::tally("pages.numberings", || numberings(&mut bindings, &chained));
+    legal_pdf_core::profile::tally("pages.printing_lines", || printing_lines(&mut bindings, pages, rowed, &read));
     bindings
 }
 
 /// Each page's number read on the page alone (`printed`), for the fit's helpers.
-fn observed(pages: &[PageEvidence]) -> Vec<Option<String>> {
-    pages.iter().map(|page| printed(page).map(|(label, _)| label)).collect()
+fn observed(pages: &[PageEvidence], rowed: &[Vec<Row>]) -> Vec<Option<String>> {
+    pages.iter().zip(rowed).map(|(page, rows)| printed(page, rows).map(|(label, _)| label)).collect()
 }
 
 /// What a page prints as its number, read on the page alone (the page-number rule the structure stage's furniture
@@ -149,7 +173,7 @@ fn observed(pages: &[PageEvidence]) -> Vec<Option<String>> {
 /// ("12", "- 12 -", "Page 12", "Page 2 of 30", "xiv"), the foot's before the head's; not a bare number beside a line of
 /// the page's prose (twenty letters or more, no running head's words: a law report's paragraph number in its margin),
 /// nor one opening a foot row that goes on in text (a note's). With the line printing it.
-fn printed(page: &PageEvidence) -> Option<(String, usize)> {
+fn printed(page: &PageEvidence, rows: &[Row]) -> Option<(String, usize)> {
     static SHAPE: OnceLock<Regex> = OnceLock::new();
     let shape = SHAPE.get_or_init(|| {
         Regex::new(r"(?i)^-?\s*(?:page\s+)?(\d{1,6}|[ivxlc]{1,12})(?:\s*(?:of|/|of\s*/\s*de|de|sur)\s*\d{1,6})?\s*-?$").unwrap()
@@ -159,7 +183,6 @@ fn printed(page: &PageEvidence) -> Option<(String, usize)> {
         return None;
     }
     let p = patterns();
-    let rows = rows(page);
     let foot = rows.last().filter(|row| row.whole.rect[1] > height * 0.86);
     let head = rows.first().filter(|row| row.whole.rect[3] < height * 0.14);
     for (row, at_foot) in foot.map(|row| (row, true)).into_iter().chain(head.map(|row| (row, false))) {
@@ -183,29 +206,62 @@ fn printed(page: &PageEvidence) -> Option<(String, usize)> {
     None
 }
 
-/// Each numbered page's line printing its number: the line it was read from where the map gives the page the number it
-/// reads there (`printed`, `margin_labels`), else the outermost line of its head or foot printing that number (a
-/// sequence's folio beside a running head's title, a counter, a typed numbering); none where it prints it nowhere there.
-fn printing_lines(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], read: &[Option<(String, usize)>]) {
-    for ((binding, page), read) in bindings.iter_mut().zip(pages).zip(read) {
+/// Each numbered page's line printing its number: the line the number was read from where the map gives the page the
+/// number it reads there (`printed`, `margin_labels`); else the outermost line of its head or foot printing that number
+/// (`printing`) at a place the document sets its folios: where a read line stands, or where three pages print different
+/// numbers of theirs (a sequence's folio beside a running head's title, a counter, a typed numbering). A paragraph's
+/// "[1]" before its words on an unnumbered opening page stands at no such place. Where the document shows no such
+/// place (a page or two numbered), a page's line is its first or last row printing its number.
+fn printing_lines(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], rowed: &[Vec<Row>], read: &[Option<(String, usize)>]) {
+    let place = |page: &PageEvidence, line: usize| {
+        let rect = page.lines[line].rect;
+        ((rect[1] + rect[3]) / 2.0 / page.height.max(1.0), (rect[0] + rect[2]) / 2.0 / page.width.max(1.0))
+    };
+    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() <= 0.03 && (a.1 - b.1).abs() <= 0.15;
+    let mut places: Vec<(f64, f64)> = Vec::new();
+    let mut printed: Vec<Vec<(f64, usize, bool)>> = vec![Vec::new(); bindings.len()];
+    for (at, ((binding, page), read)) in bindings.iter_mut().zip(pages).zip(read).enumerate() {
         let Some(label) = binding.label.as_deref() else { continue };
-        binding.line = match read {
-            Some((own, line)) if own.eq_ignore_ascii_case(label) => Some(*line),
-            _ => printing_line(page, label),
-        };
+        match read {
+            Some((own, line)) if own.eq_ignore_ascii_case(label) => {
+                places.push(place(page, *line));
+                binding.line = Some(*line);
+            }
+            _ => printed[at] = printing(page, &rowed[at], label),
+        }
+    }
+    // two more pages printing other numbers there: a decision printed twice opens both printings on "[1]", and a
+    // contents list's "I." can stand where the opening paragraph's "[1]" does
+    let shared: Vec<(f64, f64)> = printed.iter().enumerate()
+        .flat_map(|(at, lines)| lines.iter().map(move |&(_, line, _)| (at, place(&pages[at], line))))
+        .filter(|&(at, here)| {
+            let others = printed.iter().enumerate().filter(|(other, lines)| {
+                bindings[*other].label != bindings[at].label && lines.iter().any(|&(_, line, _)| near(here, place(&pages[*other], line)))
+            });
+            others.count() >= 2
+        })
+        .map(|(_, here)| here)
+        .collect();
+    places.extend(shared);
+    for (at, lines) in printed.iter().enumerate() {
+        let takes = |&&(_, line, outermost): &&(f64, usize, bool)| if places.is_empty() { outermost } else { places.iter().any(|&set| near(set, place(&pages[at], line))) };
+        if let Some(&(_, line, _)) = lines.iter().filter(takes).min_by(|a, b| a.0.total_cmp(&b.0)) {
+            bindings[at].line = Some(line);
+        }
     }
 }
 
-/// The outermost line of a page's head or foot (its top or bottom 28%) printing `label`: a number among the line's
-/// folio candidates, a roman numeral alone, a typed numbering ("E-162") as printed.
-fn printing_line(page: &PageEvidence, label: &str) -> Option<usize> {
+/// The lines of a page's head or foot (its top or bottom 28%) printing `label` (a number among the line's folio
+/// candidates, a roman numeral alone, a typed numbering "E-162" as printed), one a row: how far its row stands from the
+/// page's nearer edge, the line, and whether its row is the page's first or last.
+fn printing(page: &PageEvidence, rows: &[Row], label: &str) -> Vec<(f64, usize, bool)> {
     let height = page.height.max(1.0);
     let number = label.parse::<i64>().ok();
     let compact = |text: &str| text.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect::<String>();
     let wanted = compact(label);
-    rows(page)
-        .iter()
-        .filter_map(|row| {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(at, row)| {
             let y = (row.whole.rect[1] + row.whole.rect[3]) / 2.0 / height;
             let zone = if y <= 0.28 { Zone::Top } else if y >= 0.72 { Zone::Bottom } else { return None };
             let prints = |text: &str| match number {
@@ -216,20 +272,19 @@ fn printing_line(page: &PageEvidence, label: &str) -> Option<usize> {
                 }
             };
             let (line, _) = row.pieces.iter().flatten().find(|(_, piece)| prints(&piece.text))?;
-            Some((y.min(1.0 - y), *line))
+            Some((y.min(1.0 - y), *line, at == 0 || at + 1 == rows.len()))
         })
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, line)| line)
+        .collect()
 }
 
 /// A page the sequence leaves without a number that names its place itself ("Page 1 of 1", "Page: 2", "1/4") is that
 /// page: a form or a decision bound with others counts its own pages, and no sequence runs through them.
-fn counters(bindings: &mut [PdfPageBinding], pages: &[PageEvidence]) {
-    for (binding, page) in bindings.iter_mut().zip(pages) {
+fn counters(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], rowed: &[Vec<Row>]) {
+    for ((binding, page), rows) in bindings.iter_mut().zip(pages).zip(rowed) {
         if binding.label.is_some() {
             continue;
         }
-        let numbers: std::collections::BTreeSet<i64> = page_candidates(None, Some(page)).iter()
+        let numbers: std::collections::BTreeSet<i64> = page_candidates(None, Some((page, rows))).iter()
             .filter(|c| c.kind == Kind::Counter && sequence_anchor(c)).map(|c| c.number).collect();
         if let [number] = numbers.into_iter().collect::<Vec<_>>()[..] {
             binding.label = Some(number.to_string());
@@ -414,6 +469,11 @@ fn trailing_number(text: &str) -> Option<(usize, usize)> {
 }
 
 fn isolated_number(text: &str) -> Option<i64> {
+    // a letter anywhere is no number alone (what is left of the text once its edge punctuation goes must be all digits):
+    // a page's prose rows, nearly all of them, are none without a pattern read
+    if text.chars().any(char::is_alphabetic) {
+        return None;
+    }
     // a hyphen, dash, point or tilde between two numbers joins two labels ("5-1" a chapter's page, "12-13" a spread,
     // "12.6" a section, "4.16.3 ~ 1" a section's page), not one number's digits a reading spaced ("74 1")
     static COMPOUND: OnceLock<Regex> = OnceLock::new();
@@ -688,15 +748,25 @@ fn rows(page: &PageEvidence) -> Vec<Row> {
     let mut lines: Vec<(usize, &EdgeLine)> = page.lines.iter().enumerate().filter(|(_, l)| !l.text.trim().is_empty()).collect();
     lines.sort_by(|(_, a), (_, b)| a.rect[1].total_cmp(&b.rect[1]).then(a.rect[0].total_cmp(&b.rect[0])));
     let mut rows: Vec<Vec<(usize, &EdgeLine)>> = Vec::new();
+    // The rows a line may still join, in the order they were made: the lines come down the page, so a row whose lowest
+    // bottom is above a line's top overlaps no line after it either.
+    let mut live: Vec<(usize, f64)> = Vec::new();
     for (at, line) in lines {
         let same_row = |(_, other): &(usize, &EdgeLine)| {
             let overlap = line.rect[3].min(other.rect[3]) - line.rect[1].max(other.rect[1]);
             let height = (line.rect[3] - line.rect[1]).min(other.rect[3] - other.rect[1]).max(0.1);
             overlap >= height * 0.5
         };
-        match rows.iter_mut().find(|row| row.iter().any(same_row)) {
-            Some(row) => row.push((at, line)),
-            None => rows.push(vec![(at, line)]),
+        live.retain(|&(_, bottom)| bottom > line.rect[1]);
+        match live.iter_mut().find(|(row, _)| rows[*row].iter().any(same_row)) {
+            Some((row, bottom)) => {
+                rows[*row].push((at, line));
+                *bottom = bottom.max(line.rect[3]);
+            }
+            None => {
+                live.push((rows.len(), line.rect[3]));
+                rows.push(vec![(at, line)]);
+            }
         }
     }
     let bounds = |pieces: &[(usize, &EdgeLine)]| pieces.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |r, (_, l)| {
@@ -725,13 +795,12 @@ fn rows(page: &PageEvidence) -> Vec<Row> {
 }
 
 /// One page's candidates, best first, its structural head and foot numbers kept and the rest up to eight.
-fn page_candidates(observed: Option<&str>, page: Option<&PageEvidence>) -> Vec<Candidate> {
+fn page_candidates(observed: Option<&str>, page: Option<(&PageEvidence, &[Row])>) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
     if let Some(number) = observed.and_then(|l| l.parse::<i64>().ok()).filter(|n| (1..=99_999).contains(n)) {
         candidates.push(Candidate { number, kind: Kind::Isolated, zone: Zone::Top, score: 1.0, year_like: false, citation_like: false, y: None, line: 1_000_000, text: number.to_string(), context: number.to_string(), running: false });
     }
-    if let Some(page) = page {
-        let rows = rows(page);
+    if let Some((page, rows)) = page {
         let (count, height) = (rows.len(), page.height.max(1.0));
         for (index, row) in rows.iter().enumerate() {
             let line = &row.whole;
@@ -905,17 +974,17 @@ impl Sequence {
 /// it fails the hard requirements (too few anchors, too short a span, anchors at inconsistent heights, too sparse for a
 /// long document), a close competitor leaves the numbering in doubt, or a running head's sequence outranks a local
 /// footer count. A short document with one numbered page takes that page's shift.
-fn sequence(bindings: &mut [PdfPageBinding], observed: &[Option<String>], pages: &[PageEvidence], starts: &[u32]) {
+fn sequence(bindings: &mut [PdfPageBinding], observed: &[Option<String>], pages: &[PageEvidence], rowed: &[Vec<Row>], starts: &[u32], chained: &[Chain]) {
     let total = bindings.len();
     if total == 0 {
         return;
     }
-    let (candidates, ranked) = ranked_sequences(observed, pages);
+    let (candidates, ranked) = legal_pdf_core::profile::tally("pages.ranked_sequences", || ranked_sequences(observed, pages, rowed, chained));
     let required = if total == 1 { 1 } else { 2 };
     // a PDF binding documents of their own numberings (a book of authorities, a volume's plates): each part its own run
     let parts = parts(&ranked, total);
     if parts.len() >= 2 {
-        let roman = roman_runs(bindings, pages);
+        let roman = legal_pdf_core::profile::tally("pages.roman_runs", || roman_runs(bindings, pages, rowed));
         let mut numbered = vec![false; total];
         for part in &parts {
             let (first, last) = (part.anchors[0].0, part.anchors.last().unwrap().0);
@@ -923,7 +992,8 @@ fn sequence(bindings: &mut [PdfPageBinding], observed: &[Option<String>], pages:
                 numbered[at] = true;
                 let number = at as i64 + 1 + part.shift;
                 let binding = &mut bindings[at];
-                if number < 1 || roman[at] {
+                // a page the part's own folio stands on is the part's, a roman numeral there notwithstanding (a heading's "IV.")
+                if number < 1 || (roman[at] && !part.anchors.iter().any(|(page, _)| *page == at)) {
                     continue;
                 }
                 if binding.label.as_deref() != Some(number.to_string().as_str()) {
@@ -943,7 +1013,7 @@ fn sequence(bindings: &mut [PdfPageBinding], observed: &[Option<String>], pages:
         return;
     }
     let required_span = if total <= 4 { 1 } else { 2.max((total as f64 * 0.15).ceil() as usize) };
-    let chosen = choose(&ranked, total, required, required_span);
+    let chosen = legal_pdf_core::profile::tally("pages.choose", || choose(&ranked, total, required, required_span));
     // the PDF's own count of its pages (its 1 on the PDF's first page) says nothing the PDF's page does not: where another
     // numbering is printed through the document, that numbering is the page's
     let chosen = match chosen {
@@ -952,7 +1022,7 @@ fn sequence(bindings: &mut [PdfPageBinding], observed: &[Option<String>], pages:
             && row.anchors.len() * 2 >= best.anchors.len() && row.y_span.is_none_or(|y| y <= 0.10)).or(Some(best)),
         other => other,
     };
-    let roman = roman_runs(bindings, pages);
+    let roman = legal_pdf_core::profile::tally("pages.roman_runs", || roman_runs(bindings, pages, rowed));
     let (shift, range) = match chosen {
         Some(best) => {
             let competitors = ranked.iter().filter(|row| !std::ptr::eq(*row, best)).take(7)
@@ -1046,7 +1116,7 @@ struct Chain {
 /// the facing page's, or both centred). A chain of three pages on the outermost rows, or of five within the page where a
 /// text's own numbers stand, is a run. A year repeats on a running head rather than climbs, a transcript's line numbers
 /// start again on each page, and a note's numbers seldom climb one a page at one place.
-fn chains(pages: &[PageEvidence]) -> Vec<Chain> {
+fn chains(pages: &[PageEvidence], rowed: &[Vec<Row>]) -> Vec<Chain> {
     static TOKEN: OnceLock<Regex> = OnceLock::new();
     static NOT_A_PREFIX: OnceLock<Regex> = OnceLock::new();
     let token = TOKEN.get_or_init(|| Regex::new(r"(?:\b(?P<letters>[A-Za-z]{1,6})(?P<dash>\s?-\s?)?|\b(?P<chapter>\d{1,3})\s?-\s?)?\b(?P<digits>\d{1,8})\b").unwrap());
@@ -1062,10 +1132,12 @@ fn chains(pages: &[PageEvidence]) -> Vec<Chain> {
         outer: bool,
         text: String,
     }
-    let tokens: Vec<Vec<Token>> = pages.iter().map(|page| {
+    // Alone: nothing about the number but a folio's dress ("Page", "of 30", "/ 30") is a letter or digit. A letter outside
+    // the dress words' own (their letters, and the long s their case-blind match takes) is none, without the dress read at all.
+    let dressable = |c: char| !c.is_alphanumeric() || c.is_numeric() || "pagofdesurPAGOFDESUR\u{17f}".contains(c);
+    let tokens: Vec<Vec<Token>> = pages.iter().zip(rowed).map(|(page, rows)| {
         let (height, width) = (page.height.max(1.0), page.width.max(1.0));
         let mut found = Vec::new();
-        let rows = rows(page);
         let count = rows.len();
         for (index, row) in rows.iter().enumerate() {
             let y = (row.whole.rect[1] + row.whole.rect[3]) / 2.0 / height;
@@ -1073,17 +1145,23 @@ fn chains(pages: &[PageEvidence]) -> Vec<Chain> {
             for (_, piece) in row.pieces.iter().flatten() {
                 let x = (piece.rect[0] + piece.rect[2]) / 2.0 / width;
                 let text = piece.text.trim();
+                // Off the outermost rows a number stands only alone, every letter about it a dress word's but the six at
+                // most its own prefix holds: a piece with more letters than that (a sentence) holds none.
+                if !outer && text.chars().filter(|&c| !dressable(c)).nth(6).is_some() {
+                    continue;
+                }
                 for capture in token.captures_iter(text) {
                     // a number standing as a folio stands: its line alone, in a folio's dress ("- 12 -", "Page 12", "12 of
                     // 30", "E-162"), or opening or closing a head's or foot's outermost row (a running head's "48 UBC LAW
                     // REVIEW"); a number within a sentence or a note's text is the text's
                     let whole = capture.get(0).unwrap();
-                    let rest = format!("{} {}", &text[..whole.start()], &text[whole.end()..]);
-                    let dress = folio_dress().replace_all(&rest, "");
-                    let alone = dress.chars().all(|c| !c.is_alphanumeric());
                     let edge = outer && (whole.start() == 0 || whole.end() == text.len() || text[..whole.start()].chars().all(|c| !c.is_alphanumeric())
                         || text[whole.end()..].chars().all(|c| !c.is_alphanumeric()));
-                    if !alone && !edge {
+                    let alone = || text[..whole.start()].chars().chain(text[whole.end()..].chars()).all(dressable) && {
+                        let rest = format!("{} {}", &text[..whole.start()], &text[whole.end()..]);
+                        folio_dress().replace_all(&rest, "").chars().all(|c| !c.is_alphanumeric())
+                    };
+                    if !edge && !alone() {
                         continue;
                     }
                     let digits = &capture["digits"];
@@ -1156,14 +1234,14 @@ fn chains(pages: &[PageEvidence]) -> Vec<Chain> {
 
 /// The fit's candidates from the runs (`chains`) a page number may be: bare numbers and lettered pages ("E-162"), not a
 /// chapter's ("5-1") or a record's serial ("ABC0001234"), which are numberings of their own (`numberings`).
-fn folio_runs(pages: &[PageEvidence]) -> Vec<Vec<Candidate>> {
-    let mut out: Vec<Vec<Candidate>> = (0..pages.len()).map(|_| Vec::new()).collect();
-    for chain in chains(pages).into_iter().filter(|chain| matches!(chain.form, "bare" | "letter") && chain.pad == 0) {
-        for (q, value, y, text) in chain.pages {
+fn folio_runs(total: usize, chained: &[Chain]) -> Vec<Vec<Candidate>> {
+    let mut out: Vec<Vec<Candidate>> = (0..total).map(|_| Vec::new()).collect();
+    for chain in chained.iter().filter(|chain| matches!(chain.form, "bare" | "letter") && chain.pad == 0) {
+        for &(q, value, y, ref text) in &chain.pages {
             let zone = if y <= 0.28 { Zone::Top } else if y >= 0.72 { Zone::Bottom } else if y <= 0.5 { Zone::NearTop } else { Zone::NearBottom };
             if (1..=99_999).contains(&value) {
                 out[q].push(Candidate { number: value, kind: Kind::Run, zone, score: 1.0, year_like: false, citation_like: false, y: Some(y),
-                    line: 1_000_000, context: text.clone(), text, running: false });
+                    line: 1_000_000, context: text.clone(), text: text.clone(), running: false });
             }
         }
     }
@@ -1175,9 +1253,9 @@ fn folio_runs(pages: &[PageEvidence]) -> Vec<Vec<Candidate>> {
 /// page's own label already gives is not repeated. The kind is the printed form's: a lettered page "exhibit", a serial or
 /// zero-padded number "bates", a chapter's page "chapter", the PDF's own count "pdf", another count of pages "other". A page
 /// the fit leaves without a number takes the strongest typed one (exhibit, bates, chapter) as its label.
-fn numberings(bindings: &mut [PdfPageBinding], pages: &[PageEvidence]) {
+fn numberings(bindings: &mut [PdfPageBinding], chained: &[Chain]) {
     let mut runs: HashMap<(String, &'static str, usize, i64), (usize, usize, usize)> = HashMap::new();
-    for chain in chains(pages) {
+    for chain in chained {
         let shift = chain.pages[0].1 - chain.pages[0].0 as i64 - 1;
         let (first, last) = (chain.pages[0].0, chain.pages.last().unwrap().0);
         let entry = runs.entry((chain.prefix.clone(), chain.form, chain.pad, shift)).or_insert((first, last, 0));
@@ -1223,13 +1301,13 @@ fn numberings(bindings: &mut [PdfPageBinding], pages: &[PageEvidence]) {
 
 /// Each page's candidates (`observed`: what each prints as read), and the shifts their anchors support, best first
 /// (`ranked_delta_sequences`).
-fn ranked_sequences(observed: &[Option<String>], pages: &[PageEvidence]) -> (Vec<Vec<Candidate>>, Vec<Sequence>) {
+fn ranked_sequences(observed: &[Option<String>], pages: &[PageEvidence], rowed: &[Vec<Row>], chained: &[Chain]) -> (Vec<Vec<Candidate>>, Vec<Sequence>) {
     let total = observed.len();
-    let mut candidates: Vec<Vec<Candidate>> = observed.iter().enumerate().map(|(at, observed)| page_candidates(observed.as_deref(), pages.get(at))).collect();
-    for (page, chained) in candidates.iter_mut().zip(folio_runs(pages)) {
-        page.extend(chained);
+    let mut candidates: Vec<Vec<Candidate>> = legal_pdf_core::profile::tally("pages.candidates", || observed.iter().enumerate().map(|(at, observed)| page_candidates(observed.as_deref(), pages.get(at).zip(rowed.get(at).map(Vec::as_slice)))).collect());
+    for (page, runs) in candidates.iter_mut().zip(legal_pdf_core::profile::tally("pages.folio_runs", || folio_runs(pages.len(), chained))) {
+        page.extend(runs);
     }
-    running_heads(&mut candidates);
+    legal_pdf_core::profile::tally("pages.running_heads", || running_heads(&mut candidates));
     let valid = |shift: i64| {
         let skipped = (1..=total as i64).filter(|page| page + shift <= 0).count();
         // pages before the sequence's 1 (an issue's front matter, a repository's cover) are left unnumbered
@@ -1251,7 +1329,9 @@ fn ranked_sequences(observed: &[Option<String>], pages: &[PageEvidence]) -> (Vec
             }
         }
     }
-    let mut ranked: Vec<Sequence> = by_shift.into_iter().map(|(shift, anchors)| Sequence::new(shift, anchors, total)).collect();
+    let shifts = by_shift.len();
+    let mut ranked: Vec<Sequence> = legal_pdf_core::profile::tally("pages.sequences", || by_shift.into_iter().map(|(shift, anchors)| Sequence::new(shift, anchors, total)).collect());
+    if std::env::var_os("LEGALPDF_PHASE_TIMING").is_some() { eprintln!("phase	pages.shifts	{shifts}"); }
     ranked.sort_by(|a, b| b.anchors.len().cmp(&a.anchors.len()).then(b.span_ratio.total_cmp(&a.span_ratio))
         .then(b.support.total_cmp(&a.support)).then(b.score.total_cmp(&a.score)).then(a.shift.abs().cmp(&b.shift.abs())));
     (candidates, ranked)
@@ -1312,16 +1392,16 @@ fn roman_value(label: &str) -> Option<i64> {
 /// The roman runs (Text-Fidelity's roman fit, safe mode): roman folios read on pages whose numbers agree with their
 /// places (two or more at one shift) number the pages from the first to the last of them; a roman folio read alone, or
 /// at odds with its neighbours, is no page number. Returns which pages a roman run holds.
-fn roman_runs(bindings: &mut [PdfPageBinding], pages: &[PageEvidence]) -> Vec<bool> {
+fn roman_runs(bindings: &mut [PdfPageBinding], pages: &[PageEvidence], rowed: &[Vec<Row>]) -> Vec<bool> {
     // each page's roman folios: the one it prints as read (`printed`), and a cell of its head or foot that is a numeral alone, between
     // marks perhaps ("(iv)", "- xii -"; `roman_candidate_text`)
     let mut by_shift: HashMap<i64, Vec<usize>> = HashMap::new();
     let mut heights: HashMap<(i64, usize), f64> = HashMap::new();
     for (at, binding) in bindings.iter().enumerate() {
         let mut values: Vec<i64> = binding.label.as_deref().filter(|_| binding.source.as_deref() == Some("detected")).and_then(roman_value).into_iter().collect();
-        if let Some(page) = pages.get(at) {
+        if let (Some(page), Some(rows)) = (pages.get(at), rowed.get(at)) {
             let height = page.height.max(1.0);
-            for row in rows(page) {
+            for row in rows {
                 let y = (row.whole.rect[1] + row.whole.rect[3]) / 2.0 / height;
                 if y > 0.28 && y < 0.72 {
                     continue;
@@ -1419,20 +1499,23 @@ fn unconfirmed(bindings: &mut [PdfPageBinding], numbered: std::ops::Range<usize>
 /// from): what the fit weighed, for a person checking a page map.
 #[doc(hidden)]
 pub fn weighed(pages: &[PageEvidence]) -> Vec<(i64, Vec<(usize, i64, String)>)> {
-    let (_, ranked) = ranked_sequences(&observed(pages), pages);
+    let rowed: Vec<Vec<Row>> = pages.iter().map(rows).collect();
+    let (_, ranked) = ranked_sequences(&observed(pages, &rowed), pages, &rowed, &chains(pages, &rowed));
     ranked.into_iter().map(|row| (row.shift, row.anchors.into_iter().map(|(at, c)| (at + 1, c.number, c.text)).collect())).collect()
 }
 
 /// Whether a page's lines print a number in a folio's shape.
 pub fn prints_a_folio(page: &PageEvidence) -> bool {
-    page_candidates(printed(page).map(|(label, _)| label).as_deref(), Some(page)).iter().any(sequence_anchor)
+    let rows = rows(page);
+    page_candidates(printed(page, &rows).map(|(label, _)| label).as_deref(), Some((page, &rows))).iter().any(sequence_anchor)
 }
 
 /// Each page's candidates (number, how it is printed, its zone, its score, whether it anchors a sequence, its line), for a
 /// person checking a page map.
 #[doc(hidden)]
 pub fn candidates_of(pages: &[PageEvidence]) -> Vec<Vec<String>> {
-    observed(pages).iter().zip(pages).map(|(observed, page)| page_candidates(observed.as_deref(), Some(page)).iter()
+    let rowed: Vec<Vec<Row>> = pages.iter().map(rows).collect();
+    observed(pages, &rowed).iter().zip(pages).zip(&rowed).map(|((observed, page), rows)| page_candidates(observed.as_deref(), Some((page, rows))).iter()
         .map(|c| format!("{} {:?} {:?} {:.2} {} | {}", c.number, c.kind, c.zone, c.score, if sequence_anchor(c) { "ANCHOR" } else { "-" }, c.text))
         .collect()).collect()
 }
@@ -1440,7 +1523,8 @@ pub fn candidates_of(pages: &[PageEvidence]) -> Vec<Vec<String>> {
 /// The parts the fit finds (shift, first and last PDF page, anchors), for a person checking a page map.
 #[doc(hidden)]
 pub fn parts_of(pages: &[PageEvidence]) -> Vec<(i64, usize, usize, usize)> {
-    let (_, ranked) = ranked_sequences(&observed(pages), pages);
+    let rowed: Vec<Vec<Row>> = pages.iter().map(rows).collect();
+    let (_, ranked) = ranked_sequences(&observed(pages, &rowed), pages, &rowed, &chains(pages, &rowed));
     parts(&ranked, pages.len()).iter().map(|part| (part.shift, part.anchors[0].0 + 1, part.anchors.last().unwrap().0 + 1, part.anchors.len())).collect()
 }
 
@@ -1449,7 +1533,8 @@ pub fn parts_of(pages: &[PageEvidence]) -> Vec<(i64, usize, usize, usize)> {
 /// own count of its pages at the foot (`local_article_count`), as a repository's copy prints over the journal's page whose
 /// folio is in the image of its head. A page the body's numbers seem to number is no page whose folio was read.
 pub fn read_again(pages: &[PageEvidence]) -> Vec<bool> {
-    let (_, ranked) = ranked_sequences(&observed(pages), pages);
+    let rowed: Vec<Vec<Row>> = pages.iter().map(rows).collect();
+    let (_, ranked) = ranked_sequences(&observed(pages, &rowed), pages, &rowed, &chains(pages, &rowed));
     let local = ranked.first().is_some_and(|best| best.local_article_count(pages.len()));
     pages.iter().map(|page| {
         let band = PageEvidence {
@@ -1567,7 +1652,9 @@ fn short_single_anchor(candidates: &[Vec<Candidate>], total: usize) -> Option<i6
     let mut page: Vec<&Candidate> = page.iter().copied().filter(|c| c.score >= 0.55 && c.kind != Kind::Counter && c.kind != Kind::HeaderTrailing).collect();
     page.sort_by(|a, b| b.score.total_cmp(&a.score).then(b.zone.top().cmp(&a.zone.top())).then((b.kind == Kind::Isolated).cmp(&(a.kind == Kind::Isolated))).then(a.number.cmp(&b.number)));
     let top = page.first()?;
-    if page.iter().filter(|c| (c.score - top.score).abs() < 0.05).count() > 1 || (*at + 1 == total && total > 2) {
+    // (Another number as likely as the best leaves the page in doubt; the same number read twice, on its line and as the
+    // page's own reading, does not.)
+    if page.iter().any(|c| c.number != top.number && (c.score - top.score).abs() < 0.05) || (*at + 1 == total && total > 2) {
         return None;
     }
     let shift = top.number - (*at as i64 + 1);

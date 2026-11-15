@@ -23,7 +23,7 @@ use crate::machine::machine::{LineView, Move, State, RANKED_BODY};
 use crate::model::regions::{region_of, zone_of, CONTENTS, HEADING, MARGINAL_NOTE, NOTE, TEXT, TITLE};
 use crate::model::{Evidence, MarkerReading, Role, Rule, Runs, Slot, Slots};
 use std::collections::{HashMap, HashSet};
-use legal_structure_model::UnitRole;
+use legal_structure_model::{CandidateGrammar, UnitRole};
 
 /// A marker going on from the number open in its family.
 const COUNTS_ON: f32 = 1.0;
@@ -191,7 +191,10 @@ fn settle(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, r
             let competing = readings.iter().filter(|reading| reading.role != Role::Open).count() > 1;
             let member = decision.reading[at].and_then(|member| Some((member, member_of(member).kind?)));
             let mut winner: Option<(Heard, Move, f32)> = None;
-            for reading in &readings {
+            // The document's own outline names headings and sections, never a list's items: where it names a line a
+            // marker would open as an item, the marker's reading does not compete.
+            let named_item = member.is_some_and(|(_, kind)| kind == UnitRole::Item) && readings.iter().any(|reading| reading.rule == Rule::Anchor);
+            for reading in readings.iter().filter(|reading| !(named_item && reading.rule == Rule::Opener)) {
                 let chosen = candidate(view, runs, reading.role, reading.rule, member.filter(|_| matches!(reading.rule, Rule::Opener | Rule::Caption)), reading.joined);
                 let mut score = worth(reading, &chosen);
                 if weighing && competing && !fixed {
@@ -290,7 +293,14 @@ fn settle(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, r
             grouped = Some((zone, blocks[at], key));
         }
         if chosen.opens && RANKED_BODY.contains(&chosen.region) {
-            chosen.depth = state.stack_depth(view, &chosen).min(9) as u8;
+            // A ladder the instrument grammar read gives each of its provisions its level ("2(1)(a)" two under "2"): the
+            // depth of the deepest the line opens. Any other unit stands where its number counts on the stack.
+            let rung = chosen.unit.and_then(|(run, _)| {
+                let run = &runs.runs[run as usize];
+                let levels = marked.get(&slot)?.iter().filter(|member| runs.runs[member.0 as usize].id == run.id).map(|&member| member_of(member).level);
+                levels.max().filter(|_| run.grammar == CandidateGrammar::Hierarchy)
+            });
+            chosen.depth = rung.map_or_else(|| state.stack_depth(view, &chosen), |level| usize::from(level) + 1).min(9) as u8;
         }
         state.apply(view, &chosen);
         decision.moves[k] = chosen;

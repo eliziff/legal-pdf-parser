@@ -24,7 +24,7 @@ const ORIGIN: &str = "legalpdf.pdf-structure.v2";
 /// The grammar of a constituent's section; its kind follows ("constituent_exhibit").
 pub(crate) const GRAMMAR: &str = "constituent_";
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Start {
     pub(crate) line_id: String,
     kind: String,

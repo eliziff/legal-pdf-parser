@@ -7,6 +7,7 @@ mod orientation;
 mod planning;
 mod raster;
 mod separator;
+mod simd_kernel;
 mod uncovered;
 
 pub use indra::{IndraTier, OcrOptions, OcrProvider, PreparedOcrProvider};

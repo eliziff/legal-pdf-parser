@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use legal_pdf_core::render::open_pdf;
 use legal_pdf_core::{Error, Result};
 use legal_pdf_ocr::{OcrOptions, OcrPageRequest, OcrProvider, PdfOcrProvider};

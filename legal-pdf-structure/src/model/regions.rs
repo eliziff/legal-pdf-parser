@@ -1,11 +1,11 @@
 //! The regions a line may be in: the gold's (`labels::REGIONS`), the region a decided role is, and the name a page gives
-//! a line of a region. The one vocabulary the decision's writer and the transition parser read.
+//! a line of a region. The one vocabulary the decision's writer and DOC read.
 
 use crate::model::{Edge, Role};
 use legal_pdf_core::model::{LineZone, NoteMode};
 
 /// The regions a line may be in, the gold's (`labels::REGIONS`).
-pub(crate) const REGIONS: [&str; 17] = [
+pub const REGIONS: [&str; 17] = [
     "none", "text", "list_item", "heading", "quote", "note", "table", "contents", "caption", "headnote", "marginal_note",
     "furniture", "page_label", "line_label", "title", "note_quote", "provision",
 ];
@@ -63,7 +63,7 @@ pub(crate) fn zone_of(role: Role, edge: Option<Edge>, note: NoteMode) -> LineZon
 
 /// Regions whose units run on in one stream, as the gold's do (`labels::stream`): the body's, notes',
 /// marginal notes', furniture's, page and line labels'.
-pub(crate) fn stream_of(region: u8) -> usize {
+pub fn stream_of(region: u8) -> usize {
     match REGIONS[usize::from(region)] {
         "note" | "note_quote" => 1,
         "marginal_note" => 2,

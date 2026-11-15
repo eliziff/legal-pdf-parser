@@ -95,6 +95,12 @@ pub(crate) fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &c
         let source_switches = column_switches(lines, body, model, page_width);
         let source_run = median_column_run(lines, body, model, page_width);
         let source_hyphens = hyphen_join_score(lines, body);
+        let boxed_body = body.iter().filter(|&&slot| has_valid_bbox(&lines[slot]) && !lines[slot].exclude_from_body).count();
+        let minimum_switches = if source_hyphens.0 > 0 { 3 } else { 5 }.max((boxed_body as f64 * 0.10) as usize);
+        // (A source changing column fewer times than that stands, whatever the challenger reads: it is not read.)
+        if source_switches < minimum_switches {
+            return source_switches > 2;
+        }
         // The challenger: the lines in pdf-inspector's reading order; the source order stands unless
         // it fixes the columns' interleaving and breaks no hyphenated word.
         let mut kept = vec![false; lines.len()];
@@ -109,8 +115,6 @@ pub(crate) fn arbitrate_body_order(page: &Page, body: &mut Vec<usize>, items: &c
         }
         let challenger_switches = column_switches(lines, &challenger, model, page_width);
         let challenger_hyphens = hyphen_join_score(lines, &challenger);
-        let boxed_body = body.iter().filter(|&&slot| has_valid_bbox(&lines[slot]) && !lines[slot].exclude_from_body).count();
-        let minimum_switches = if source_hyphens.0 > 0 { 3 } else { 5 }.max((boxed_body as f64 * 0.10) as usize);
         // A source changing column at nearly every line (half its column runs a line or two long) reads the page's
         // rows across both columns: its hyphen joins pair one column's word with the other's line, and prove
         // nothing; the challenger reading the columns one after the other stands.

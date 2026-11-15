@@ -32,6 +32,9 @@ pub(crate) struct TemplateView {
 /// A template row's width (`Stylesheet::rows`), as DOC's stylesheet stage reads it.
 pub(crate) const ROW: usize = 20;
 
+/// An outline anchor's levels DOC reads (0 for none): a deeper level reads as the deepest.
+pub(crate) const ANCHORS: u16 = 10;
+
 /// A line feature's place among `LINE_FEATURES`.
 pub(crate) fn feature(name: &str) -> usize {
     LINE_FEATURES.iter().position(|n| *n == name).expect("a line feature")
@@ -70,7 +73,7 @@ impl Stylesheet {
         let mut anchor = vec![0u16; n];
         for found in &decision.anchors {
             for slot in &found.lines {
-                anchor[fences.place[slot.index()] as usize] = found.level.max(1);
+                anchor[fences.place[slot.index()] as usize] = found.level.clamp(1, ANCHORS - 1);
             }
         }
         let mut views = vec![TemplateView::default(); count];
@@ -114,7 +117,8 @@ impl Stylesheet {
 
     /// Each template's row as DOC's stylesheet stage reads it: its measures, the mean of its lines' look and place, the
     /// share of them opening on a marker, and where in the document it first stands. Three cells hold what the export
-    /// was fitted on and no reader now gives: a heading share uniform over the classes, and two zeros.
+    /// was fitted on and no reader now gives: a heading share uniform over the classes, and two zeros. Each cell within
+    /// ±8, a cell of no number 0: the reader's range.
     pub(crate) fn rows(&self, table: &LineTable, measures: &Measures) -> Vec<[f32; ROW]> {
         let count = self.templates.len();
         let at = ["size", "bold", "upper", "centre", "indent", "length", "width"].map(feature);
@@ -135,7 +139,7 @@ impl Stylesheet {
             r[..11].copy_from_slice(&[v.lines, v.pages, uniform, v.monotone, v.anchored, v.anchor_level, v.level, v.edge, v.beside, 0.0, 0.0]);
             r[11..19].iter_mut().zip(sums[t]).for_each(|(out, sum)| *out = sum / lines[t].max(1.0));
             r[19] = first[t].map_or(1.0, |k| k as f32 / n.max(1) as f32);
-            r
+            r.map(|v| if v.is_finite() { v.clamp(-8.0, 8.0) } else { 0.0 })
         }).collect()
     }
 }

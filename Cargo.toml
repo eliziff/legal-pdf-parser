@@ -13,7 +13,7 @@ resolver = "2"
 
 # First-party dependencies are the independent main checkouts beside this repository.
 [workspace.dependencies]
-legal-structure = { path = "../legal-structure" }
+legal-structure = { path = "../legal-structure", default-features = false }
 legal-layout = { path = "../legal-structure/layout" }
 legal-structure-model = { path = "../legal-structure/model" }
 legal-locator = { path = "../legal-structure/locator" }
@@ -23,7 +23,8 @@ pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 
 [features]
 default = []
-pdf = ["dep:legal-pdf-pages", "dep:legal-pdf-core", "dep:legal-pdf-extraction-processor", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:serde", "dep:serde_json", "dep:sha2"]
+pdf-lite = ["dep:legal-pdf-pages", "dep:legal-pdf-core", "dep:legal-pdf-extraction-processor", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:serde", "dep:serde_json", "dep:sha2"]
+pdf = ["pdf-lite", "legal-structure/default"]
 language = ["dep:legal-pdf-core", "dep:legal-pdf-language"]
 ocr = ["pdf", "dep:legal-pdf-ocr"]
 indra = ["ocr"]
@@ -51,7 +52,7 @@ legal-pdf-core = { path = "legal-pdf-core", optional = true }
 legal-pdf-extraction-processor = { path = "legal-pdf-extraction-processor", optional = true }
 legal-pdf-language = { path = "legal-pdf-language", optional = true }
 legal-pdf-ocr = { path = "legal-pdf-ocr", optional = true }
-legal-pdf-structure = { path = "legal-pdf-structure", optional = true }
+legal-pdf-structure = { path = "legal-pdf-structure", default-features = false, optional = true }
 legal-pdf-support = { path = "legal-pdf-support", optional = true }
 legal-pdf-pages = { path = "legal-pdf-pages", optional = true }
 legal-structure = { workspace = true }
@@ -77,7 +78,8 @@ debug = 0
 incremental = true
 
 [profile.release]
-codegen-units = 16
+lto = "thin"
+codegen-units = 1
 incremental = false
 strip = true
 

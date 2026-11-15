@@ -109,7 +109,7 @@ impl PdfDocument {
         Self { evidence: Arc::new(evidence), printed: OnceLock::new(), structure, authority_text_units, summary }
     }
 
-    /// The pages passages are read from: the extraction witnesses.
+    /// The pages as the structure read them, whose lines its source fragments and line labels name.
     pub fn passage_pages(&self) -> Arc<Vec<Page>> {
         Arc::clone(&self.evidence)
     }

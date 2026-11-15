@@ -20,7 +20,7 @@ fn file_bytes<'a>(files: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]
     files.iter().find(|(entry, _)| entry == name).map(|(_, bytes)| bytes.as_slice())
 }
 
-fn replace_file(files: &mut Vec<(String, Vec<u8>)>, name: &str, bytes: Vec<u8>) {
+pub(crate) fn replace_file(files: &mut Vec<(String, Vec<u8>)>, name: &str, bytes: Vec<u8>) {
     match files.iter_mut().find(|(entry, _)| entry == name) {
         Some((_, value)) => *value = bytes,
         None => files.push((name.to_owned(), bytes)),
@@ -273,6 +273,8 @@ pub struct DocxSupraCleanup {
     pub bookmarks_added: usize,
     pub restarted_numbering: bool,
     pub unsafe_or_split_fields: usize,
+    /// Each paragraph's conversion, written as a tracked change.
+    pub changes: Vec<crate::docx_tracked::AppliedChange>,
 }
 
 struct SupraAnalysis {
@@ -390,7 +392,7 @@ fn analyze_supras(xml: &str) -> Result<SupraAnalysis> {
     Ok(analysis)
 }
 
-fn read_docx_files(bytes: &[u8], wanted: Option<&[&str]>) -> Result<Vec<(String, Vec<u8>)>> {
+pub(crate) fn read_docx_files(bytes: &[u8], wanted: Option<&[&str]>) -> Result<Vec<(String, Vec<u8>)>> {
     const MAX_EXPANDED_BYTES: u64 = 96 * 1024 * 1024;
     const MAX_XML_PART_BYTES: u64 = 16 * 1024 * 1024;
     const MAX_XML_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
@@ -449,7 +451,7 @@ fn read_docx_files(bytes: &[u8], wanted: Option<&[&str]>) -> Result<Vec<(String,
     Ok(files)
 }
 
-fn write_docx_files(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+pub(crate) fn write_docx_files(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     for (name, value) in files {
@@ -841,7 +843,15 @@ fn noteref_field(attributes: &str, properties: &str, name: &str, number: &str) -
     [run(begin), run(&instruction), run(separate), plain_run(attributes, properties, number), run(end)].concat()
 }
 
-fn convert_safe_paragraphs(xml: &str, names: &HashMap<usize, String>) -> Result<(String, usize)> {
+/// Each paragraph's converted runs as one tracked change by "Beaver": the runs as they were deleted, as converted inserted.
+struct Tracking {
+    next: u64,
+    date: String,
+    changes: Vec<crate::docx_tracked::AppliedChange>,
+}
+
+fn convert_safe_paragraphs(xml: &str, names: &HashMap<usize, String>, tracking: &mut Tracking) -> Result<(String, usize)> {
+    static TEXT: LazyLock<Regex> = LazyLock::new(|| literal(r"<(/?)w:t([\s>/])"));
     let (mut output, mut cursor, mut converted) = (String::with_capacity(xml.len()), 0, 0);
     for paragraph in PARAGRAPH.find_iter(xml) {
         output.push_str(&xml[cursor..paragraph.start()]);
@@ -878,11 +888,25 @@ fn convert_safe_paragraphs(xml: &str, names: &HashMap<usize, String>) -> Result<
                 converted += 1;
             }
             replacement.push_str(&plain(&node.text[text_cursor..]));
-            edits.push((node.run_start, node.run_end, replacement));
+            edits.push((node.run_start, node.run_end, replacement, node));
         }
         let mut next = paragraph.as_str().to_owned();
         edits.sort_by_key(|edit| std::cmp::Reverse(edit.0));
-        for (start, end, replacement) in edits {
+        if let (Some(last), Some(first)) = (edits.first(), edits.last()) {
+            let (del, ins) = (tracking.next, tracking.next + 1);
+            tracking.next += 2;
+            let text = edits.iter().rev().map(|edit| edit.3.text.as_str()).collect::<String>();
+            tracking.changes.push(crate::docx_tracked::AppliedChange { id: format!("{del}:{ins}"), del_id: Some(del.to_string()), ins_id: Some(ins.to_string()),
+                deleted_text: text.clone(), inserted_text: text.clone(), context_before: visible[..first.3.visible_start].to_owned(),
+                context_after: visible[last.3.visible_end..].to_owned(), reason: Some("Link supra references to native Word note numbers".to_owned()),
+                diff: [crate::docx_tracked::DiffKind::Delete, crate::docx_tracked::DiffKind::Insert].map(|kind| crate::docx_tracked::EditDiffSegment { kind, text: text.clone() }).into() });
+            let wrap = |tag: &str, id: u64, content: &str| format!(r#"<w:{tag} w:id="{id}" w:author="Beaver" w:date="{}">{content}</w:{tag}>"#, tracking.date);
+            for (start, end, replacement, _) in &mut edits {
+                let deleted = TEXT.replace_all(&next[*start..*end], "<${1}w:delText${2}").into_owned();
+                *replacement = wrap("del", del, &deleted) + &wrap("ins", ins, replacement);
+            }
+        }
+        for (start, end, replacement, _) in edits {
             next.replace_range(start..end, &replacement);
         }
         output.push_str(&next);
@@ -908,6 +932,7 @@ pub fn fix_docx_supra_cross_references(bytes: &[u8]) -> Result<DocxSupraCleanup>
         bookmarks_added: 0,
         restarted_numbering,
         unsafe_or_split_fields: review_required,
+        changes: Vec::new(),
     };
     if detected == 0 || restarted {
         return Ok(unchanged(detected.saturating_sub(already_linked), restarted));
@@ -915,18 +940,24 @@ pub fn fix_docx_supra_cross_references(bytes: &[u8]) -> Result<DocxSupraCleanup>
     let ordinals = body.ordinals.union(&notes.ordinals).copied().collect();
     let reference_ids = footnote_reference_ids(&document);
     let (bookmarked, names, bookmarks_added) = add_target_bookmarks(document, &reference_ids, &ordinals);
-    let (next_document, body_converted) = convert_safe_paragraphs(&bookmarked, &names)?;
-    let (next_footnotes, note_converted) = convert_safe_paragraphs(&footnotes, &names)?;
+    // A document with no pending revisions (refused below otherwise) has no revision ids to avoid.
+    let mut tracking = Tracking { next: 1, date: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(), changes: Vec::new() };
+    let (next_document, body_converted) = convert_safe_paragraphs(&bookmarked, &names, &mut tracking)?;
+    let (next_footnotes, note_converted) = convert_safe_paragraphs(&footnotes, &names, &mut tracking)?;
     let converted = body_converted + note_converted;
     let review_required = detected.saturating_sub(converted + already_linked);
     if converted == 0 {
         return Ok(unchanged(review_required, false));
     }
+    if !crate::docx_tracked::docx_tracked_change_ids(bytes)?.is_empty() {
+        return Err(Error::Message("Accept or reject pending tracked changes before fixing supra references".to_owned()));
+    }
     let mut files = read_docx_files(bytes, None)?;
     replace_file(&mut files, "word/document.xml", next_document.into_bytes());
     replace_file(&mut files, "word/footnotes.xml", next_footnotes.into_bytes());
     let bytes = write_docx_files(&files)?;
-    Ok(DocxSupraCleanup { bytes, detected, converted, already_linked, review_required, bookmarks_added, restarted_numbering: false, unsafe_or_split_fields: review_required })
+    Ok(DocxSupraCleanup { bytes, detected, converted, already_linked, review_required, bookmarks_added, restarted_numbering: false,
+        unsafe_or_split_fields: review_required, changes: tracking.changes })
 }
 
 fn nested_word_elements<'a>(element: &'a XmlElement, wanted: &str) -> Vec<&'a XmlElement> {

@@ -6,6 +6,7 @@
 //! note label, its reference tokens, the lexicon its words match, and its citations; and the
 //! document's bookmarks, the page labels it declares and whether it is an instrument.
 
+use legal_pdf_core::profile::tally;
 use legal_pdf_core::model::{Line, Page, PdfOutlineEntry};
 use legal_pdf_core::{flag_share, median};
 use crate::furniture::compact_note_line;
@@ -155,13 +156,29 @@ fn title_shaped(text: &str) -> bool {
     !text.is_empty() && text.split_whitespace().count() <= 12 && !sentence_ended(text) && !text.ends_with([',', ';', ':'])
 }
 
-/// A line opening with a division's word and number, as the heading ladder reads one
-/// (`rules::enumerator`): a part, an article, a schedule, a division or a chapter, in English or
-/// French.
-fn division_word(text: &str) -> bool {
-    headings::rules::enumerator(text).is_some_and(|(_, word)| {
-        matches!(word.as_str(), "part" | "partie" | "article" | "schedule" | "annexe" | "division" | "chapter" | "chapitre")
-    })
+/// The words a heading's number may follow, its number counting under the word ("PART II", "Article 5", "SCHEDULE A").
+const HEADING_WORDS: [&str; 15] = [
+    "part", "section", "article", "chapter", "schedule", "division", "title", "book", "appendix", "annex", "exhibit",
+    "count", "partie", "chapitre", "annexe",
+];
+
+/// A line opening with a division's word and number (`marker_readings`): a part, an article, a schedule, a division or a
+/// chapter, in English or French. A section, a title, a book, an appendix, an exhibit or a count is no division.
+fn division_word(text: &str, readings: &[MarkerReading]) -> bool {
+    let word = text.split_whitespace().next().unwrap_or("").to_lowercase();
+    matches!(word.as_str(), "part" | "partie" | "article" | "schedule" | "annexe" | "division" | "chapter" | "chapitre")
+        && readings.iter().any(|reading| reading.family.starts_with(&format!("{word}:")))
+}
+
+/// A heading's number as it opens its line, a stop or a bracket after it ("4.", "4.1", "iv.", "B)"), alone or before its
+/// title.
+pub(crate) fn enumerated(text: &str) -> bool {
+    enumerated_in(&marker_readings(text, false))
+}
+
+/// `enumerated`, of a line's readings.
+pub(crate) fn enumerated_in(readings: &[MarkerReading]) -> bool {
+    readings.iter().any(|reading| !reading.worded() && (reading.family.starts_with(".:") || reading.family.starts_with("):") || reading.family.contains("1.1")))
 }
 
 /// A court's name and nothing else, as a caption's header prints it: "IN THE COURT OF APPEAL FOR
@@ -176,6 +193,9 @@ fn court_name(text: &str) -> bool {
     const JOIN: &str = r"(?i:of|for|the|and|de|du|des|la|le|d'|d’|l'|l’)";
     const FRENCH: &str = r"(?i:sup[ée]rieure|supr[êe]me|f[ée]d[ée]rale|provinciale|municipale|d['’]appel)";
     let text = text.trim();
+    if !text.starts_with(char::is_uppercase) || !text.contains("our") && !text.contains("OUR") {
+        return false;
+    }
     let lower = text.to_lowercase();
     let before = lower.split("cour").next().unwrap_or("");
     text.starts_with(char::is_uppercase)
@@ -190,15 +210,18 @@ fn court_name(text: &str) -> bool {
 }
 
 /// The lexicon a line's words match (`WORD_*`), the citation title aside.
-fn lexicon(line: &Line) -> u32 {
+fn lexicon(line: &Line, readings: &[MarkerReading]) -> u32 {
     let text = line.text.trim();
+    let party = party_label().is_match(text);
+    let speaker = legal_structure::transcript::speaker_label(text).is_some();
+    let lower = text.to_ascii_lowercase();
     bits([
-        (WORD_LABEL, headings::rules::label(text)),
-        (WORD_PARTY, party_label().is_match(text)),
+        (WORD_LABEL, party || headings::rules::label_unless_party(text)),
+        (WORD_PARTY, party),
         (WORD_JURAT, jurat(text)),
         (WORD_DATE, date_line(text)),
-        (WORD_FIELD, captions::field(&line.text).is_some()),
-        (WORD_CLOSING, captions::closing(&line.text)),
+        (WORD_FIELD, captions::field_in(&line.text, &lower).is_some()),
+        (WORD_CLOSING, captions::closing_in(&lower)),
         (WORD_REASONS, captions::reasons(line)),
         (WORD_SIGNATURE, legal_structure::judgment::signature_line(text)),
         (WORD_AUTHOR, legal_structure::judgment::author_line(text)),
@@ -206,15 +229,15 @@ fn lexicon(line: &Line) -> u32 {
         (WORD_EXAMINATION, headings::rules::examination(text)),
         (WORD_TRANSCRIPT_PART, headings::rules::transcript_part(text)),
         (WORD_HEARING_PART, headings::rules::hearing_part(text)),
-        (WORD_TURN, headings::rules::turn_or_event(text)),
+        (WORD_TURN, speaker || headings::rules::event(text)),
         (WORD_INDEX_ENTRY, headings::rules::index_entry(text)),
-        (WORD_SPEAKER, legal_structure::transcript::speaker_label(text).is_some()),
+        (WORD_SPEAKER, speaker),
         (WORD_NOTES_HEADING, endnote_heading(text)),
         (WORD_RESET_HEADING, structural_reset_heading(text)),
         (WORD_CONTENTS_TITLE, contents_lists::contents_title(text)),
         (WORD_INDEX_LETTER, contents_lists::index_letter(text)),
         (WORD_HISTORY, legal_structure::statute::history_note(text)),
-        (WORD_DIVISION, division_word(text)),
+        (WORD_DIVISION, division_word(text, readings)),
         (WORD_COURT, court_name(text)),
     ])
 }
@@ -245,14 +268,25 @@ pub(crate) fn reference_marks(line: &Line, size: f64) -> impl Iterator<Item = (&
     })
 }
 
+/// A line's references read once: its reference tokens (`REFERENCE_*`), and its marks and calls.
+pub(crate) struct References {
+    pub(crate) tokens: u8,
+    pub(crate) marks: Vec<(u32, u32, u32)>,
+    pub(crate) calls: Vec<(u32, u32, u32)>,
+}
+
 /// A line's reference marks (`reference_marks`) with where each stands in the line's text: its value
 /// (0 for a note symbol) and its first and past-last UTF-16 code unit. A mark is found by its span's text,
 /// spans read in order along the line; one whose text the line does not hold there is left out. A
-/// detached reference stands where it says.
-pub(crate) fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
+/// detached reference stands where it says. Its marks (`Evidence::marks`) take the figures recognition runs straight on
+/// from a word too (a mark for the notes to answer, or no one's); its calls (`Evidence::calls`) only the marks set apart
+/// from the text. Its tokens are how its marks are set, whether it holds a detached reference and figures glued to a
+/// word (`REFERENCE_*`), its type set at `size`.
+pub(crate) fn references(line: &Line, size: f64) -> References {
     let value = |text: &str| text.trim().parse().unwrap_or(0);
     let chars: Vec<char> = line.text.chars().collect();
-    let marks: Vec<&str> = reference_marks(line, size).map(|(text, _)| text).collect();
+    let (marks, set): (Vec<&str>, Vec<u8>) = reference_marks(line, size).unzip();
+    let mut tokens = set.into_iter().fold(0, |found, set| found | set);
     let mut found: Vec<(u32, u32, u32)> = Vec::new();
     let mut cursor = 0;
     for span in &line.spans {
@@ -275,21 +309,29 @@ pub(crate) fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
         }
     }
     // Figures run on after a word's punctuation ("count.12 This", "Act;3"), where no span sets them apart.
-    // Recognition sets a raised mark on the line's own run of text: figures run straight on from a word or its
-    // abbreviation ("Ontario1", "Reid J.2") are a mark for the notes to answer, or no one's.
-    let recognized = line.source == "ocr" || line.spans.iter().any(|span| span.flags & legal_pdf_core::model::INVISIBLE != 0);
-    let run_on = regex!(r"[\p{L}.,;:)\]\u{201d}\u{2019}\u{bb}](\d{1,3})(?:[\s.,;:)]|$)");
-    for pattern in [Some(glued_re()), recognized.then_some(run_on)].into_iter().flatten() {
+    let run_on = |pattern: &Regex, found: &mut Vec<(u32, u32, u32)>| {
+        let mut any = false;
         for found_at in pattern.captures_iter(&line.text).filter_map(|c| c.get(1)) {
+            any = true;
             let start = line.text[..found_at.start()].chars().count() as u32;
             let end = start + found_at.as_str().chars().count() as u32;
             if !found.iter().any(|&(_, a, b)| a < end && start < b) {
                 found.push((value(found_at.as_str()), start, end));
             }
         }
+        any
+    };
+    if run_on(glued_re(), &mut found) {
+        tokens |= REFERENCE_GLUED;
+    }
+    let mut calls = found.clone();
+    // Recognition sets a raised mark on the line's own run of text: figures run straight on from a word or its
+    // abbreviation ("Ontario1", "Reid J.2") are a mark for the notes to answer, or no one's.
+    if line.source == "ocr" || line.spans.iter().any(|span| span.flags & legal_pdf_core::model::INVISIBLE != 0) {
+        run_on(regex!(r"[\p{L}.,;:)\]\u{201d}\u{2019}\u{bb}](\d{1,3})(?:[\s.,;:)]|$)"), &mut found);
     }
     // A detached reference stands where it says, its blank edges trimmed.
-    for r in &line.detached_references {
+    let detached: Vec<(u32, u32, u32)> = line.detached_references.iter().map(|r| {
         let (mut start, mut end) = (r.start_offset.min(chars.len()), r.end_offset.min(chars.len()));
         while start < end && chars[start].is_whitespace() {
             start += 1;
@@ -297,13 +339,20 @@ pub(crate) fn reference_spans(line: &Line, size: f64) -> Vec<(u32, u32, u32)> {
         while end > start && chars[end - 1].is_whitespace() {
             end -= 1;
         }
-        found.push((value(&r.selected_text), start as u32, end as u32));
+        (value(&r.selected_text), start as u32, end as u32)
+    }).collect();
+    if !detached.is_empty() {
+        tokens |= REFERENCE_DETACHED;
     }
-    found.sort_by_key(|&(_, start, _)| start);
     // Found among the line's characters (as recognition places a detached reference), each mark stands in the line's
     // UTF-16 code units, as the structure places text.
     let units: Vec<u32> = std::iter::once(0).chain(chars.iter().scan(0, |sum, c| { *sum += c.len_utf16() as u32; Some(*sum) })).collect();
-    found.into_iter().map(|(value, start, end)| (value, units[start as usize], units[end as usize])).collect()
+    let placed = |mut found: Vec<(u32, u32, u32)>| {
+        found.extend_from_slice(&detached);
+        found.sort_by_key(|&(_, start, _)| start);
+        found.into_iter().map(|(value, start, end)| (value, units[start as usize], units[end as usize])).collect()
+    };
+    References { tokens, marks: placed(found), calls: placed(calls) }
 }
 
 /// A line's text with the space a recognizer leaves inside its opening bracket closed up ("[ 13] Having ...").
@@ -316,7 +365,7 @@ fn closed_up(text: &str) -> std::borrow::Cow<'_, str> {
 
 /// Every reading of a line's opening token by the numbering grammar: read alone and, where a single
 /// letter is also a roman numeral, as the letter after the letter before it ("(i)" as 1 and after
-/// "(h)"); and, where `division` says the line opens on a division word, the number after the word.
+/// "(h)"); and, where `division` asks and the line opens on a heading's word (`HEADING_WORDS`), the number after the word.
 pub(crate) fn marker_readings(text: &str, division: bool) -> Vec<MarkerReading> {
     let text = closed_up(text);
     let mut tokens = text.split_whitespace();
@@ -341,7 +390,7 @@ pub(crate) fn marker_readings(text: &str, division: bool) -> Vec<MarkerReading> 
             .collect::<Vec<_>>()
     };
     let mut found = read(first, None);
-    if division && first.chars().count() > 1 && first.chars().all(char::is_alphabetic) {
+    if division && HEADING_WORDS.contains(&first.to_lowercase().as_str()) {
         if let Some(number) = tokens.next() {
             found.extend(read(number.trim_end_matches(['.', ':', '\u{2014}', '-']), Some(first)));
         }
@@ -350,22 +399,20 @@ pub(crate) fn marker_readings(text: &str, division: bool) -> Vec<MarkerReading> 
     found
 }
 
-/// A line's reference tokens (`REFERENCE_*`), its type set at `size`.
-fn reference_tokens(line: &Line, size: f64) -> u8 {
-    let marks = reference_marks(line, size).fold(0, |found, (_, set)| found | set);
-    marks | bits([(REFERENCE_DETACHED, !line.detached_references.is_empty()), (REFERENCE_GLUED, glued_re().is_match(&line.text))])
+/// A line's heading numbers (`MarkerReading::heading`), a heading word's among them.
+pub(crate) fn heading_numbers(text: &str) -> Vec<MarkerReading> {
+    marker_readings(text, true).into_iter().filter(MarkerReading::heading).collect()
 }
 
-/// The line's opening marker (`Marker`): the first of its token's readings (`marker_readings`), its family named in
-/// `families`.
-fn opening_marker(line: &Line, families: &mut Names) -> Option<Marker> {
-    let reading = marker_readings(&line.text, false).into_iter().next()?;
+/// The line's opening marker (`Marker`): the first of its token's readings (`readings`), its family named in `families`.
+fn opening_marker(line: &Line, readings: &[MarkerReading], families: &mut impl FnMut(&str) -> u16) -> Option<Marker> {
+    let reading = readings.first().filter(|reading| !reading.worded())?;
     let text = closed_up(&line.text);
     let text = text.trim_start();
     let token = text.split_whitespace().next()?;
     let end = line.text.len() - text.len() + token.len();
     Some(Marker {
-        family: families.id(&reading.family),
+        family: families(&reading.family),
         value: reading.value,
         depth: reading.prefix.len().min(usize::from(u8::MAX)) as u8,
         end: end.min(usize::from(u16::MAX)) as u16,
@@ -422,12 +469,23 @@ pub(crate) fn note_label(page: &Page, slot: usize) -> Option<NoteLabel> {
     })
 }
 
-/// An instrument's operative words.
-const OPERATIVE: &str = r"(?i)\b(?:shall|hereby|herein|hereto|hereof|hereunder|hereinafter|thereof|whereas|aux présentes|doit|doivent)\b";
+/// An instrument's operative words, and the words it names itself and its own parts by ("this Act", "la présente loi").
+const OPERATIVE: &str = r"(?i)\b(?:shall|hereby|herein|hereto|hereof|hereunder|hereinafter|thereof|whereas|aux présentes|doit|doivent|this (?:act|regulation|by-?law|section|subsection|agreement|part|rule|code|order|policy|lease|contract)|these (?:rules|regulations|by-?laws)|la présente loi|le présent (?:règlement|code|contrat|article)|du présent|de la présente|des présentes)\b";
 
 /// A text's words (two letters or more), and how many of them are operative (`OPERATIVE`).
 fn operative_words(text: &str) -> (usize, usize) {
-    (regex!(r"[A-Za-zÀ-ÿ]{2,}").find_iter(text).count(), regex!(OPERATIVE).find_iter(text).count())
+    // (The words: each run of two or more letters of A-Z, a-z and À-ÿ.)
+    let letter = |c: char| c.is_ascii_alphabetic() || ('\u{c0}'..='\u{ff}').contains(&c);
+    let (mut words, mut run) = (0, 0);
+    for c in text.chars().chain([' ']) {
+        if letter(c) {
+            run += 1;
+        } else {
+            words += usize::from(run >= 2);
+            run = 0;
+        }
+    }
+    (words, regex!(OPERATIVE).find_iter(text).count())
 }
 
 /// The evidence read off the pages: every page, line and the document measured once (`measure`), the citations on the
@@ -448,29 +506,60 @@ pub(crate) fn measure(pages: &[Page],
     let mut evidence = Evidence { beside: vec![None; count], ..Evidence::default() };
     let (mut faces, mut families) = (Names::default(), Names::default());
     let (mut words, mut operative) = (0, 0);
-    for (page_slot, page) in pages.iter().enumerate() {
+    // Each page's rows and lines read on its own, the pages on every core; the names they use (faces, marker families)
+    // numbered after, in the lines' order, as one reading down the document numbers them.
+    let numbered: Vec<usize> = (0..pages.len()).collect();
+    let measured = tally("measure.pages", || legal_pdf_core::parallel::each(&numbered, |&page_slot| {
+        let page = &pages[page_slot];
         let first = slots.on(page_slot).start as usize;
-        let rows = page_rows(page);
-        for (at, line) in page.lines.iter().enumerate() {
+        let rows = tally("measure.rows", || page_rows(page));
+        let lines: Vec<_> = page.lines.iter().enumerate().map(|(at, line)| {
             let text = line.text.trim();
             let face = dominant_face(line);
-            evidence.face.push(face.map_or(u16::MAX, |(face, _)| faces.id(face)));
-            evidence.half_points.push(face.map_or(0, |(_, size)| (size * 2.0).round().clamp(0.0, f64::from(u16::MAX)) as u16));
             let underlined = !line.words.is_empty() && line.words.iter().filter(|word| word.underlined).count() * 2 > line.words.len();
-            evidence.look.push(bits([
+            let look = bits([
                 (LOOK_BOLD, bold_char_share(line) >= 0.5),
                 (LOOK_ITALIC, flag_share(line, ITALIC).unwrap_or(0.0) > 0.5),
                 (LOOK_CAPS, all_caps(text)),
                 (LOOK_UNDERLINED, underlined),
-            ]));
-            evidence.tag.push(SourceTag::of(line));
-            evidence.marker.push(opening_marker(line, &mut families));
-            evidence.label.push(note_label(page, at));
-            evidence.references.push(reference_tokens(line, line.size));
-            evidence.title_shaped.push(title_shaped(text));
-            evidence.words.push(lexicon(line));
-            if !line_numbers[first + at] {
-                let (read, found) = operative_words(&line.text);
+            ]);
+            let tag = SourceTag::of(line);
+            let readings = marker_readings(&line.text, true);
+            let mut family = None;
+            let marker = opening_marker(line, &readings, &mut |name| {
+                family = Some(name.to_owned());
+                u16::MAX
+            });
+            let label = note_label(page, at);
+            let References { tokens: references, marks, calls } = references(line, line.size);
+            let title = title_shaped(text);
+            let lexicon = lexicon(line, &readings);
+            let counted = (!line_numbers[first + at]).then(|| operative_words(&line.text));
+            (face, look, tag, readings, marker.map(|marker| (marker, family)), label, references, marks, calls, title, lexicon, counted)
+        }).collect();
+        (rows, lines)
+    }));
+    for ((page_slot, page), (rows, lines)) in pages.iter().enumerate().zip(measured) {
+        let first = slots.on(page_slot).start as usize;
+        for (face, look, tag, readings, marker, label, references, marks, calls, title, lexicon, counted) in lines {
+            evidence.face.push(face.map_or(u16::MAX, |(face, _)| faces.id(face)));
+            evidence.half_points.push(face.map_or(0, |(_, size)| legal_pdf_core::rounded(size * 2.0).clamp(0.0, f64::from(u16::MAX)) as u16));
+            evidence.look.push(look);
+            evidence.tag.push(tag);
+            evidence.marker.push(marker.map(|(mut marker, family)| {
+                if let Some(family) = family {
+                    marker.family = families.id(&family);
+                }
+                marker
+            }));
+            evidence.label.push(label);
+            evidence.references.push(references);
+            evidence.marks.push(marks);
+            evidence.calls.push(calls);
+            evidence.title_shaped.push(title);
+            evidence.words.push(lexicon);
+            evidence.readings.push(readings);
+            if let Some((read, found)) = counted {
                 words += read;
                 operative += found;
             }
@@ -514,11 +603,12 @@ pub(crate) fn measure(pages: &[Page],
             }
         }
     }
-    read_citations(&mut evidence, pages, slots, &line_numbers);
+    tally("measure.citations", || read_citations(&mut evidence, pages, slots, &line_numbers));
     evidence.outline_usable = headings::bookmarks::usable(outline, pages.len());
     evidence.outline_complete = headings::bookmarks::complete(outline, pages.len());
-    evidence.instrument = instrument || words >= 200 && operative * 1000 >= words * 6;
-    evidence.operative = if instrument { 1000.0 } else if words >= 200 { (operative * 1000) as f32 / words as f32 } else { 0.0 };
+    // A proceeding's document (an order, reasons, an affidavit under its style of cause) is none, however operative its words.
+    evidence.instrument = instrument
+        || words >= 200 && operative * 1000 >= words * 6 && !captions::proceeding(pages.iter().flat_map(|page| &page.lines).map(|line| line.text.as_str()));
     evidence.faces = faces.names;
     evidence.families = families.names;
     evidence.line_number = line_numbers;
@@ -533,6 +623,9 @@ pub(crate) fn measure(pages: &[Page],
 /// lines name the case by its citation.
 pub(crate) fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Slots, line_numbers: &[bool]) {
     let count = slots.len();
+    // A figure the note pairer could read as a reference is protected by a citation holding it; a document no line of
+    // which opens on a note's label has no notes to pair, and its figures are read for no one.
+    let noted = evidence.label.iter().any(Option::is_some);
     let mut wanted: Vec<bool> = (0..count)
         .map(|slot| {
             !line_numbers[slot]
@@ -541,7 +634,7 @@ pub(crate) fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Sl
                     || evidence.references[slot] != 0
                     || evidence.title_shaped[slot]
                     || slots.page(Slot(slot as u32)) < 2
-                    || slots.line(pages, Slot(slot as u32)).text.chars().any(char::is_numeric))
+                    || noted && slots.line(pages, Slot(slot as u32)).text.chars().any(char::is_numeric))
         })
         .collect();
     let seeds = wanted.clone();
@@ -584,15 +677,19 @@ pub(crate) fn read_citations(evidence: &mut Evidence, pages: &[Page], slots: &Sl
                     (from < to).then(|| (slot, byte as u32, (from - byte) as u32, (to - byte) as u32))
                 })
         };
-        for citation in legal_structure::analysis::citation_spans(&window) {
-            for (slot, byte, from, to) in on_lines(citation.range.start, citation.range.end) {
-                let core_from = (citation.core_range.start as u32).saturating_sub(byte).clamp(from, to);
-                let core_to = (citation.core_range.end as u32).saturating_sub(byte).clamp(core_from, to);
+        // The window read in one call: the finder's work is set up per call, so a window read in its runs costs it
+        // three times over (measured: 4.4 s against 1.5 s over the structure gold's 23 documents).
+        let citations = tally("citations.find", || legal_structure::analysis::citation_spans(&window));
+        let protected = tally("citations.protected", || legal_structure::analysis::protected_citation_spans(&window));
+        for (range, core_range) in citations.iter().map(|citation| (citation.range.clone(), citation.core_range.clone())) {
+            for (slot, byte, from, to) in on_lines(range.start, range.end) {
+                let core_from = (core_range.start as u32).saturating_sub(byte).clamp(from, to);
+                let core_to = (core_range.end as u32).saturating_sub(byte).clamp(core_from, to);
                 found.push(Cited { slot, range: (from, to), core: (core_from, core_to), protected: false });
             }
         }
         // The protected spans, in UTF-16 code units: each read back to bytes on its lines.
-        for (start, end) in legal_structure::analysis::protected_citation_spans(&window) {
+        for (start, end) in protected {
             let first = placed.partition_point(|&(_, _, unit)| unit <= start).saturating_sub(1);
             for at in (first..placed.len()).take_while(|&at| placed[at].2 < end) {
                 let (slot, _, unit) = placed[at];
@@ -662,10 +759,13 @@ pub(crate) fn reread(evidence: &mut Evidence, pages: &[Page], slots: &Slots, rep
         let page = &pages[page_slot];
         let line = slots.line(pages, *slot);
         let text = line.text.trim();
-        evidence.marker[at] = opening_marker(line, &mut families);
+        evidence.readings[at] = marker_readings(&line.text, true);
+        evidence.marker[at] = opening_marker(line, &evidence.readings[at], &mut |name| families.id(name));
         evidence.label[at] = note_label(page, (slot.0 - range.start) as usize);
+        let References { marks, calls, .. } = references(line, line.size);
+        (evidence.marks[at], evidence.calls[at]) = (marks, calls);
         evidence.title_shaped[at] = title_shaped(text);
-        evidence.words[at] = lexicon(line) | evidence.words[at] & WORD_CITATION_TITLE;
+        evidence.words[at] = lexicon(line, &evidence.readings[at]) | evidence.words[at] & WORD_CITATION_TITLE;
         // The words after the rewritten marker keep their citations, moved by what the marker
         // gained or lost.
         let after = before.len() - before.bytes().rev().zip(line.text.bytes().rev()).take_while(|(a, b)| a == b).count();

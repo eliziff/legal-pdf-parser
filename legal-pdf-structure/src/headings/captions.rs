@@ -23,10 +23,15 @@ pub(crate) enum Field {
 }
 
 pub(crate) fn field(text: &str) -> Option<Field> {
+    field_in(text, &text.trim().to_ascii_lowercase())
+}
+
+/// `field`, of a text and its trimmed text in lower case (`lower`).
+pub(crate) fn field_in(text: &str, lower: &str) -> Option<Field> {
     let labelled = text.contains(':');
-    let key = text.split_once(':').map_or(text, |(key, _)| key);
-    let key = key.trim().trim_end_matches('.').to_ascii_lowercase();
-    Some(match key.as_str() {
+    let key = lower.split_once(':').map_or(lower, |(key, _)| key);
+    let key = key.trim().trim_end_matches('.');
+    Some(match key {
         "court file no" | "court file number" | "court file numbers" | "file no" | "case no" | "case number" => Field::File,
         "court" => Field::Court,
         "judicial centre" | "judicial center" => Field::Place,
@@ -51,15 +56,37 @@ pub(crate) fn field(text: &str) -> Option<Field> {
     })
 }
 
+/// Whether a document's opening lines (its first 120) are a proceeding's: a style of cause (two party fields, or one
+/// with a file, docket, court, registry or citation field) under a title naming a court's or a party's document
+/// ("ORDER", "REASONS FOR JUDGMENT", "AFFIDAVIT OF JANE DOE", "NOTICE OF MOTION"). Such a document numbers its
+/// paragraphs, however operative its words; an instrument numbers its sections. A settlement filed under its style of
+/// cause carries no such title.
+pub(crate) fn proceeding<'a>(opening: impl Iterator<Item = &'a str>) -> bool {
+    let (mut parties, mut filed, mut titled) = (0, false, false);
+    for text in opening.take(120) {
+        match field(text) {
+            Some(Field::Parties) => parties += 1,
+            Some(Field::File | Field::Docket | Field::Court | Field::Registry | Field::Citation) => filed = true,
+            _ => {}
+        }
+        titled |= legal_pdf_core::regex!(r"(?i)^\W*(?:(?:amended|fresh as amended|draft|consent|interim|final|supplementary|reply|responding)\s+)*(?:order|judgment|reasons(?: for (?:judgment|decision|order|sentence))?|endorsement|decision|ruling|affidavit|factum|notice of (?:motion|application|appeal|action|civil claim)|statement of (?:claim|defence|defense)|memorandum of (?:argument|fact and law)|ordonnance|jugement|motifs(?: du jugement)?|décision|arrêt)\b.{0,40}$").is_match(text.trim());
+    }
+    titled && (parties >= 2 || parties == 1 && filed)
+}
+
 pub(crate) fn closing(text: &str) -> bool {
-    let text = text.trim().to_ascii_lowercase();
-    let key = text.split_once(':').map_or(text.as_str(), |(key, _)| key);
+    closing_in(&text.trim().to_ascii_lowercase())
+}
+
+/// `closing`, of a text trimmed and in lower case.
+pub(crate) fn closing_in(text: &str) -> bool {
+    let key = text.split_once(':').map_or(text, |(key, _)| key);
     matches!(
         key.trim(),
         "counsel" | "appearances" | "solicitors" | "participant information"
     ) || (!text.contains(':')
         && matches!(
-            text.as_str(),
+            text,
             "memorandum of judgment" | "judgment" | "endorsement"
         ))
         || text.starts_with("reasons for judgment")

@@ -22,11 +22,14 @@ fn layout_sources() -> PathBuf {
     PathBuf::from(env::var_os("DEP_LEGAL_STRUCTURE_MODEL_LAYOUT").expect("legal-structure-model publishes legal-layout's sources"))
 }
 
-/// The name a file is hashed under: its path in this checkout, or in legal-layout's under `legal-layout/`.
+/// The name a file is hashed under: its path in this checkout, in legal-layout's under `legal-layout/`, or in the
+/// legal-structure repository (legal-layout's parent) under `legal-structure/`.
 fn key_of(root: &Path, layout: &Path, file: &Path) -> String {
-    let key = match file.strip_prefix(layout) {
-        Ok(rest) => Path::new("legal-layout").join(rest),
-        Err(_) => file.strip_prefix(root).unwrap_or(file).to_owned(),
+    let structure = layout.parent().unwrap();
+    let key = match (file.strip_prefix(layout), file.strip_prefix(structure)) {
+        (Ok(rest), _) => Path::new("legal-layout").join(rest),
+        (_, Ok(rest)) => Path::new("legal-structure").join(rest),
+        _ => file.strip_prefix(root).unwrap_or(file).to_owned(),
     };
     key.to_string_lossy().replace('\\', "/")
 }
@@ -92,6 +95,14 @@ fn crate_inputs(root: &Path, name: &str) -> Vec<PathBuf> {
     inputs
 }
 
+/// The parser's own crates (`legal-pdf-NAME`, by path) a crate's manifest names, by NAME.
+fn parser_dependencies(root: &Path, name: &str) -> Vec<String> {
+    let manifest = fs::read_to_string(root.join(format!("legal-pdf-{name}/Cargo.toml"))).unwrap();
+    manifest.lines()
+        .filter_map(|line| line.split("path = \"../legal-pdf-").nth(1)?.split('"').next().map(str::to_owned))
+        .collect()
+}
+
 /// What measures a page's render beyond its text: the raster module and the shared render helpers.
 fn raster_sources(root: &Path) -> Vec<PathBuf> {
     ["legal-pdf-ocr/Cargo.toml", "legal-pdf-ocr/src/raster.rs", "legal-pdf-ocr/src/ocr.rs", "legal-pdf-ocr/src/separator.rs", "legal-pdf-core/src/ocr_contract.rs", "legal-pdf-core/src/render.rs"]
@@ -132,8 +143,15 @@ fn stage_inputs(root: &Path) -> [Vec<PathBuf>; 3] {
     // The structure stage reads pdf-inspector's layout too (columns, furniture, leaders, words'
     // joins, heading tiers, tables).
     document.extend(inspector_inputs(root, &[]));
-    // The structure stage, one crate: an edit to it is a new structure (and a new reader and document key).
+    // The structure stage, one crate, and the parser's crates it reads through (the page map's legal-pdf-pages): an
+    // edit to any is a new structure (and a new reader and document key).
     document.extend(crate_inputs(root, "structure"));
+    for name in parser_dependencies(root, "structure") {
+        document.extend(crate_inputs(root, &name));
+    }
+    // And the structure engine it reads a judgment's paragraphs, headings and counts through (legal-structure).
+    let engine = layout_sources().parent().unwrap().to_owned();
+    document.extend([engine.join("Cargo.toml"), engine.join("src")]);
     let layout = paths(&[
         "legal-pdf-core/Cargo.toml",
         "legal-pdf-core/src/model.rs",
@@ -150,7 +168,7 @@ fn stage_inputs(root: &Path) -> [Vec<PathBuf>; 3] {
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let enabled = |feature: &str| env::var_os(format!("CARGO_FEATURE_{feature}")).is_some();
-    let pdf = enabled("PDF");
+    let pdf = enabled("PDF") || enabled("PDF_LITE");
     let mut features: Vec<_> = env::vars_os()
         .filter_map(|(name, _)| {
             name.to_str()?

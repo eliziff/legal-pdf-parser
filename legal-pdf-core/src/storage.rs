@@ -90,6 +90,30 @@ pub fn write_gzip_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     })
 }
 
+/// `value` kept in the engine's own form: MessagePack, its fields named, gzip'd. Read back without parsing text
+/// (`read_gzip_packed`), what the engine keeps of its own work and reads again.
+pub fn write_gzip_packed<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let packed = rmp_serde::to_vec_named(value).map_err(|error| Error::Message(format!("{}: {error}", path.display())))?;
+    atomic_write_with(path, |writer| {
+        let mut gzip = GzBuilder::new().mtime(0).write(writer, Compression::fast());
+        io(path, gzip.write_all(&packed))?;
+        io(path, gzip.finish().map(drop))
+    })
+}
+
+/// A value `write_gzip_packed` kept.
+pub fn read_gzip_packed<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let compressed = io(path, fs::read(path))?;
+    let mut packed = Vec::with_capacity(compressed.len() * 6);
+    io(path, GzDecoder::new(compressed.as_slice()).read_to_end(&mut packed))?;
+    unpack(&packed).map_err(|error| Error::Message(format!("{}: {error}", path.display())))
+}
+
+/// A value `write_gzip_packed` kept, inflated.
+pub fn unpack<T: DeserializeOwned>(packed: &[u8]) -> std::result::Result<T, rmp_serde::decode::Error> {
+    rmp_serde::from_slice(packed)
+}
+
 /// The JSON is inflated whole and parsed from memory: serde_json reads a reader a byte at a time.
 pub fn read_gzip_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let file = io(path, File::open(path))?;

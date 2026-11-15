@@ -114,49 +114,49 @@ impl Reading<'_> {
     // paragraph's.
     pub(crate) fn in_note(&self, slot: Slot, reading_place: usize, stream: Stream, kept: &[Slot], notes: &mut NoteWalk) -> bool {
         let (fences, pages, slots, evidence) = (self.fences, self.pages, self.slots, self.evidence);
-        let (at, line) = (slot.index(), &slots.line(pages, slot).text);
-        let (top, language) = (slots.line(pages, slot).bbox[1], stream.index());
-            let band = self.measures.band_top[slots.page(slot)][language];
-            let below = top >= self.measures.body_end[slots.page(slot)][language] - 1.0 && (band == f64::MAX || top >= band);
-            notes.turn_to(slots.page(slot));
-            // Notes count on from 1, each page's or the document's: a number that goes on with no count is a small
-            // quotation's at the page's foot ("75 Along the same lines", "2 In this Act,").
-            // A figure alone, far smaller than the body, is a label a scan's layer set on its own line.
-            let lone_figure = || line.trim().parse::<u32>().ok().filter(|_| slots.line(pages, Slot(at as u32)).size * 2.0 < fences.label_size() && self.first_on_row(reading_place));
-            let label = evidence.label[at].filter(|label| label.suppress == 0).map(|label| label.value).or_else(lone_figure);
-            // (Set in a note's type, or raised: a quotation's own numbers run on at the foot of a page in its larger one.)
-            // (Or a tab after its label: "1\tHighway 5 runs ...", some reports' notes set little under the body.)
-            let tabbed = self.smaller(at) && line.trim_start().trim_start_matches(|c: char| c.is_ascii_digit()).starts_with('\t');
-            let set_as_label = lone_figure().is_some() || tabbed || evidence.label[at].is_some_and(|label| label.raised);
-            let set_as_note = fences.below_body(slots.line(pages, slot).size, at, 0.85) || set_as_label;
-            // (A colon over it sets a quotation out: "... as follows:" / "1. The party ...".)
-            // (A note may stand under one all the same: its label a lone small figure, raised, or before a tab.)
-            let lead_in = kept.last().is_some_and(|last| slots.line(pages, *last).text.trim_end().ends_with(':')) && !set_as_label;
-            if lead_in && label.is_some() {
-                notes.opens_quoted_list(slots.page(slot), slots.line(pages, Slot(at as u32)).size);
-            }
-            let lead_in = lead_in || notes.in_quoted_list(slots.page(slot), slots.line(pages, Slot(at as u32)).size);
-            // (A table's cell is no note's label, but under a table holding the page's running text: a word processor's grid of numbered
-            // paragraphs, its notes at the foot.)
-            let lead_in = lead_in || fences.role[at] == Role::Table && self.measures.cells_end[slots.page(slot)][language].is_none_or(|end| top < end - 1.0);
-            let labelled = below && set_as_note && !lead_in && label.is_some_and(|value| notes.counts_on(value));
-            // A scan's layer may read a label standing alone after its note's first line.
-            let label_after = fences.order.get(reading_place + 1).is_some_and(|next| {
-                slots.line(pages, *next).size * 2.0 < fences.label_size() && evidence.label[next.index()].is_some() && slots.line(pages, *next).text.trim().chars().count() <= 4
-                    && self.first_on_row(reading_place + 1)
-            });
-            let labelled = labelled || below && label_after && set_as_note && !lead_in;
-            // Under the page's rule a label makes a note in any type: some set their notes in the body's.
-            // A note a page's foot left unfinished goes on at the next page's, with no label, in its own type: a quotation
-            // stands smaller than the body too, "Immunity waived".
-            let carried = self.smaller(at) && below && (notes.carries_on(slots.line(pages, Slot(at as u32)).size, slots.page(slot)) || notes.noted_before(slots.page(slot)) && self.over_label(reading_place, notes));
-            // (The page's text above labels a layer read first goes on being the text, and the words under them notes: "8", "9" / "[...] ce ne
-            // sont pas" / "L'Oratoire, supra".)
-            let above_labels = notes.above_labels(slots.line(pages, slot).bbox[3]);
-            let in_note = fences.band[at] && (self.small(at) || label.is_some() || notes.inside())
-                || self.smaller(at) && (labelled || notes.inside() && !above_labels && (fences.continues[at].is_some() || below)) || carried;
+        let (at, page, language) = (slot.index(), slots.page(slot), stream.index());
+        let (line, size, top) = (&slots.line(pages, slot).text, slots.line(pages, slot).size, slots.line(pages, slot).bbox[1]);
+        let band = self.measures.band_top[page][language];
+        let below = top >= self.measures.body_end[page][language] - 1.0 && (band == f64::MAX || top >= band);
+        notes.turn_to(page);
+        // Notes count on from 1, each page's or the document's: a number that goes on with no count is a small
+        // quotation's at the page's foot ("75 Along the same lines", "2 In this Act,").
+        // A figure alone, far smaller than the body, is a label a scan's layer set on its own line.
+        let lone_figure = line.trim().parse::<u32>().ok().filter(|_| size * 2.0 < fences.label_size() && self.first_on_row(reading_place));
+        let label = evidence.label[at].filter(|label| label.suppress == 0).map(|label| label.value).or(lone_figure);
+        // (Set in a note's type, or raised: a quotation's own numbers run on at the foot of a page in its larger one.)
+        // (Or a tab after its label: "1\tHighway 5 runs ...", some reports' notes set little under the body.)
+        let tabbed = self.smaller(at) && line.trim_start().trim_start_matches(|c: char| c.is_ascii_digit()).starts_with('\t');
+        let set_as_label = lone_figure.is_some() || tabbed || evidence.label[at].is_some_and(|label| label.raised);
+        let set_as_note = fences.below_body(size, at, 0.85) || set_as_label;
+        // (A colon over it sets a quotation out: "... as follows:" / "1. The party ...".)
+        // (A note may stand under one all the same: its label a lone small figure, raised, or before a tab.)
+        let lead_in = kept.last().is_some_and(|last| slots.line(pages, *last).text.trim_end().ends_with(':')) && !set_as_label;
+        if lead_in && label.is_some() {
+            notes.opens_quoted_list(page, size);
+        }
+        let lead_in = lead_in || notes.in_quoted_list(page, size);
+        // (A table's cell is no note's label, but under a table holding the page's running text: a word processor's grid of numbered
+        // paragraphs, its notes at the foot.)
+        let lead_in = lead_in || fences.role[at] == Role::Table && self.measures.cells_end[page][language].is_none_or(|end| top < end - 1.0);
+        let labelled = below && set_as_note && !lead_in && label.is_some_and(|value| notes.counts_on(value));
+        // A scan's layer may read a label standing alone after its note's first line.
+        let label_after = fences.order.get(reading_place + 1).is_some_and(|next| {
+            slots.line(pages, *next).size * 2.0 < fences.label_size() && evidence.label[next.index()].is_some() && slots.line(pages, *next).text.trim().chars().count() <= 4
+                && self.first_on_row(reading_place + 1)
+        });
+        let labelled = labelled || below && label_after && set_as_note && !lead_in;
+        // Under the page's rule a label makes a note in any type: some set their notes in the body's.
+        // A note a page's foot left unfinished goes on at the next page's, with no label, in its own type: a quotation
+        // stands smaller than the body too, "Immunity waived".
+        let carried = self.smaller(at) && below && (notes.carries_on(size, page) || notes.noted_before(page) && self.over_label(reading_place, notes));
+        // (The page's text above labels a layer read first goes on being the text, and the words under them notes: "8", "9" / "[...] ce ne
+        // sont pas" / "L'Oratoire, supra".)
+        let above_labels = notes.above_labels(slots.line(pages, slot).bbox[3]);
+        let in_note = fences.band[at] && (self.small(at) || label.is_some() || notes.inside())
+            || self.smaller(at) && (labelled || notes.inside() && !above_labels && (fences.continues[at].is_some() || below)) || carried;
         if in_note {
-            notes.took(label.map(|value| (value, set_as_label)), line, top, slots.line(pages, Slot(at as u32)).size, slots.page(slot));
+            notes.took(label.map(|value| (value, set_as_label)), line, top, size, page);
         } else if !above_labels {
             notes.left();
         }

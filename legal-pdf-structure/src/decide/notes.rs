@@ -35,7 +35,7 @@ fn continued_note(text: &str) -> bool {
 
 /// A page's note lines in one document and language, in reading order, and whether the first opens
 /// with no label of its own and so goes on with the last note of the page before.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct NoteSegment {
     pub(crate) lines: Vec<Slot>,
     pub(crate) continued: bool,
@@ -45,16 +45,14 @@ pub(crate) struct NoteSegment {
 /// whose number the band read as a numbered paragraph's; the labels it read as no note's; an
 /// endnote page's running heads; the notes headings; each page's note segments; and the warnings
 /// of a band drawn on weak geometry. A trace holds its readings of the lines.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Notes {
     pub(crate) note: Vec<Option<NoteKind>>,
     pub(crate) paragraph_label: Vec<bool>,
     pub(crate) suppressed: Vec<bool>,
     pub(crate) running_head: Vec<bool>,
     pub(crate) heading: Vec<bool>,
-    #[serde(skip)]
     pub(crate) segments: Vec<NoteSegment>,
-    #[serde(skip)]
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 

@@ -1,7 +1,7 @@
 //! What a line is, the rule that decided it, and the edge of its page a line of furniture stands at.
 
 /// What a line is.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Role {
     /// Nothing has decided it yet.
     #[default]
@@ -21,7 +21,7 @@ pub(crate) enum Role {
 }
 
 /// The rule that gave a line its role.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Rule {
     #[default]
     None,
@@ -88,7 +88,7 @@ pub(crate) enum Rule {
 }
 
 /// The edge of its page a line of furniture stands at: the running head's or the foot's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Edge {
     Top,
     Bottom,

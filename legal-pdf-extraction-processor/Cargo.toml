@@ -5,17 +5,19 @@ edition = "2021"
 license = "MIT"
 
 [features]
+default = ["full"]
+full = ["dep:ttf-parser", "legal-pdf-core/structure-inference"]
 # TypeScript declarations of the types the engine hands JavaScript (the engine's export-types), never a runtime build.
 binding-types = ["dep:ts-rs", "legal-pdf-core/binding-types"]
 
 [dependencies]
-legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-core = { path = "../legal-pdf-core", default-features = false }
 lopdf = { version = "0.45.0", default-features = false }
 pdf-inspector = { workspace = true }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 # Arial's own file, read and subset into the PDFs compose.rs writes; the parser's own TrueType reader.
-ttf-parser = "0.25"
+ttf-parser = { version = "0.25", optional = true }
 unicode-normalization = "0.1"
 ts-rs = { version = "12", optional = true, features = ["serde-json-impl"] }
 

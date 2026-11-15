@@ -66,10 +66,13 @@ pub(crate) fn outline_contexts(
             }
         }
     }
+    // Each holder with the span its ranges envelop: a holder of a node envelops the node's span, which two comparisons
+    // tell before its ranges are read.
+    let envelope = |ranges: &[legal_structure_model::ScalarRange]| ranges.first().zip(ranges.last()).map_or((usize::MAX, 0), |(first, last)| (first.start, last.end));
     let constituents = nodes.iter().filter(|node| node.grammar.as_deref().is_some_and(|grammar| grammar.starts_with("constituent_")))
-        .map(|node| (node.id.clone(), node.ranges.clone())).collect::<Vec<_>>();
+        .map(|node| (node.id.clone(), node.ranges.clone(), envelope(&node.ranges))).collect::<Vec<_>>();
     let cells = nodes.iter().filter(|node| matches!(node.kind, NodeKind::Cell | NodeKind::Footnote | NodeKind::Endnote))
-        .map(|node| (node.id.clone(), node.ranges.clone())).collect::<Vec<_>>();
+        .map(|node| (node.id.clone(), node.ranges.clone(), envelope(&node.ranges))).collect::<Vec<_>>();
     let contains = |outer: &[legal_structure_model::ScalarRange], inner: &[legal_structure_model::ScalarRange]| {
         !inner.is_empty() && inner.iter().all(|part| outer.iter().any(|range|
             range.start <= part.start && part.end <= range.end))
@@ -83,9 +86,10 @@ pub(crate) fn outline_contexts(
             } else if matches!(node.kind, NodeKind::Paragraph | NodeKind::ListItem | NodeKind::Prose) {
                 node.role.get_or_insert(PrimaryRole::Text);
             }
-            let smallest = |holders: &[(String, Vec<legal_structure_model::ScalarRange>)]| {
-                let holding = holders.iter().filter(|(id, ranges)| id != &node.id && contains(ranges, &node.ranges));
-                holding.min_by_key(|(_, ranges)| ranges.iter().map(|range| range.end - range.start).sum::<usize>()).map(|(id, _)| id.clone())
+            let (start, end) = envelope(&node.ranges);
+            let smallest = |holders: &[(String, Vec<legal_structure_model::ScalarRange>, (usize, usize))]| {
+                let holding = holders.iter().filter(|(id, ranges, (from, to))| *from <= start && end <= *to && id != &node.id && contains(ranges, &node.ranges));
+                holding.min_by_key(|(_, ranges, _)| ranges.iter().map(|range| range.end - range.start).sum::<usize>()).map(|(id, _, _)| id.clone())
             };
             // A page holds whatever ends on it (a blank page sits at the edge of a note) rather than
             // belonging to its quotation or note: it names only its document.

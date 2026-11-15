@@ -50,23 +50,20 @@ pub(crate) fn longest_label_run(values: &[u32]) -> usize {
     runs.into_iter().max().unwrap_or(0)
 }
 
-/// Whether one of `lines` above `label_y` refers to `label`: a raised number, a reference read apart
-/// from its line, or the symbol ending a word.
-pub(crate) fn has_prior_reference<'a>(lines: impl IntoIterator<Item = &'a Line>, label: &str, label_y: f64) -> bool {
+/// Whether one of `lines` above `label_y` refers to `label`, each line with its reference marks as the evidence read
+/// them (`Evidence::marks`): a mark of the label's number (raised, set smaller, read apart from its line, or run on
+/// after a word or its stop), a raised or detached symbol, or the symbol ending a word.
+pub(crate) fn has_prior_reference<'a>(lines: impl IntoIterator<Item = (&'a Line, &'a [(u32, u32, u32)])>, label: &str, label_y: f64) -> bool {
     let matches_label = |value: &str| {
         let value = value.trim();
         value == label || normalize_label(value) == label
     };
-    lines.into_iter().any(|line| {
+    let number: Option<u32> = normalize_label(label).parse().ok().filter(|&value| value > 0);
+    lines.into_iter().any(|(line, marks)| {
         line.bbox[1] < label_y
-            && (line
-                .spans
-                .iter()
-                .any(|span| span.superscript && matches_label(&span.text))
-                || line
-                    .detached_references
-                    .iter()
-                    .any(|reference| matches_label(&reference.note_id))
+            && (number.is_some_and(|value| marks.iter().any(|&(mark, ..)| mark == value))
+                || line.spans.iter().any(|span| span.superscript && matches_label(&span.text))
+                || line.detached_references.iter().any(|reference| matches_label(&reference.note_id))
                 || (label.chars().all(is_note_symbol)
                     && line
                         .text

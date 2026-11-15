@@ -18,8 +18,10 @@ use legal_pdf_core::{
     model::{Line, Page},
     regex,
 };
+use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::decide::Notes;
+use crate::model::Slot;
 use super::band::Document;
 
 const SEPARATOR_Y_TOLERANCE: f64 = 0.006;
@@ -42,51 +44,8 @@ fn folded(text: &str) -> String {
     text.chars().map(fold).collect::<String>().trim().to_owned()
 }
 
-fn marker_match(text: &str) -> bool {
-    regex!(r"^\s*(?:\(?\d{1,3}\)?[.)]?|[*†‡§¶]+)\s+\S").is_match(text)
-}
-
 fn page_label(text: &str) -> bool {
     regex!(r"^\s*(?:[-\u{2013}\u{2014}]\s*)?(?:\d{1,4}|[ivxlcdmIVXLCDM]{1,12})(?:\s*[-\u{2013}\u{2014}])?\s*$").is_match(text)
-}
-
-enum Marker {
-    Symbol(String),
-    Numeric(i64),
-    Other,
-}
-
-/// A marker-matched line split into its marker and the rest.
-fn marker_label(text: &str) -> Marker {
-    let head = text.trim_start();
-    if head.starts_with(|c: char| SYMBOL_MARKER_CHARS.contains(c)) {
-        return Marker::Symbol(head.trim_start_matches(|c: char| SYMBOL_MARKER_CHARS.contains(c)).trim().to_owned());
-    }
-    regex!(r"^\(?(\d{1,3})\)?[.)]?").captures(head).map_or(Marker::Other, |found| Marker::Numeric(found[1].parse().unwrap_or(0)))
-}
-
-/// The number a line opening as a note does prints, where it prints one.
-fn marker_number(text: &str) -> Option<i64> {
-    match marker_label(text) {
-        Marker::Numeric(label) if marker_match(text) => Some(label),
-        _ => None,
-    }
-}
-
-/// A line that is nothing but a note's label: its number, or a symbol run.
-fn bare_label(text: &str) -> Option<Option<i64>> {
-    let text = folded(text);
-    if text.is_empty() {
-        return None;
-    }
-    if text.chars().all(|c| SYMBOL_MARKER_CHARS.contains(c)) {
-        return Some(None);
-    }
-    regex!(r"^\(?(\d{1,3})\)?[.)]?$").captures(&text).map(|found| Some(found[1].parse().unwrap_or(0)))
-}
-
-fn leading_note_number(text: &str) -> Option<i64> {
-    regex!(r"^\s*\(?(\d{1,3})\)?[.)]?(?:\s|$)").captures(text).and_then(|found| found[1].parse().ok())
 }
 
 fn citation_shaped(text: &str) -> bool {
@@ -133,17 +92,72 @@ fn dense(labels: &[i64]) -> bool {
 /// band read of them (`Notes`).
 struct DocumentLines<'a> {
     pages: &'a [Page],
-    order: &'a [(usize, Vec<usize>)],
     document: Document<'a>,
     notes: &'a Notes,
     /// Native font sizes and recognized glyph heights are distinct measurements.
     note_sizes: [Option<f64>; 2],
+    /// Each page's slot and its lines in reading order.
+    by_page: Vec<(usize, Vec<LineRef>)>,
+    /// Each line's opening as the lanes read it, by its slot, read when a lane first asks.
+    openings: Vec<OnceCell<Opening>>,
+}
+
+/// A line's marker, split from the rest: a symbol run (and whether words follow it), or a number.
+#[derive(Clone, Copy)]
+enum Marker {
+    Symbol(bool),
+    Numeric(i64),
+    Other,
+}
+
+/// What a line's opening reads as, its superscript labels folded to plain digits (`folded`), read once for every lane:
+/// whether it opens as a note does (a number or a symbol run, then its words), its marker, the number it opens on set
+/// off from what follows, whether it is nothing but a note's label (its number, or a symbol run), and whether it is
+/// up to three figures and nothing else.
+struct Opening {
+    marker: bool,
+    label: Marker,
+    number: Option<i64>,
+    bare: Option<Option<i64>>,
+    figures: bool,
+}
+
+impl Opening {
+    fn read(text: &str) -> Self {
+        let fold = folded(text);
+        let rest = fold.trim_start_matches(|c: char| SYMBOL_MARKER_CHARS.contains(c));
+        let numeral = |pattern: &regex::Regex| pattern.captures(&fold).and_then(|found| found[1].parse().ok());
+        Self {
+            marker: regex!(r"^(?:\(?\d{1,3}\)?[.)]?|[*†‡§¶]+)\s+\S").is_match(&fold),
+            label: if rest.len() < fold.len() {
+                Marker::Symbol(rest.chars().any(char::is_alphabetic))
+            } else {
+                numeral(regex!(r"^\(?(\d{1,3})\)?[.)]?")).map_or(Marker::Other, Marker::Numeric)
+            },
+            number: numeral(regex!(r"^\(?(\d{1,3})\)?[.)]?(?:\s|$)")),
+            bare: if fold.is_empty() { None } else if rest.is_empty() { Some(None) } else { numeral(regex!(r"^\(?(\d{1,3})\)?[.)]?$")).map(Some) },
+            figures: !fold.is_empty() && fold.len() <= 3 && fold.bytes().all(|byte| byte.is_ascii_digit()),
+        }
+    }
+
+    /// The number a line opening as a note does prints, where it prints one.
+    fn numbered(&self) -> Option<i64> {
+        match self.label {
+            Marker::Numeric(label) if self.marker => Some(label),
+            _ => None,
+        }
+    }
 }
 
 impl<'a> DocumentLines<'a> {
     /// Each page's slot and its lines in reading order.
-    fn pages(&self) -> impl Iterator<Item = (usize, Vec<LineRef>)> + 'a {
-        self.order.iter().map(|(page, slots)| (*page, slots.iter().map(|slot| (*page, *slot)).collect()))
+    fn pages(&self) -> impl Iterator<Item = (usize, &[LineRef])> + '_ {
+        self.by_page.iter().map(|(page, refs)| (*page, refs.as_slice()))
+    }
+
+    /// What the line's opening reads as (`Opening`).
+    fn opening(&self, line: LineRef) -> &Opening {
+        self.openings[self.at(line)].get_or_init(|| Opening::read(self.text(line)))
     }
 
     fn line(&self, (page, line): LineRef) -> &'a Line {
@@ -179,7 +193,7 @@ impl<'a> DocumentLines<'a> {
     }
 
     fn paragraph_label(&self, line: LineRef) -> bool {
-        self.notes.paragraph_label[self.at(line)] && bare_label(&self.line(line).text).is_some()
+        self.notes.paragraph_label[self.at(line)] && self.opening(line).bare.is_some()
     }
 
     fn y_ratio(&self, at: LineRef) -> f64 {
@@ -214,7 +228,7 @@ fn note_text_size(line: &Line) -> f64 {
 /// heights separately over the whole document, never borrowing one measurement for the other.
 fn note_type_sizes(lines: &DocumentLines<'_>) -> [Option<f64>; 2] {
     let (mut notes, mut body) = ([Vec::new(), Vec::new()], [Vec::new(), Vec::new()]);
-    for at in lines.pages().flat_map(|(_, refs)| refs) {
+    for at in lines.pages().flat_map(|(_, refs)| refs.iter().copied()) {
         let line = lines.line(at);
         let (size, source) = (note_text_size(line), usize::from(line.spans.is_empty()));
         if size <= 0.0 {
@@ -238,7 +252,9 @@ fn note_type_sizes(lines: &DocumentLines<'_>) -> [Option<f64>; 2] {
 /// The lines one logical document's lanes take for notes, beside the note band's (`lines`), with
 /// separators aligned to its page slots: each by its page slot and its place on the page, in order.
 pub(crate) fn note_promotions(pages: &[Page], order: &[(usize, Vec<usize>)], document: Document, notes: &Notes, separators: &[Option<f64>]) -> Vec<LineRef> {
-    let mut lines = DocumentLines { pages, order, document, notes, note_sizes: [None; 2] };
+    let by_page = order.iter().map(|(page, places)| (*page, places.iter().map(|place| (*page, *place)).collect())).collect();
+    let openings = (0..document.slots.len()).map(|_| OnceCell::new()).collect();
+    let mut lines = DocumentLines { pages, document, notes, note_sizes: [None; 2], by_page, openings };
     lines.note_sizes = note_type_sizes(&lines);
     let lines = lines;
     let rerouted = post_footnote_reroute(&lines);
@@ -265,7 +281,7 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
         for (position, &line) in refs.iter().enumerate() {
             let text = lines.text(line);
             if lines.is_note(line) {
-                trail = trail.past_note(text);
+                trail = trail.past_note(text, lines.opening(line).number);
                 continue;
             }
             if position < first_note || text.is_empty() {
@@ -281,16 +297,16 @@ fn post_footnote_reroute(lines: &DocumentLines<'_>) -> Vec<LineRef> {
             if last_text.is_empty() {
                 continue;
             }
-            let fold = folded(text);
-            let bare = fold.len() <= 3 && !fold.is_empty() && fold.bytes().all(|byte| byte.is_ascii_digit());
+            let opening = lines.opening(line);
+            let (bare, marker) = (opening.figures, opening.marker);
             if page_label(text) && !bare {
                 continue;
             }
-            let marker = marker_match(&fold);
-            let number = if bare || marker { leading_note_number(&fold) } else { None };
+            let number = opening.number.filter(|_| bare || marker);
             let bare_claim = bare && number.is_some() && last_number.is_some_and(|last| number == Some(last + 1));
             let continuation = *anchored && !sentence_ended(last_text);
-            let anchored_citation = position < last_note && !legal_structure::analysis::protected_citation_spans(text).is_empty();
+            // (A citation the grammar protects on the line, as the evidence read it.)
+            let anchored_citation = position < last_note && lines.document.evidence.citations_of(Slot(lines.at(line) as u32)).iter().any(|cited| cited.protected);
             if (bare && !bare_claim) || !(marker || continuation || anchored_citation || bare_claim) {
                 trail = Trail::Broken;
                 continue;
@@ -314,9 +330,9 @@ enum Trail {
 
 impl Trail {
     /// The trail past a line of a note, whose own number, where it prints one, replaces the last.
-    fn past_note(self, text: &str) -> Self {
+    fn past_note(self, text: &str, number: Option<i64>) -> Self {
         let last = if let Self::Note { number, .. } = self { number } else { None };
-        Self::Note { text: text.to_owned(), anchored: true, number: leading_note_number(&folded(text)).or(last) }
+        Self::Note { text: text.to_owned(), anchored: true, number: number.or(last) }
     }
 }
 
@@ -390,10 +406,10 @@ fn note_band(lines: &DocumentLines<'_>, separators: &[Option<f64>], reserved: &B
         // The page's note ladder: each entry's place, label, and the candidate it is, if it is one.
         let mut ladder = Vec::<(usize, i64, Option<usize>)>::new();
         for (position, &line) in refs.iter().enumerate() {
-            let (text, y) = (folded(lines.text(line)), lines.y_ratio(line));
-            if lines.is_note(line) && marker_match(&text) && y > floor {
+            let y = lines.y_ratio(line);
+            if lines.is_note(line) && y > floor && lines.opening(line).marker {
                 band_top_below = Some(band_top_below.map_or(y, |top| top.min(y)));
-                ladder.extend(marker_number(&text).map(|label| (position, label, None)));
+                ladder.extend(lines.opening(line).numbered().map(|label| (position, label, None)));
             }
         }
         let mut band_lines = Vec::<(f64, String)>::new();
@@ -412,14 +428,14 @@ fn note_band(lines: &DocumentLines<'_>, separators: &[Option<f64>], reserved: &B
             if !lines.mutable(line) || lines.body_type(line) || text.is_empty() {
                 continue;
             }
-            let fold = folded(text);
-            if !marker_match(&fold) {
+            let opening = lines.opening(line);
+            if !opening.marker {
                 continuations.push((line, y));
                 continue;
             }
-            match marker_label(&fold) {
+            match opening.label {
                 _ if reserved.contains(&line) => {}
-                Marker::Symbol(rest) if !rest.chars().any(char::is_alphabetic) => {}
+                Marker::Symbol(false) => {}
                 Marker::Numeric(label) => candidates.push((position, line, y, Some(label), false)),
                 _ => candidates.push((position, line, y, None, false)),
             }
@@ -508,7 +524,7 @@ fn font_role_strands(lines: &DocumentLines<'_>, separators: &[Option<f64>], rese
     let (mut ladder_last, mut claims, mut claimed) = (None::<i64>, Vec::new(), HashSet::new());
     for (page, refs) in lines.pages() {
         for &line in refs.iter().filter(|line| lines.is_note(**line)) {
-            ladder_last = ladder_last.max(marker_number(&folded(lines.text(line))));
+            ladder_last = ladder_last.max(lines.opening(line).numbered());
         }
         for label in promoted_labels.get(&page).into_iter().flatten() {
             ladder_last = ladder_last.max(Some(*label));
@@ -527,12 +543,12 @@ fn font_role_strands(lines: &DocumentLines<'_>, separators: &[Option<f64>], rese
         };
         let base = refs
             .iter()
-            .map(|&line| open(line) && !lines.paragraph_label(line) && (lines.matches_note_type(line) || bare_label(lines.text(line)).is_some()))
+            .map(|&line| open(line) && !lines.paragraph_label(line) && (lines.matches_note_type(line) || lines.opening(line).bare.is_some()))
             .collect::<Vec<_>>();
         let mut expanded = refs
             .iter()
             .zip(&base)
-            .map(|(&line, &member)| member || (open(line) && !lines.paragraph_label(line) && marker_match(&folded(lines.text(line)))))
+            .map(|(&line, &member)| member || (open(line) && !lines.paragraph_label(line) && lines.opening(line).marker))
             .collect::<Vec<_>>();
         for index in 1..refs.len().saturating_sub(1) {
             if !expanded[index] && expanded[index - 1] && expanded[index + 1] && open(refs[index]) {
@@ -564,14 +580,14 @@ fn font_role_strands(lines: &DocumentLines<'_>, separators: &[Option<f64>], rese
                 let mut labels = run
                     .iter()
                     .filter_map(|line| {
-                        let text = folded(lines.text(*line));
-                        bare_label(&text).flatten().or_else(|| marker_number(&text))
+                        let opening = lines.opening(*line);
+                        opening.bare.flatten().or_else(|| opening.numbered())
                     })
                     .collect::<Vec<_>>();
-                let head_text = folded(lines.text(run[0]));
-                let head = bare_label(&head_text).or_else(|| match marker_label(&head_text) {
-                    Marker::Symbol(rest) if marker_match(&head_text) && rest.chars().any(char::is_alphabetic) => Some(None),
-                    Marker::Numeric(label) if marker_match(&head_text) => Some(Some(label)),
+                let opening = lines.opening(run[0]);
+                let head = opening.bare.or(match opening.label {
+                    Marker::Symbol(true) if opening.marker => Some(None),
+                    Marker::Numeric(label) if opening.marker => Some(Some(label)),
                     _ => None,
                 });
                 if let Some(Some(label)) = head {

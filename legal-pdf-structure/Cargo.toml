@@ -9,17 +9,19 @@ description = "The PDF structure stage: evidence, fences, runs, notes, tier 0's 
 legal-pdf-core = { path = "../legal-pdf-core" }
 legal-pdf-pages = { path = "../legal-pdf-pages" }
 legal-structure-model = { workspace = true }
-legal-structure = { workspace = true, features = ["structure-inference"] }
+legal-structure = { workspace = true, default-features = false, features = ["structure-inference"] }
 pdf-inspector = { workspace = true }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# A parse kept in the dump (`doc::Entry`'s `parse`), read back whole.
+rmp-serde = "1.3"
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"], optional = true }
-# The DOC reader's text model (transition/doc.rs): Hugging Face's tokenizer, its regular expressions in Rust.
+# The DOC reader's text model (doc/reader.rs): Hugging Face's tokenizer, its regular expressions in Rust.
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
 
 [features]
-# Tier 1's and tier 2's document encoder, and Detect-Order-Construct's stages (transition).
+# Tier 1's and tier 2's document encoder, and Detect-Order-Construct's stages (`doc`).
 encoder = ["dep:ort", "dep:tokenizers", "legal-pdf-core/ort-runtime"]
 
 # Unit tests run the structure engine, which programs supply at run time.

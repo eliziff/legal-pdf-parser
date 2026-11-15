@@ -16,7 +16,7 @@ use crate::headings::bookmarks::{
 use crate::headings::rules::{ladder_levels, ATTACHMENTS};
 use crate::layout::Geometry;
 use crate::model::{Evidence, MarkerReading, Role, Rule, Slot, Slots, SourceTag};
-use crate::text::text::enumerated;
+use crate::evidence::enumerated_in;
 use super::residual::{apart, look_of, marker_alone, Families, Look};
 use super::rules::{body_like, Decision, OutlineAnchor, Sequences};
 
@@ -192,7 +192,7 @@ pub(crate) fn anchors(
         let order = order(page);
         let base = slots.on(page).start;
         let same = |slot: Slot| heading(slot) && eligible(slot) && context(slot) == context(first);
-        let numbered = |slot: Slot| enumerated(text(slot));
+        let numbered = |slot: Slot| enumerated_in(&evidence.readings[slot.index()]);
         let mut start = (fences.place[first.index()] - base) as usize;
         let mut end = (fences.place[lines[lines.len() - 1].index()] - base) as usize;
         if !numbered(order[start]) {
@@ -379,10 +379,9 @@ pub(crate) fn heading_levels(
             SourceTag::Heading(level) if level > 0 && anchored(unit).is_none() => Some(usize::from(level)),
             _ => None,
         };
-        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let enumerators: Vec<Option<(String, String)>> = refs.iter().map(|text| headings::rules::enumerator(text)).collect();
-        let breaks: Vec<bool> = enumerators.iter().zip(&reads).map(|(enumerator, &read)| enumerator.is_none() && read <= 1).collect();
-        let ladder = ladder_levels(&refs, &breaks);
+        let numbers: Vec<Vec<MarkerReading>> = texts.iter().map(|text| crate::evidence::heading_numbers(text)).collect();
+        let breaks: Vec<bool> = numbers.iter().zip(&reads).map(|(number, &read)| number.is_empty() && read <= 1).collect();
+        let ladder = ladder_levels(&numbers, &breaks);
         // Each run's offset from its depths to the document's levels, by the anchored headings in it.
         let mut votes: Vec<(usize, isize, usize)> = Vec::new();
         let mut run = 0;
@@ -413,7 +412,7 @@ pub(crate) fn heading_levels(
             if let Some((_, true)) = rung {
                 run += 1;
                 // An attachment stands at the top whatever heads the part before it.
-                let attachment = enumerators[k].as_ref().is_some_and(|(_, word)| ATTACHMENTS.contains(&word.as_str()));
+                let attachment = numbers[k].iter().any(|reading| ATTACHMENTS.iter().any(|word| reading.family.starts_with(&format!("{word}:"))));
                 base = if prior_numbered || attachment { 0 } else { prior_level.unwrap_or(0) };
             }
             let level = if placed(unit) {

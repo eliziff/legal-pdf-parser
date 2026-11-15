@@ -394,8 +394,8 @@ fn aligned_siblings(pages: &[Page], slots: &Slots, view: &View, run: &StructureC
 pub(crate) fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, fences: &mut Fences, geometry: &Geometry) -> Result<Runs> {
     let repaired = legal_pdf_core::profile::measure("runs.repair", || repair_markers(pages, fences));
     let pages: &[Page] = pages;
-    crate::evidence::reread(evidence, pages, slots, &repaired);
-    fences.read_numbers(pages, slots, evidence, !repaired.is_empty());
+    legal_pdf_core::profile::tally("runs.reread", || crate::evidence::reread(evidence, pages, slots, &repaired));
+    legal_pdf_core::profile::tally("runs.read_numbers", || fences.read_numbers(pages, slots, evidence, !repaired.is_empty()));
     // A paragraph number in the margin stands beside the line of its row it numbers, as one printed line
     // (`Fences::read_margin_numbers`): the numbering reads it opening that line, not ending the one before.
     for (at, row) in fences.margin_number.iter().enumerate() {
@@ -413,8 +413,8 @@ pub(crate) fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, f
     }
     let mut runs = Vec::new();
     for (ctx, lines) in by_context.iter().enumerate().filter(|(_, lines)| !lines.is_empty()) {
-        let view = View::of(pages, slots, evidence, lines);
-        let found = legal_pdf_core::profile::measure("candidates.detect", || legal_structure::detect_structure_candidate_runs(&view.text, true));
+        let view = legal_pdf_core::profile::tally("runs.view", || View::of(pages, slots, evidence, lines));
+        let found = legal_pdf_core::profile::measure("candidates.detect", || legal_structure::detect_structure_candidate_runs(&view.text, true, evidence.instrument));
         // A provision ladder under one worded top-level marker that goes on with the sentence
         // before it (a witness's "it's at" / "Exhibit F.") is a cross-reference's, no outline: the
         // question numbers under it are the count's, not its subsections. A list's items go on
@@ -433,17 +433,17 @@ pub(crate) fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, f
         if found.is_empty() {
             continue;
         }
-        let found = part_at_paragraphs(found, &view, evidence, fences);
+        let found = legal_pdf_core::profile::tally("runs.part", || part_at_paragraphs(found, &view, evidence, fences));
         let marked: HashSet<Slot> =
             found.iter().flat_map(|run| &run.markers).map(|candidate| view.place(candidate.marker_range.start).slot).collect();
         let shown = Lines { pages, slots, evidence, fences, geometry, view: &view, marked: &marked };
-        let readings: Vec<Vec<Reading>> = found
+        let readings: Vec<Vec<Reading>> = legal_pdf_core::profile::tally("runs.readings", || found
             .iter()
             .map(|run| {
-                let aligned = aligned_siblings(pages, slots, &view, run);
+                let aligned = legal_pdf_core::profile::tally("runs.aligned", || aligned_siblings(pages, slots, &view, run));
                 run.markers.iter().zip(aligned).map(|(candidate, aligned)| shown.read(run, candidate, aligned)).collect()
             })
-            .collect();
+            .collect());
         let candidate_evidence: Vec<CandidateEvidenceV2> = found
             .iter()
             .zip(&readings)
@@ -462,7 +462,7 @@ pub(crate) fn read(pages: &mut [Page], slots: &Slots, evidence: &mut Evidence, f
                 CandidateEvidenceV2 { candidate_id: candidate.id.clone(), page_indexes, line_ids, observations: reading.observations.clone() }
             })
             .collect();
-        let roles = legal_pdf_core::profile::measure("runs.resolve", || legal_structure::candidates::resolve_candidates(&found, &candidate_evidence))
+        let roles = legal_pdf_core::profile::measure("runs.resolve", || legal_structure::candidates::resolve_candidates(&found, &candidate_evidence, evidence.instrument))
             .map_err(|error| Error::Message(error.to_string()))?;
         let role_of: HashMap<&str, &legal_structure_model::CandidateRoleV2> = roles.iter().map(|role| (role.candidate_id.as_str(), role)).collect();
         // A document read in more than one context names each context's candidates apart.

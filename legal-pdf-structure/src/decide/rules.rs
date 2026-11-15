@@ -9,7 +9,6 @@
 //! first keeps it. Each line keeps the rule that decided it, and each marker the unit it opens.
 
 use legal_pdf_core::model::{sentence_ended, Page, PdfOutlineEntry};
-use crate::headings;
 use crate::fences::{Continuation, Fences};
 use crate::layout::Geometry;
 use crate::model::{
@@ -18,7 +17,7 @@ use crate::model::{
     WORD_JURAT, WORD_LABEL, WORD_PARTY, WORD_SIGNATURE, WORD_TRANSCRIPT_PART, WORD_WITNESS,
 };
 use crate::text::heading_ladder::{
-    enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation, HeadingLadderStatus,
+    parse_heading_runs, rungs, EnumeratorInterpretation, HeadingLadderStatus,
 };
 use crate::text::text::all_caps;
 use super::levels::{anchors, heading_levels};
@@ -35,7 +34,7 @@ pub(crate) type Opening = (u32, UnitRole);
 
 /// Lines a confirmed or found bookmark or contents entry names: its lines, its level, and whether
 /// its title is found whole.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct OutlineAnchor {
     pub(crate) lines: Vec<Slot>,
     pub(crate) level: u16,
@@ -62,7 +61,7 @@ impl Sequences {
     }
 }
 
-/// A reading a rule gives a line, for the one decision on it (`transition::tier0`): the role, the rule, what the rule
+/// A reading a rule gives a line, for the one decision on it (`tier0`): the role, the rule, what the rule
 /// weighs it at where it weighs (the residual's score), and whether the line goes on with the one above it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Heard {
@@ -79,7 +78,7 @@ pub(crate) struct Heard {
 /// rule gives it (0 for none: a transcript's part, an anchor's) and the anchor naming it (an index among the anchors,
 /// plus one; 0 for none), each standing where the line's rule is that rule's; and, where the decision is traced, each
 /// residual candidate as the residual weighed it. A trace holds its readings of the lines.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Decision {
     pub(crate) moves: Vec<Move>,
     pub(crate) place: Vec<u32>,
@@ -87,7 +86,6 @@ pub(crate) struct Decision {
     pub(crate) reading: Vec<Option<(u32, u32)>>,
     pub(crate) given: Vec<u8>,
     pub(crate) anchor: Vec<u32>,
-    #[serde(skip)]
     pub(crate) anchors: Vec<OutlineAnchor>,
     #[serde(skip)]
     pub(crate) residual: Vec<ResidualRecord>,
@@ -467,7 +465,7 @@ impl Decision {
                 }
             }
             if !evidence.instrument {
-                self.ladder(pages, slots, fences, run, sequences);
+                self.ladder(pages, slots, evidence, fences, run, sequences);
             }
         }
     }
@@ -487,15 +485,14 @@ impl Decision {
     /// as a list's item does, none after a lead-in, each followed by a paragraph of its own, and
     /// their numbers a ladder the heading grammar parses (`parse_heading_runs`), not a count of
     /// notes' numbers.
-    fn ladder(&mut self, pages: &[Page], slots: &Slots, fences: &Fences, run: &Run, sequences: &Sequences) {
+    fn ladder(&mut self, pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, run: &Run, sequences: &Sequences) {
         let counted: Vec<&Member> = run.members.iter().filter(|member| member.counted && !quoted(member)).collect();
         if counted.len() < 2 {
             return;
         }
         let readings: Vec<Vec<EnumeratorInterpretation>> = counted
             .iter()
-            .filter_map(|member| headings::rules::enumerator(slots.line(pages, member.slot).text.trim()))
-            .map(|(value, punctuation)| enumerator_interpretations(&value, &punctuation))
+            .map(|member| rungs(&evidence.readings[member.slot.index()]))
             .filter(|readings| !readings.is_empty())
             .collect();
         let readings: Vec<&[EnumeratorInterpretation]> = readings.iter().map(Vec::as_slice).collect();

@@ -3,7 +3,8 @@
 //! counsel, parties and contact details, and the numbering a heading opens with as the heading
 //! ladder reads it.
 
-use crate::text::heading_ladder::{enumerator_interpretations, parse_heading_runs, EnumeratorInterpretation};
+use crate::model::MarkerReading;
+use crate::text::heading_ladder::{parse_heading_runs, rungs, EnumeratorInterpretation};
 use legal_pdf_core::regex;
 use regex::Regex;
 use std::sync::OnceLock;
@@ -34,10 +35,10 @@ pub(crate) fn examination(text: &str) -> bool {
 pub(crate) fn transcript_part(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     // Letters printed apart ("I N D E X") read as their word.
-    let squeezed: String = if text.split_whitespace().all(|word| word.chars().filter(|c| c.is_alphabetic()).count() <= 1) {
-        text.chars().filter(|c| !c.is_whitespace()).collect()
+    let squeezed: std::borrow::Cow<'_, str> = if text.split_whitespace().all(|word| word.chars().filter(|c| c.is_alphabetic()).count() <= 1) {
+        text.chars().filter(|c| !c.is_whitespace()).collect::<String>().into()
     } else {
-        text.to_owned()
+        text.into()
     };
     pattern(&RE, concat!(
         r"^[-*\s]*(?:(?:WORD\s+)?INDEX(?:\s+OF\s+[A-Z' ,&]{3,60})?|TABLE\s+OF\s+CONTENTS|EXHIBITS|OBJECTIONS|REFUSALS|ADVISEMENTS",
@@ -60,16 +61,25 @@ pub(crate) fn hearing_part(text: &str) -> bool {
 /// ("BY MR. PHILLIPS:"), a speaker's turn ("Q.", "THE WITNESS:"), a recess, an exhibit marked, a
 /// discussion off the record.
 pub(crate) fn turn_or_event(text: &str) -> bool {
-    legal_structure::transcript::speaker_label(text).is_some()
-        || regex!(r"(?i)^(?:-{2,}|\(|\[)|^exhibit\s+no\b|off\s+the\s+record|^by\s+(?:mr|ms|mrs|miss|dr|me|madam)\.?\s").is_match(text)
+    legal_structure::transcript::speaker_label(text).is_some() || event(text)
+}
+
+/// `turn_or_event`'s events and examiners, a speaker's turn aside.
+pub(crate) fn event(text: &str) -> bool {
+    regex!(r"(?i)^(?:-{2,}|\(|\[)|^exhibit\s+no\b|off\s+the\s+record|^by\s+(?:mr|ms|mrs|miss|dr|me|madam)\.?\s").is_match(text)
 }
 
 /// A label never a heading, with or without its colon: counsel and appearances, a litigant's role
 /// (the caption reader's `party_label`) and a contract's parties and signatories, a recital's
 /// "WHEREAS", a caption's connectives, contact details, a placeholder.
 pub(crate) fn label(text: &str) -> bool {
+    crate::text::text::party_label().is_match(text) || label_unless_party(text)
+}
+
+/// `label`'s labels, a litigant's role aside.
+pub(crate) fn label_unless_party(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    crate::text::text::party_label().is_match(text) || pattern(&RE, concat!(
+    pattern(&RE, concat!(
         r"(?i)^\W*(?:appearances?|comparutions?|a\s*p\s*p\s*e\s*a\s*r\s*a\s*n\s*c\s*e\s*s|solicitors?\s+of\s+record|counsel(?:\s+of\s+record)?",
         r"|procureurs?(?:\s+inscrits?(?:\s+aux?\s+dossiers?)?)?|also\s+present|parties\s+present\b.*|written\s+representations\s+by",
         r"|(?:the\s+)?(?:additional\s+)?(?:borrowers?|lenders?|guarantors?|monitor|covenantors?",
@@ -88,26 +98,11 @@ pub(crate) fn label(text: &str) -> bool {
 pub(crate) fn numbered(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let text = text.trim();
-    crate::text::text::enumerated(text)
+    crate::evidence::enumerated(text)
         || pattern(&RE, concat!(
             r"^\s*(?:(?i:part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|count|partie|chapitre|annexe)\b",
             r"|\(\s*(?:\d{1,3}|[a-zA-Z]{1,2}|[ivxlc]{1,6})\s*\)(?:\s|$)|[IVXLC]{1,4}\s+[A-Z])"
         )).is_match(text)
-}
-
-/// A heading's enumerator as the ladder reads it, (value, punctuation): from the parser's own heading
-/// patterns, a bracketed one ("(a)" read as "a" in brackets), or a division word's numeral ("PART IV",
-/// "ARTICLE 5"), the word standing for the punctuation so that each word counts its own family.
-pub(crate) fn enumerator(text: &str) -> Option<(String, String)> {
-    let text = text.trim();
-    if let Some(found) = regex!(r"(?i)^(part|section|article|chapter|schedule|division|title|book|appendix|annex|exhibit|count|partie|chapitre|annexe)\s+[\x22\u{201c}\u{2018}'(]?([IVXLCDM]{1,7}|\d{1,3}|[A-Z])\b").captures(text) {
-        return Some((found[2].to_owned(), found[1].to_lowercase()));
-    }
-    if let Some(capture) = crate::text::text::heading_inline_re().captures(text).or_else(|| crate::text::text::heading_standalone_re().captures(text)) {
-        let (value, punct, _) = crate::text::text::heading_enumerator(&capture);
-        return Some((value.to_owned(), punct.to_owned()));
-    }
-    regex!(r"^\(\s*(\d{1,3}|[A-Za-z]|[ivxlc]{1,6})\s*\)(?:\s|$)").captures(text).map(|found| (found[1].to_owned(), "()".to_owned()))
 }
 
 /// A number and nothing else ("III.", "4", "(b)"), as the paragraph reader knows one: a heading's
@@ -129,12 +124,12 @@ pub(crate) const ATTACHMENTS: [&str; 5] = ["schedule", "appendix", "annex", "exh
 /// ladder over, as does every text `breaks` marks (a part of the document an unnumbered top heading
 /// opens: a judgment's reasons after its headnote). Each numbered text's depth on its run, and
 /// whether it opens a run; None where unnumbered.
-pub(crate) fn ladder_levels(texts: &[&str], breaks: &[bool]) -> Vec<Option<(usize, bool)>> {
+pub(crate) fn ladder_levels(texts: &[Vec<MarkerReading>], breaks: &[bool]) -> Vec<Option<(usize, bool)>> {
     let mut levels = vec![None; texts.len()];
-    let numbered: Vec<(usize, Vec<EnumeratorInterpretation>, bool)> = texts.iter().enumerate().filter_map(|(k, text)| {
-        let (value, punct) = enumerator(text)?;
-        let readings = enumerator_interpretations(&value, &punct);
-        (!readings.is_empty()).then(|| (k, readings, ATTACHMENTS.contains(&punct.as_str())))
+    let numbered: Vec<(usize, Vec<EnumeratorInterpretation>, bool)> = texts.iter().enumerate().filter_map(|(k, readings)| {
+        let attachment = readings.iter().any(|reading| ATTACHMENTS.iter().any(|word| reading.family.starts_with(&format!("{word}:"))));
+        let readings = rungs(readings);
+        (!readings.is_empty()).then_some((k, readings, attachment))
     }).collect();
     // Where a run starts over: at an attachment, or past a break since the numbered text before it.
     let restarts = |n: usize| numbered[n].2 || n > 0 && (numbered[n - 1].0 + 1..=numbered[n].0).any(|k| breaks.get(k).copied().unwrap_or(false));

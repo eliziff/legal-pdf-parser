@@ -30,7 +30,7 @@ pub(crate) mod tables;
 
 
 /// Why a line goes on with the one before it in reading order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Continuation {
     /// A word hyphenated across, an unfinished sentence going on in lower case, or a bracket closed
     /// (`body_flow_edge`).
@@ -48,7 +48,7 @@ pub(crate) enum Continuation {
 }
 
 /// The fences, contexts and reading order, by slot.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Fences {
     pub(crate) role: Vec<Role>,
     pub(crate) rule: Vec<Rule>,
@@ -167,35 +167,35 @@ impl Fences {
             continues: vec![None; count],
             ..Self::default()
         };
-        let views = PageView::whole(pages);
+        let views = legal_pdf_core::profile::tally("fences.views", || PageView::whole(pages));
         let rows: Vec<&Rows> = evidence.pages.iter().map(|page| &page.rows).collect();
         // A transcript's line numbers.
         for slot in (0..count).filter(|&slot| evidence.line_number[slot]) {
             fences.set(Slot(slot as u32), Role::LineLabel, Rule::LineNumber);
         }
-        fences.read_page_numbers(pages, slots, evidence, page_labels);
-        fences.read_furniture(evidence, &views, &rows);
-        let items = fences.read_columns(pages, slots, evidence);
-        fences.read_translation(pages, slots, evidence, &views);
-        let (tables, in_table, listed) = fences.find_tables(pages, slots, &items);
-        let listed_contents = fences.read_contents(pages, slots, evidence, page_labels, &views, &in_table, &listed);
-        fences.read_tables(slots, tables, &listed_contents);
-        let mut voided = fences.free_referenced_note_cells(pages, slots, evidence);
-        fences.read_note_band(pages, slots, evidence);
-        fences.read_body_type(pages, slots, evidence);
-        fences.clear_false_bands(pages, slots, evidence);
-        voided |= fences.free_noted_cells(pages, slots, evidence);
-        fences.read_documents(&views, outline);
+        legal_pdf_core::profile::tally("fences.read_page_numbers", || fences.read_page_numbers(pages, slots, evidence, page_labels));
+        legal_pdf_core::profile::tally("fences.read_furniture", || fences.read_furniture(evidence, &views, &rows));
+        let items = legal_pdf_core::profile::tally("fences.read_columns", || fences.read_columns(pages, slots, evidence));
+        legal_pdf_core::profile::tally("fences.read_translation", || fences.read_translation(pages, slots, evidence, &views));
+        let (tables, in_table, listed) = legal_pdf_core::profile::tally("fences.find_tables", || fences.find_tables(pages, slots, &items));
+        let listed_contents = legal_pdf_core::profile::tally("fences.read_contents", || fences.read_contents(pages, slots, evidence, page_labels, &views, &in_table, &listed));
+        legal_pdf_core::profile::tally("fences.read_tables", || fences.read_tables(slots, tables, &listed_contents));
+        let mut voided = legal_pdf_core::profile::tally("fences.free_referenced_note_cells", || fences.free_referenced_note_cells(pages, slots, evidence));
+        legal_pdf_core::profile::tally("fences.read_note_band", || fences.read_note_band(pages, slots, evidence));
+        legal_pdf_core::profile::tally("fences.read_body_type", || fences.read_body_type(pages, slots, evidence));
+        legal_pdf_core::profile::tally("fences.clear_false_bands", || fences.clear_false_bands(pages, slots, evidence));
+        voided |= legal_pdf_core::profile::tally("fences.free_noted_cells", || fences.free_noted_cells(pages, slots, evidence));
+        legal_pdf_core::profile::tally("fences.read_documents", || fences.read_documents(&views, outline));
         if !fences.starts.is_empty() {
-            fences.read_document_furniture(pages, slots, evidence, &rows);
+            legal_pdf_core::profile::tally("fences.read_document_furniture", || fences.read_document_furniture(pages, slots, evidence, &rows));
         }
-        fences.read_transcripts(slots, evidence);
-        voided |= fences.free_spoken_cells(slots, evidence);
+        legal_pdf_core::profile::tally("fences.read_transcripts", || fences.read_transcripts(slots, evidence));
+        voided |= legal_pdf_core::profile::tally("fences.free_spoken_cells", || fences.free_spoken_cells(slots, evidence));
         if voided {
-            fences.prune_tables(slots);
+            legal_pdf_core::profile::tally("fences.prune_tables", || fences.prune_tables(slots));
         }
-        fences.read_order(pages, slots, evidence);
-        fences.read_margin_numbers(pages, slots);
+        legal_pdf_core::profile::tally("fences.read_order", || fences.read_order(pages, slots, evidence));
+        legal_pdf_core::profile::tally("fences.read_margin_numbers", || fences.read_margin_numbers(pages, slots));
         fences
     }
 

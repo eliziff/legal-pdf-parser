@@ -5,7 +5,7 @@
 use legal_pdf_core::model::Page;
 use legal_pdf_core::{AuthoritySource, AuthorityTextUnit, SourceMapping};
 use legal_pdf_core::{Error, Result};
-use crate::model::TRANSITION_ORIGIN;
+use crate::model::ORIGIN;
 use legal_structure_model::{utf16_len, DocumentStructure, NodeKind, PrimaryRole, ScalarRange, ScalarText, StructureNode};
 use std::collections::{HashMap, HashSet};
 
@@ -22,7 +22,7 @@ fn fault(message: &str) -> Error {
 
 /// A unit's text node, or a note: the nodes whose lines are theirs in the rendered text.
 fn owns_text(node: &StructureNode) -> bool {
-    (node.origin_id == TRANSITION_ORIGIN || note(node)) && !node.line_ids.is_empty()
+    (node.origin_id == ORIGIN || note(node)) && !node.line_ids.is_empty()
         && matches!(node.kind, NodeKind::Paragraph | NodeKind::Heading | NodeKind::Section | NodeKind::ListItem
             | NodeKind::Prose | NodeKind::Footnote | NodeKind::Endnote)
 }

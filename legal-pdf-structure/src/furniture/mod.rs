@@ -8,7 +8,7 @@ use legal_pdf_core::{quantile, regex};
 use legal_pdf_pages::{EdgeLine, PageEvidence};
 use crate::layout::{aligned_note_body, aligned_note_body_among, line_center_x, standalone_note_label};
 use crate::model::{Edge, PageView, Rows, Rule, Slot};
-use crate::text::text::{heading_standalone_re, scalar_suffix, standalone_paragraph_number};
+use crate::text::text::{scalar_suffix, standalone_paragraph_number};
 use legal_structure_model::text::line_start_label_prefix;
 use std::collections::{HashMap, HashSet};
 
@@ -195,14 +195,13 @@ pub(crate) fn section_heads(views: &[PageView], rows: &[&Rows]) -> Vec<(Slot, Ed
 /// paragraph's or provision's marker alone on its line beside its text ("(1)", "15(4)", "12" at a
 /// page's top) is no running head or page number, though it recurs at one place. A division's
 /// heading alone on its line ("PART 50") whose text no other line prints, and on a row of no other
-/// furniture, is no running head. Lines `line_label` holds are a transcript's line numbers, never
+/// furniture, is no running head. Words the body prints away from the edges on as many pages as
+/// they recur at one place on the edge are the body's, no running head. Lines `line_label` holds are a transcript's line numbers, never
 /// furniture. Each line read as furniture, with its edge and the rule that read it.
 pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot) -> bool, folio: impl Fn(Slot) -> bool) -> Vec<(Slot, Edge, Rule)> {
-    // LEGALPDF_ABLATE=furniture leaves the repeated-furniture reader out, for its measure under the tagger.
-    if legal_structure_model::ablated("furniture") {
-        return Vec::new();
-    }
     let mut candidates: HashMap<(u8, String), Vec<Hit>> = HashMap::new();
+    // The pages printing each text (as repetition compares it) away from their edges.
+    let mut body: HashMap<String, HashSet<usize>> = HashMap::new();
     measure("furniture.candidates", || {
         for (page_slot, view) in views.iter().enumerate() {
             let page = view.page;
@@ -213,10 +212,11 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                 let line_slot = view.place(slot);
                 let edge = furniture_edge(line, page.width, page.height)
                     .or_else(|| frame_edge(rows[page_slot], line_slot).map(|edge| u8::from(edge == Edge::Bottom)));
+                let normalized = normalize_furniture(&line.text);
                 let Some(edge) = edge else {
+                    body.entry(normalized).or_default().insert(page_slot);
                     continue;
                 };
-                let normalized = normalize_furniture(&line.text);
                 if !normalized.is_empty() {
                     let (y_ratio, x_ratio) = (line.bbox[1] / page.height, (line.bbox[0] + line.bbox[2]) / (2.0 * page.width));
                     candidates.entry((edge, normalized)).or_default().push(Hit { page_slot, line_slot, page_number: page.number, y_ratio, x_ratio });
@@ -233,10 +233,18 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
     let figures = |key: &str| !key.chars().any(char::is_alphabetic) && (key.contains("#:#") || key.contains("#/#"));
     // A cover-page title can repeat the running title away from the header
     // baseline. Admit the stable occurrence cluster, not every matching string.
+    // A running head's words are printed at the page's edge; words the body prints on at least as
+    // many pages are the body's, where its flow reaches the edge (a statute's sections set in one
+    // form of words, "shall record the reasons ...", the first lines of page after page).
     let mut repeated: HashSet<(usize, usize)> = measure("furniture.alignment", || {
         candidates
             .into_iter()
-            .flat_map(|((_, key), hits)| aligned_furniture(&hits, if figures(&key) { minimum.max(views.len().div_ceil(2)) } else { minimum }))
+            .flat_map(|((_, key), hits)| {
+                let kept = aligned_furniture(&hits, if figures(&key) { minimum.max(views.len().div_ceil(2)) } else { minimum });
+                let pages = kept.iter().map(|&(page_slot, _)| page_slot).collect::<HashSet<_>>().len();
+                let printed = if key.chars().any(char::is_alphabetic) { body.get(&key).map_or(0, HashSet::len) } else { 0 };
+                if pages > 0 && printed >= pages { HashSet::new() } else { kept }
+            })
             .collect()
     });
     // A document too short for repetition shows its furniture at its pages' edges.
@@ -282,7 +290,7 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
             // other page repeats there, as no folio beside its running title does.
             attached.extend(members.iter().copied().filter(|&index| {
                 let label = &page.lines[index];
-                let heading = heading_standalone_re().is_match(&label.text);
+                let heading = label.text.split_whitespace().count() == 1 && crate::evidence::enumerated(&label.text);
                 (heading || structure_marker(&label.text))
                     && members.iter().any(|&body_index| {
                         let body = &page.lines[body_index];
@@ -334,10 +342,15 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
             }
             // A bare number with a line of the page's prose on its row is the margin's, not the page's: a law report
             // prints its paragraph numbers beside the row each opens on, and at the page's first or last row they read
-            // as a repeated edge number ("#"). A folio or a page number stands beside furniture or alone.
+            // as a repeated edge number ("#"), in either margin ("Although ..." / "Bien que ..." / "25"). A folio or a
+            // page number stands beside furniture or alone; the page's folio the page map read stands after its row's
+            // words too (a scan's running head read as one line of prose: "[1996] I R.C.S. CHABLIS TEXTILES ... Le juge
+            // Gonthier" / "167"), and is a paragraph's number only where the prose it opens follows it ("4" / "The
+            // Union has traditionally ...").
             let row_of = &rows[page_slot].of;
             let letters = |index: usize| page.lines[index].text.chars().filter(|c| c.is_alphabetic()).count();
             let row_mates = |index: usize| (0..page.lines.len()).filter(move |&other| other != index && row_of[other] == row_of[index]);
+            let opens = |index: usize, other: usize| !is_folio(index) || page.lines[other].bbox[0] >= page.lines[index].bbox[0];
             // (Figures too long for a folio stand so in a table's row, its words in cells: "(7)  15050040" / "James Bingham en
             // 1862" / "11749133" / "9 févr. 2001" / "& Timber Corporation".)
             let margin: Vec<usize> = (0..page.lines.len())
@@ -347,7 +360,7 @@ pub(crate) fn read(views: &[PageView], rows: &[&Rows], line_label: impl Fn(Slot)
                         && !text.is_empty()
                         && text.bytes().all(|byte| byte.is_ascii_digit())
                         && row_of[index] != u32::MAX
-                        && (text.len() <= 4 && row_mates(index).any(|other| found[other].is_none() && letters(other) >= 20)
+                        && (text.len() <= 4 && row_mates(index).any(|other| found[other].is_none() && letters(other) >= 20 && opens(index, other))
                             || text.len() > 4 && row_mates(index).filter(|&other| found[other].is_none()).map(letters).sum::<usize>() >= 20)
                 })
                 .collect();

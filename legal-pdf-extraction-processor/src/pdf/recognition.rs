@@ -1,12 +1,17 @@
 //! Recognized pages: recognition's lines made into the model's, a text layer's quality against
 //! them, and a whole document recognized.
 
+#[allow(unused_imports, dead_code)]
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[allow(unused_imports)]
 use legal_pdf_core::{regex, Error, OcrLine, OcrPageRequest, PdfOcrProvider, Result};
 use legal_pdf_core::model::{Diagnostic, Line, Page, Word};
+#[allow(unused_imports)]
 use super::ExtractedPdf;
+#[allow(unused_imports)]
 use super::pictures::place_picture_lines;
 
+#[cfg_attr(not(feature = "full"), allow(dead_code))]
 pub(crate) fn make_ocr_line(result: OcrLine, page: &Page, local_index: usize) -> Option<Line> {
     let mut text = result.text;
     let trimmed_end = text.trim_end().len();
@@ -176,6 +181,7 @@ fn read_lines(lines: Vec<OcrLine>, page: &Page, first: usize) -> Vec<Line> {
 }
 
 /// Apply recognition to extracted pages without loading or extracting the PDF again.
+#[cfg(feature = "full")]
 pub fn recognize_pdf(
     pdf: &[u8],
     extracted: &mut ExtractedPdf,
@@ -366,7 +372,7 @@ pub fn recognize_pdf(
             }
         }
         // Paragraph numbers the scan lost, from the run they stand in and the margin read again.
-        if crate::paragraph_recovery::recover(pdf, pages, &metadata.scanned_pages, provider) > 0 {
+        if crate::paragraph_recovery::recover(pdf, pages, &metadata.scanned_pages, separators, provider) > 0 {
             reindex = true;
         }
     }

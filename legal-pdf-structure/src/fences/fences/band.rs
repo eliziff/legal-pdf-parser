@@ -20,7 +20,8 @@ impl Fences {
                     return None;
                 }
                 let prefix = label_prefix(&line.text)?;
-                has_prior_reference(&page.lines, &prefix.label, line.bbox[1])
+                let marked = slots.on(page_slot).map(|slot| (slots.line(pages, Slot(slot)), evidence.marks[slot as usize].as_slice()));
+                has_prior_reference(marked, &prefix.label, line.bbox[1])
                     .then(|| (slot, prefix.label.chars().all(is_note_symbol)))
             }).collect::<Vec<_>>();
             let tolerance = separator_tolerance(page);

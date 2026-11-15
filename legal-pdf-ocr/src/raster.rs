@@ -2,7 +2,7 @@
 //! separator, thin strokes (rules and underlines), and each line's ink, stroke weight and capital
 //! height. Nothing here reads text, so it is keyed apart from recognition.
 use crate::ocr::gray_of;
-use crate::separator::{horizontal_rules, separator_y};
+use crate::separator::separator_y;
 use legal_pdf_core::render::{open_pdf, PageRenderer};
 use legal_pdf_core::{OcrPageRequest, RasterReading};
 
@@ -139,11 +139,42 @@ fn halved(gray: &[u8], width: usize, height: usize) -> (Vec<u8>, usize, usize) {
     (out, half_width, half_height)
 }
 
-/// Thin horizontal strokes, `[x0, y, x1, y]` in points: rules at least ten pixels long and at most
-/// four rows thick, dark below 110.
+/// Thin horizontal strokes, `[x0, y, x1, y]` in points: runs of pixels dark below 110 (gaps of two bridged) at least ten
+/// pixels long, each with light rows three pixels above and below it across most of the run, a run in the row just under
+/// one joining it as the same stroke, thicker; at most four rows thick. Each row's run is tested on its own, which the
+/// separator's scanner (`separator::horizontal_rules`, testing a rule at its two ends) does not do: there the rows of a
+/// line of text join the underline set close under them into one rule too thick to be one, and no underline is read.
 fn thin_strokes(gray: &[u8], width: usize, height: usize, sx: f64, sy: f64) -> Vec<[f64; 4]> {
-    horizontal_rules(|x, y| gray[y * width + x] < 110, width, height, 10, 4)
+    let dark = |x: usize, y: usize| gray[y * width + x] < 110;
+    let light_share = |y: usize, a: usize, b: usize| (a..b).filter(|&x| !dark(x, y)).count() * 10 >= (b - a) * 7;
+    let mut strokes: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for y in 3..height.saturating_sub(3) {
+        let mut x = 0;
+        while x < width {
+            if !dark(x, y) {
+                x += 1;
+                continue;
+            }
+            let (start, mut end, mut gap) = (x, x, 0);
+            while x < width && gap <= 2 {
+                if dark(x, y) {
+                    (end, gap) = (x, 0);
+                } else {
+                    gap += 1;
+                }
+                x += 1;
+            }
+            if end + 1 - start >= 10 && light_share(y - 3, start, end + 1) && light_share(y + 3, start, end + 1) {
+                match strokes.iter_mut().rev().take(64).find(|s| s.3 + 1 == y && s.0 < end && start < s.1) {
+                    Some(last) => (last.0, last.1, last.3) = (last.0.min(start), last.1.max(end), y),
+                    None => strokes.push((start, end, y, y)),
+                }
+            }
+        }
+    }
+    strokes
         .into_iter()
+        .filter(|s| s.3 - s.2 <= 3)
         .map(|(a, b, top, bottom)| {
             let y = (top + bottom) as f64 / 2.0 * sy;
             [a as f64 * sx, y, (b + 1) as f64 * sx, y]

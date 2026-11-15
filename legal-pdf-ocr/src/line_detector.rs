@@ -1,5 +1,5 @@
 use crate::indra::{open_session, ort_error, LineBox};
-use image::{imageops, GrayImage};
+use image::GrayImage;
 use legal_pdf_core::{Error, OrtBackend, Result};
 use ort::{
     session::{builder::PrepackedWeights, Session},
@@ -11,11 +11,18 @@ use std::path::Path;
 pub(crate) struct LineDetector {
     session: Session,
     side: usize,
+    input: Vec<f32>,
+    scratch: crate::simd_kernel::DownsampleScratch,
 }
 
 impl LineDetector {
     pub fn open(path: &Path, side: usize, backend: OrtBackend, device: &str, independent_pool: bool) -> Result<Self> {
-        Ok(Self { session: open_session(path, 1, backend, device, true, &PrepackedWeights::new(), independent_pool)?, side })
+        Ok(Self {
+            session: open_session(path, 1, backend, device, true, &PrepackedWeights::new(), independent_pool)?,
+            side,
+            input: Vec::new(),
+            scratch: crate::simd_kernel::DownsampleScratch::default(),
+        })
     }
 
     pub fn lines(&mut self, image: &GrayImage) -> Result<Vec<LineBox>> {
@@ -25,21 +32,17 @@ impl LineDetector {
         let resized_height = (f64::from(height) * scale).round().max(1.0) as usize;
         let input_width = resized_width.div_ceil(32) * 32;
         let input_height = resized_height.div_ceil(32) * 32;
-        let resized = imageops::resize(
+        crate::simd_kernel::downsample_to_norm_f32(
             image,
-            resized_width as u32,
-            resized_height as u32,
-            imageops::FilterType::Triangle,
+            resized_width,
+            resized_height,
+            input_width,
+            input_height,
+            &mut self.input,
+            &mut self.scratch,
         );
-        let mut input = vec![0.0_f32; input_width * input_height];
-        for y in 0..resized_height {
-            for x in 0..resized_width {
-                input[y * input_width + x] =
-                    1.0 - f32::from(resized[(x as u32, y as u32)][0]) / 255.0;
-            }
-        }
         let tensor =
-            TensorRef::from_array_view(([1, 1, input_height, input_width], input.as_slice()))
+            TensorRef::from_array_view(([1, 1, input_height, input_width], self.input.as_slice()))
                 .map_err(ort_error)?;
         let name = self.session.inputs[0].name.clone();
         let outputs = self

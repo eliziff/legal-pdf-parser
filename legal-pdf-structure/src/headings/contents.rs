@@ -93,7 +93,7 @@ fn levels(entries: &[&Entry]) -> Vec<usize> {
             open.len().clamp(1, MAX_LEVEL)
         }).collect();
     }
-    let rungs = ladder_levels(&entries.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(), &[]);
+    let rungs = ladder_levels(&entries.iter().map(|entry| crate::evidence::heading_numbers(&entry.title)).collect::<Vec<_>>(), &[]);
     let ladder = || -> Vec<usize> { rungs.iter().map(|rung| rung.map_or(1, |(level, _)| level.min(MAX_LEVEL))).collect() };
     if rungs.iter().filter(|rung| rung.is_some()).count() * 2 >= entries.len() {
         return ladder();

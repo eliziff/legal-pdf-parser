@@ -9,7 +9,7 @@ pub(crate) type DocumentContext = (usize, bool);
 
 /// A reading context: a constituent document of the packet (0 for its own), its parallel
 /// translation or not, and a quotation in it (0 for none).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Context {
     pub(crate) document: u16,
     pub(crate) translation: bool,

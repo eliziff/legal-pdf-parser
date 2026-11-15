@@ -17,6 +17,6 @@ pub(crate) use roles::*;
 pub(crate) use runs::*;
 pub(crate) use slots::*;
 
-/// The origin of the transition parser's nodes.
-pub(crate) const TRANSITION_ORIGIN: &str = "legal-pdf-transition.v1";
+/// The origin of the parser's nodes.
+pub(crate) const ORIGIN: &str = "legal-pdf-structure.v1";
 

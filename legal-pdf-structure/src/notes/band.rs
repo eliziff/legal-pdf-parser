@@ -18,8 +18,6 @@
 //! The band then gives back the endnote runs the body never refers to (`verify_endnotes`), and says
 //! of each page whether it read a note there and where its band begins. It reads a document's lines
 //! (`Document`: its evidence and fences) on its pages and writes nothing (`read_band`).
-//! A line a page layout model labelled keeps that label's reading of note or text under
-//! LEGALPDF_ABLATE=layout_notes.
 
 use super::lines::{
     citation_shaped_candidate, continuing_note_heading, endnote_heading, has_prior_reference, longest_label_run,
@@ -30,7 +28,7 @@ use legal_pdf_core::median;
 use crate::fences::Fences;
 use crate::headings::recognized_page;
 use crate::layout::{
-    aligned_note_body_among, band_geometry_top, columns_of, kept_items, layout_labelled, line_center_x, line_width,
+    aligned_note_body_among, band_geometry_top, columns_of, kept_items, line_center_x, line_width,
     margin_note_model, standalone_note_label, ColumnKind, ColumnModel,
 };
 use crate::model::{
@@ -38,11 +36,11 @@ use crate::model::{
     SUPPRESS_WRAPPED,
 };
 use crate::text::text::all_caps;
-use legal_structure_model::text::{is_note_symbol, label_prefix, line_start_label_prefix, LabelPrefix};
+use legal_structure_model::text::{is_note_symbol, label_prefix, line_start_label_prefix, normalize_label, LabelPrefix};
 use std::collections::BTreeSet;
 
 /// A note's kind: at its page's foot, or among the notes collected at a part's or the document's end.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum NoteKind {
     Footnote,
     Endnote,
@@ -168,6 +166,26 @@ impl<'a> Sheet<'a> {
         self.members.iter().map(|&place| (place, &self.page.lines[place]))
     }
 
+    /// The document's lines on the page, each with its reference marks (`Evidence::marks`): what a label's
+    /// reference is looked for in (`has_prior_reference`).
+    fn marked(&self) -> impl Iterator<Item = (&'a Line, &'a [(u32, u32, u32)])> + '_ {
+        let evidence: &'a Evidence = self.document.evidence;
+        self.with(&evidence.marks)
+    }
+
+    /// The document's lines on the page, each with its marks set apart from its text (`Evidence::calls`): what decides
+    /// that a whole count or run is notes (an endnote run kept, a page's count released) looks for a label's reference
+    /// in, a scan's figures run on from its words being as often its garble as a call.
+    fn called(&self) -> impl Iterator<Item = (&'a Line, &'a [(u32, u32, u32)])> + '_ {
+        let evidence: &'a Evidence = self.document.evidence;
+        self.with(&evidence.calls)
+    }
+
+    /// The page's member lines, each with its entry of `marks` (one per document line).
+    fn with(&self, marks: &'a [Vec<(u32, u32, u32)>]) -> impl Iterator<Item = (&'a Line, &'a [(u32, u32, u32)])> + '_ {
+        self.members.iter().map(move |&place| (&self.page.lines[place], marks[self.first + place].as_slice()))
+    }
+
     /// The type sizes of the page's lines `keep` holds (by place and line), those set from 4 to 24 points.
     fn sizes_where(&self, keep: impl Fn(usize, &Line) -> bool) -> Vec<f64> {
         self.lines().filter(|&(place, line)| keep(place, line)).map(|(place, _)| self.page.lines[place].size).filter(|size| (4.0..=24.0).contains(size)).collect()
@@ -266,17 +284,37 @@ fn printed_label(line: &Line) -> String {
 /// rules, references, source regions and note continuation win.
 fn paragraph_labels(sheet: &Sheet, reading: &PageReading, expected_endnote: Option<u32>) -> Vec<bool> {
     let mut found = vec![false; sheet.page.lines.len()];
-    for (place, line) in sheet.lines() {
-        let label = || printed_label(line);
-        found[place] = sheet.paragraph(place)
-            && !reading.separator.is_some_and(|cut| line.bbox[1] >= cut - reading.tolerance)
-            && !has_prior_reference(sheet.lines().map(|(_, line)| line), &label(), line.bbox[1])
-            && !sheet.noted(place)
+    // The page's counted numbers: each one's place, its value, and whether the page shows it a note's.
+    let mut counted: Vec<(usize, u32, bool)> = Vec::new();
+    for (place, line) in sheet.lines().filter(|&(place, _)| sheet.paragraph(place)) {
+        let label = printed_label(line);
+        let shown = reading.separator.is_some_and(|cut| line.bbox[1] >= cut - reading.tolerance)
+            || has_prior_reference(sheet.called(), &label, line.bbox[1])
+            || sheet.noted(place);
+        found[place] = !shown
             && !sheet.lines().any(|(_, heading)| heading.bbox[1] < line.bbox[1] && endnote_heading(&heading.text))
             && !expected_endnote.is_some_and(|expected| {
-                label().parse::<u32>().is_ok_and(|number| number >= expected)
+                label.parse::<u32>().is_ok_and(|number| number >= expected)
                     && !sheet.lines().any(|(_, heading)| heading.bbox[1] < line.bbox[1] && structural_reset_heading(&heading.text))
             });
+        if let Ok(value) = normalize_label(&label).parse::<u32>() {
+            counted.push((place, value, shown));
+        }
+    }
+    // One count on a page is one thing. Where three or more of the page's numbers count on by one and the page shows
+    // two of them, and a third of them or more, the notes' (notes 68 and 72 to 74 referred to above, 69 to 71 and 75
+    // between and after them with their references misread), the whole count is the notes'. A page shows a number by a
+    // mark set apart from its text (`Sheet::called`): a scan's figures run on from its words ("n9", "n08" for "n°" in a
+    // count of sentences) show none.
+    counted.sort_by_key(|&(_, value, _)| value);
+    for run in counted.chunk_by(|a, b| b.1 == a.1 + 1) {
+        let shown = run.iter().filter(|(_, _, shown)| *shown).count();
+        if run.len() >= 3 && shown >= 2 && shown * 3 >= run.len() {
+            // Only a label the band would read as a note's is released (`rejected`): one it reads as no note's stays the
+            // paragraph's it was.
+            let takes = |place: usize| sheet.labels[place].is_some_and(|label| !rejected(sheet, reading, place, &label, typographic(sheet, reading, place, &label)));
+            run.iter().filter(|&&(place, ..)| takes(place)).for_each(|&(place, ..)| found[place] = false);
+        }
     }
     found
 }
@@ -284,11 +322,9 @@ fn paragraph_labels(sheet: &Sheet, reading: &PageReading, expected_endnote: Opti
 /// A line that opens with a note label: its place, the label, and whether its type sets it as one.
 type Candidate = (usize, LabelPrefix, bool);
 
-/// The lines that open with a note label, and the lines whose label is no note's: a table's cells,
-/// a page number in the corner, a number before a comma, a reference's number wrapped onto the
-/// next line, or a label set larger than the body.
+/// The lines that open with a note label, and the lines whose label is no note's: a table's cells and the labels the
+/// band rejects (`rejected`).
 fn label_candidates(sheet: &Sheet, reading: &PageReading, paragraph: &[bool]) -> (Vec<Candidate>, Vec<usize>) {
-    let (page, body_size) = (sheet.page, reading.body_size);
     let (mut candidates, mut suppress) = (Vec::new(), Vec::new());
     for (place, line) in sheet.lines() {
         if paragraph[place] {
@@ -302,28 +338,45 @@ fn label_candidates(sheet: &Sheet, reading: &PageReading, paragraph: &[bool]) ->
             continue;
         }
         let (Some(label), Some(prefix)) = (sheet.labels[place], label_prefix(&line.text)) else { continue };
-        let typographic = label.typographic(body_size)
-            || (standalone_note_label(line)
-                && aligned_note_body_among(&page.lines, sheet.rows(), sheet.members.iter().copied(), place).is_some_and(|body| {
-                    let size = sheet.page.lines[body].size;
-                    size > 0.0 && size <= body_size * 0.90
-                }));
-        let size = if sheet.page.lines[place].size > 0.0 { sheet.page.lines[place].size } else { body_size };
-        let bottom_right = reading.separator.is_none() && label.suppress & SUPPRESS_CORNER != 0;
-        // A number followed by a comma is the line's text ("1991, c. 43, s. 4" in a statute's
-        // small-type history note), unless it is raised above its line.
-        let comma_tail = label.suppress & SUPPRESS_COMMA != 0;
-        // A number opening a line under one that ends on a reference's noun ("... c. 27 (1st
-        // Supp.), s" / "13.") is that reference's number, wrapped.
-        let wrapped_reference = label.suppress & SUPPRESS_WRAPPED != 0;
-        let below_separator = reading.separator.is_some_and(|cut| line.bbox[1] >= cut - reading.tolerance);
-        if (label.suppress & SUPPRESS_FOOT != 0 && !(below_separator && typographic)) || bottom_right || comma_tail || wrapped_reference || size > body_size * 1.15 {
+        let typographic = typographic(sheet, reading, place, &label);
+        if rejected(sheet, reading, place, &label, typographic) {
             suppress.push(place);
             continue;
         }
         candidates.push((place, prefix, typographic));
     }
     (candidates, suppress)
+}
+
+/// Whether a line's label is set as a note's: its own type, or a lone label beside a note's body in a note's type.
+fn typographic(sheet: &Sheet, reading: &PageReading, place: usize, label: &NoteLabel) -> bool {
+    let body_size = reading.body_size;
+    label.typographic(body_size)
+        || (standalone_note_label(sheet.line(place))
+            && aligned_note_body_among(&sheet.page.lines, sheet.rows(), sheet.members.iter().copied(), place).is_some_and(|body| {
+                let size = sheet.page.lines[body].size;
+                size > 0.0 && size <= body_size * 0.90
+            }))
+}
+
+/// Whether a line's label is no note's: a page number in the corner, a number before a comma, a reference's number
+/// wrapped onto the next line, a foot's number not set as a note's under the rule, or a label set larger than the body
+/// (unless raised and not stopped: a scan's line is as tall as its raised label makes it, and a raised "1." in large
+/// type is a plan's or a by-law's numbered paragraph).
+fn rejected(sheet: &Sheet, reading: &PageReading, place: usize, label: &NoteLabel, typographic: bool) -> bool {
+    let (line, body_size) = (sheet.line(place), reading.body_size);
+    let size = if line.size > 0.0 { line.size } else { body_size };
+    let bottom_right = reading.separator.is_none() && label.suppress & SUPPRESS_CORNER != 0;
+    // A number followed by a comma is the line's text ("1991, c. 43, s. 4" in a statute's small-type history note),
+    // unless it is raised above its line.
+    let comma_tail = label.suppress & SUPPRESS_COMMA != 0;
+    // A number opening a line under one that ends on a reference's noun ("... c. 27 (1st Supp.), s" / "13.") is that
+    // reference's number, wrapped.
+    let wrapped_reference = label.suppress & SUPPRESS_WRAPPED != 0;
+    let below_separator = reading.separator.is_some_and(|cut| line.bbox[1] >= cut - reading.tolerance);
+    let stopped = || label_prefix(&line.text).is_some_and(|prefix| line.text.chars().nth(prefix.end) == Some('.'));
+    (label.suppress & SUPPRESS_FOOT != 0 && !(below_separator && typographic)) || bottom_right || comma_tail || wrapped_reference
+        || size > body_size * 1.15 && (!label.raised || stopped())
 }
 
 /// What a page's label candidates and its other lines say of it before any band is drawn.
@@ -503,7 +556,7 @@ fn margin_notes(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate]) 
     let supported: Vec<_> = candidates
         .iter()
         .filter(|(place, prefix, _)| {
-            margin_candidates.contains(place) && has_prior_reference(sheet.lines().map(|(_, line)| line), &prefix.label, sheet.line(*place).bbox[1])
+            margin_candidates.contains(place) && has_prior_reference(sheet.marked(), &prefix.label, sheet.line(*place).bbox[1])
         })
         .map(|(place, _, _)| *place)
         .collect();
@@ -529,7 +582,7 @@ fn labels(sheet: &Sheet, reading: &PageReading, candidates: &[Candidate], facts:
             let size = sheet.page.lines[*place].size;
             let lower = line.bbox[1] >= page.height * 0.48;
             let small = size > 0.0 && size <= body_size * 0.90;
-            let referenced = || has_prior_reference(sheet.lines().map(|(_, line)| line), &prefix.label, line.bbox[1]);
+            let referenced = || has_prior_reference(sheet.marked(), &prefix.label, line.bbox[1]);
             let reference_backed = lower && size > 0.0 && (size <= body_size * 0.90 || prefix.label.chars().all(is_note_symbol)) && referenced();
             let in_margin = margin.is_some_and(|(model, side)| {
                 usize::from(line_center_x(line) >= model.split_x) == side && size <= reading.note_size * 0.90 && line_width(line) <= page.width * 0.30
@@ -714,8 +767,8 @@ fn verify_endnotes(sheets: &[Sheet], notes: &mut [Vec<(usize, NoteKind)>]) {
         let labels: BTreeSet<String> = (slot..end).flat_map(endnotes).filter_map(|line| label_prefix(&line.text).map(|prefix| prefix.label)).collect();
         let first_note = endnotes(slot).map(|line| line.bbox[1]).min_by(f64::total_cmp).unwrap_or(0.0);
         let referenced = |label: &&String| {
-            sheets[..slot].iter().any(|sheet| has_prior_reference(sheet.lines().map(|(_, line)| line), label, f64::INFINITY))
-                || has_prior_reference(sheets[slot].lines().map(|(_, line)| line), label, first_note)
+            sheets[..slot].iter().any(|sheet| has_prior_reference(sheet.called(), label, f64::INFINITY))
+                || has_prior_reference(sheets[slot].called(), label, first_note)
         };
         let referenced = labels.iter().filter(referenced).count();
         if !headed && referenced * 2 < labels.len().max(1) {
@@ -761,18 +814,14 @@ pub(crate) fn read_band(views: &[PageView], document: Document) -> BandReading {
         let column_cuts = column_cuts(sheet, &labels, columns, margin.is_some(), endnote_page, &facts, &furniture);
         let band = Band { endnote_page, cut, column_cuts, columns, endnote_heading_source: facts.endnote_heading_source };
         // Each line's reading: a notes heading is a heading, a table's cell body text, furniture
-        // stays, a source's heading survives, a line a layout model labelled keeps its reading of
-        // note or text, a numbered paragraph's line is body, and the rest are note or body by the band.
+        // stays, a source's heading survives, a numbered paragraph's line is body, and the rest are
+        // note or body by the band.
         let kind = if endnote_page { NoteKind::Endnote } else { NoteKind::Footnote };
         let mut page_notes = Vec::new();
         for (place, line) in sheet.lines().filter(|&(place, _)| !sheet.excluded(place)) {
             if endnote_heading(&line.text) {
                 found.headings.push(sheet.view.slot(place));
             } else if reading.table_cells[place] || furniture(place) || sheet.headed(place) {
-            } else if legal_structure_model::ablated("layout_notes") && layout_labelled(line) {
-                if sheet.noted(place) {
-                    page_notes.push((place, kind));
-                }
             } else if !paragraph[place] && band.holds(line) {
                 page_notes.push((place, kind));
             }

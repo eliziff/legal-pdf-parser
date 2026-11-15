@@ -334,26 +334,53 @@ impl OcrProvider {
         if images.is_empty() {
             return Ok(Vec::new());
         }
+        let adjusted: Vec<std::borrow::Cow<'_, GrayImage>> = images
+            .iter()
+            .map(|img| {
+                let prof = crate::simd_kernel::analyze_gray_page(img);
+                match crate::simd_kernel::upright_and_deskew(img, prof) {
+                    Some(fixed) => std::borrow::Cow::Owned(fixed),
+                    None => std::borrow::Cow::Borrowed(img),
+                }
+            })
+            .collect();
+        let owned_or_borrowed: Vec<GrayImage> = adjusted.into_iter().map(|c| c.into_owned()).collect();
         // Balance bounded windows so overlap never leaves a one-page tail.
-        let window_size = if images.len() <= 4 { images.len() } else { preparation_window_size(images.len()) };
+        let window_size = if owned_or_borrowed.len() <= 4 { owned_or_borrowed.len() } else { preparation_window_size(owned_or_borrowed.len()) };
+        let mut pages = {
+            let Self { sessions, codec, layouts, plan, .. } = self;
+            std::thread::scope(|scope| -> Result<Vec<Vec<OcrLine>>> {
+                let (sender, receiver) = sync_channel(1);
+                let slice = owned_or_borrowed.as_slice();
+                scope.spawn(move || {
+                    for window in slice.chunks(window_size) {
+                        let value = prepare_window(layouts, window, window);
+                        let failed = value.is_err();
+                        if sender.send(value).is_err() || failed {
+                            break;
+                        }
+                    }
+                });
+                let mut pages = Vec::with_capacity(owned_or_borrowed.len());
+                for window in receiver {
+                    pages.extend(recognize_pages(sessions, codec, plan, window?)?);
+                }
+                Ok(pages)
+            })?
+        };
         let Self { sessions, codec, layouts, plan, .. } = self;
-        std::thread::scope(|scope| {
-            let (sender, receiver) = sync_channel(1);
-            scope.spawn(move || {
-                for window in images.chunks(window_size) {
-                    let value = prepare_window(layouts, window, window);
-                    let failed = value.is_err();
-                    if sender.send(value).is_err() || failed {
-                        break;
+        for (i, page_lines) in pages.iter_mut().enumerate() {
+            if crate::simd_kernel::needs_180_check(page_lines) {
+                let flipped = [imageops::rotate180(&owned_or_borrowed[i])];
+                let prep = prepare_window(layouts, &flipped, &flipped)?;
+                if let Some(re_lines) = recognize_pages(sessions, codec, plan, prep)?.into_iter().next() {
+                    if crate::simd_kernel::text_quality_score(&re_lines) > crate::simd_kernel::text_quality_score(page_lines) {
+                        *page_lines = re_lines;
                     }
                 }
-            });
-            let mut pages = Vec::with_capacity(images.len());
-            for window in receiver {
-                pages.extend(recognize_pages(sessions, codec, plan, window?)?);
             }
-            Ok(pages)
-        })
+        }
+        Ok(pages)
     }
 
     /// The requested pages of `bytes` recognized, in request order: drawn by up to four workers,
@@ -626,16 +653,26 @@ fn recognize_prepared_pages(
     })
 }
 
-fn recognition_jobs(lines: &[&PreparedLine], batch_size: usize, width_bucket: usize) -> Vec<Vec<usize>> {
-    let mut groups = BTreeMap::<usize, Vec<usize>>::new();
-    for (index, line) in lines.iter().enumerate() {
-        groups.entry(line.width.div_ceil(width_bucket)).or_default().push(index);
+fn recognition_jobs(lines: &[&PreparedLine], batch_size: usize, _width_bucket: usize) -> Vec<Vec<usize>> {
+    let mut order = (0..lines.len()).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|&i| lines[i].width);
+    let mut jobs = Vec::new();
+    let mut cur = Vec::with_capacity(batch_size);
+    let mut min_w = 0usize;
+    for idx in order {
+        let w = lines[idx].width;
+        if !cur.is_empty() && (cur.len() >= batch_size || cur.len() * w.saturating_sub(min_w) > 128) {
+            jobs.push(std::mem::take(&mut cur));
+        }
+        if cur.is_empty() {
+            min_w = w;
+        }
+        cur.push(idx);
     }
-    let mut jobs = groups
-        .into_values()
-        .flat_map(|indices| indices.chunks(batch_size).map(<[usize]>::to_vec).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    jobs.sort_unstable_by_key(|job| std::cmp::Reverse(job.len() * lines[job[0]].width.div_ceil(width_bucket)));
+    if !cur.is_empty() {
+        jobs.push(cur);
+    }
+    jobs.sort_unstable_by_key(|job| std::cmp::Reverse(job.len() * lines[*job.last().unwrap()].width));
     jobs
 }
 
@@ -658,14 +695,16 @@ fn recognize_batch(
         for row in 0..INPUT_HEIGHT {
             let source = row * line.width;
             let target = (local * INPUT_HEIGHT + row) * maximum;
-            for (&value, pixel) in line.pixels[source..source + line.width].iter().zip(&mut pixels[target..target + line.width]) {
-                *pixel = 1.0 - f32::from(value) / 255.0;
-            }
+            crate::simd_kernel::u8_to_norm_f32_row(
+                &line.pixels[source..source + line.width],
+                &mut pixels[target..target + line.width],
+            );
         }
     }
     let image = TensorRef::from_array_view(([batch.len(), 1, INPUT_HEIGHT, maximum], pixels.as_slice())).map_err(ort_error)?;
     let sequence_lengths = TensorRef::from_array_view(([batch.len()], lengths.as_slice())).map_err(ort_error)?;
-    let use_ids = !batch.iter().any(|&index| lines[index].bbox.recovered || lines[index].confidence_required);
+    let has_class_ids = session.outputs.iter().any(|output| output.name == "class_ids");
+    let use_ids = has_class_ids && !batch.iter().any(|&index| lines[index].bbox.recovered || lines[index].confidence_required);
     let run_options = RunOptions::new()
         .map_err(ort_error)?
         .with_outputs(OutputSelector::no_default().with(if use_ids { "class_ids" } else { "logits" }).with("lengths"));
@@ -830,6 +869,19 @@ fn translate_lines(lines: &mut [OcrLine], origin: [f64; 2]) {
     }
 }
 
+fn optimized_cache_path(model: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(model).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let stem = model.file_stem()?.to_string_lossy();
+    let dir = std::env::temp_dir().join("legalocr-ort-cache");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join(format!("{stem}_{}_{}_v3.opt.onnx", meta.len(), mtime)))
+}
+
 pub(crate) fn open_session(
     model: &Path,
     threads: usize,
@@ -839,20 +891,41 @@ pub(crate) fn open_session(
     prepacked_weights: &PrepackedWeights,
     independent_pool: bool,
 ) -> Result<Session> {
+    let cache_path = (backend == OrtBackend::Cpu).then(|| optimized_cache_path(model)).flatten();
+    let use_cached = cache_path.as_ref().is_some_and(|p| p.is_file());
+    let (load_path, opt_level, write_tmp) = if use_cached {
+        (cache_path.as_deref().unwrap(), GraphOptimizationLevel::Disable, None)
+    } else {
+        let tmp = cache_path.as_ref().map(|p| p.with_extension(format!("tmp.{}.onnx", std::process::id())));
+        (model, GraphOptimizationLevel::Level3, tmp)
+    };
     let mut builder = Session::builder()
         .map_err(ort_error)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .with_optimization_level(opt_level)
         .map_err(ort_error)?
         .with_intra_threads(threads)
         .map_err(ort_error)?
         .with_inter_threads(1)
         .and_then(|builder| builder.with_prepacked_weights(prepacked_weights))
+        .and_then(|builder| builder.with_config_entry("session.set_denormal_as_zero", "1"))
         .map_err(ort_error)?;
+    if let Some(ref tmp_path) = write_tmp {
+        builder = builder.with_optimized_model_path(tmp_path).map_err(ort_error)?;
+    }
     if independent_pool {
         builder = builder.with_independent_thread_pool().map_err(ort_error)?;
     }
-    if backend == OrtBackend::DirectMl {
-        builder = builder.with_memory_pattern(false).and_then(|builder| builder.with_parallel_execution(false)).map_err(ort_error)?;
+    if backend == OrtBackend::DirectMl || (backend == OrtBackend::Cpu && threads == 1) {
+        builder = builder
+            .with_memory_pattern(false)
+            .and_then(|builder| builder.with_parallel_execution(false))
+            .map_err(ort_error)?;
+        if backend == OrtBackend::Cpu {
+            builder = builder
+                .with_config_entry("session.intra_op.allow_spinning", "0")
+                .and_then(|builder| builder.with_config_entry("session.inter_op.allow_spinning", "0"))
+                .map_err(ort_error)?;
+        }
     }
     if backend == OrtBackend::Cpu && !cpu_arena {
         builder = builder
@@ -873,7 +946,13 @@ pub(crate) fn open_session(
     if !providers.is_empty() {
         builder = builder.with_execution_providers(providers).map_err(ort_error)?;
     }
-    builder.commit_from_file(model).map_err(ort_error)
+    let session = builder.commit_from_file(load_path).map_err(ort_error)?;
+    if let (Some(tmp_path), Some(final_path)) = (write_tmp, cache_path) {
+        if tmp_path.is_file() {
+            let _ = std::fs::rename(&tmp_path, &final_path);
+        }
+    }
+    Ok(session)
 }
 
 fn validate_options(options: &OcrOptions) -> Result<()> {
@@ -906,36 +985,60 @@ pub(crate) fn ort_error(error: ort::Error) -> Error {
 /// third of its height at each side, `VERTICAL_MARGIN` of it above and below) and scaled to the
 /// recognizer's height.
 fn prepare_line(image: &GrayImage, bbox: LineBox) -> Option<PreparedLine> {
-    if bbox.width() == 0 || bbox.height() == 0 {
+    let bw = bbox.width();
+    let bh = bbox.height();
+    if bw == 0 || bh == 0 {
         return None;
     }
-    let crop = imageops::crop_imm(image, bbox.left as u32, bbox.top as u32, bbox.width() as u32, bbox.height() as u32).to_image();
-    let (mut x0, mut y0, mut x1, mut y1) = (crop.width(), crop.height(), 0, 0);
-    for (x, y, pixel) in crop.enumerate_pixels() {
-        if pixel[0] < 220 {
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x + 1);
-            y1 = y1.max(y + 1);
-        }
-    }
-    let (px, py) = if x1 > x0 {
-        (((y1 - y0) as f64 * 0.3).ceil() as u32, ((y1 - y0) as f64 * VERTICAL_MARGIN).ceil() as u32)
+    let stride = image.width() as usize;
+    let raw = image.as_raw();
+    let (x0, y0, x1, y1, px, py) = if let Some((ix0, iy0, ix1, iy1)) =
+        crate::simd_kernel::find_ink_bbox(raw, stride, bbox.left, bbox.top, bw, bh, 220)
+    {
+        (
+            ix0,
+            iy0,
+            ix1,
+            iy1,
+            ((iy1 - iy0) as f64 * 0.3).ceil() as usize,
+            ((iy1 - iy0) as f64 * VERTICAL_MARGIN).ceil() as usize,
+        )
     } else {
-        (x0, y0, x1, y1) = (0, 0, crop.width(), crop.height());
-        (0, 0)
+        (0, 0, bw, bh, 0, 0)
     };
-    let padded_width = x1 - x0 + 2 * px;
-    let padded_height = y1 - y0 + 2 * py;
-    let mut padded = GrayImage::from_pixel(padded_width, padded_height, Luma([255]));
-    imageops::replace(&mut padded, &imageops::crop_imm(&crop, x0, y0, x1 - x0, y1 - y0).to_image(), i64::from(px), i64::from(py));
+    let cw = x1 - x0;
+    let ch = y1 - y0;
+    let padded_width = cw + 2 * px;
+    let padded_height = ch + 2 * py;
     let width = (padded_width as f32 * INPUT_HEIGHT as f32 / padded_height as f32).round().clamp(8.0, 4096.0) as usize;
-    let resized = imageops::resize(&padded, width as u32, INPUT_HEIGHT as u32, imageops::FilterType::Triangle);
+    let pixels = if padded_height > 48 {
+        let mut padded = GrayImage::from_pixel(padded_width as u32, padded_height as u32, image::Luma([255]));
+        let dst_raw = padded.as_mut();
+        for row in 0..ch {
+            let s = (bbox.top + y0 + row) * stride + bbox.left + x0;
+            let d = (py + row) * padded_width + px;
+            dst_raw[d..d + cw].copy_from_slice(&raw[s..s + cw]);
+        }
+        imageops::resize(&padded, width as u32, INPUT_HEIGHT as u32, imageops::FilterType::Triangle).into_raw()
+    } else {
+        crate::simd_kernel::resize_cropped_padded_bilinear(
+            raw,
+            stride,
+            bbox.left + x0,
+            bbox.top + y0,
+            cw,
+            ch,
+            px,
+            py,
+            width,
+            INPUT_HEIGHT,
+        )
+    };
     Some(PreparedLine {
         bbox,
         confidence_required: false,
         width,
-        pixels: resized.into_raw(),
+        pixels,
         pixel_x_origin: bbox.left as f64 + x0 as f64 - px as f64,
         pixel_x_scale: padded_width as f64 / width as f64,
     })

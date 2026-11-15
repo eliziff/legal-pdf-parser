@@ -5,40 +5,6 @@ use legal_pdf_core::regex;
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// A heading's enumerator, alone on its line ("IV.", "(a)" aside, "b)", "12."), or a decimal
-/// section number ("1.1", "2.3.1") with or without a period after it.
-pub(crate) fn heading_standalone_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"^\s*(?:([IVXLCDM]{1,7}|[A-Za-z](?:\.\d+)?|\d{1,3})([.)])|(\d{1,2}(?:\.\d{1,2}){1,3})([.)]?))\s*$",
-        )
-        .unwrap()
-    })
-}
-
-/// A heading's enumerator with its title on the line: as [`heading_standalone_re`], the title after
-/// it ("IV. Analysis", "1.1 Definitions").
-pub(crate) fn heading_inline_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"^\s*(?:([IVXLCDM]{1,7}|[A-Za-z](?:\.\d+)?|\d{1,3})([.)])|(\d{1,2}(?:\.\d{1,2}){1,3})([.)]?))\s+(\S.*)$",
-        )
-        .unwrap()
-    })
-}
-
-/// (value, punctuation, title) of a heading enumerator match from either lenient regex.
-pub(crate) fn heading_enumerator<'t>(capture: &regex::Captures<'t>) -> (&'t str, &'t str, &'t str) {
-    let (value, punct) = match (capture.get(1), capture.get(3)) {
-        (Some(value), _) => (value.as_str(), capture.get(2).map_or("", |m| m.as_str())),
-        (None, Some(value)) => (value.as_str(), capture.get(4).map_or("", |m| m.as_str())),
-        (None, None) => ("", ""),
-    };
-    (value, punct, capture.get(5).map_or("", |m| m.as_str()).trim())
-}
-
 /// A party's role set as a label, on its own line or past a column gap after the party's name ("—
 /// Respondent", "ACME LTD.      Plaintiff", "First and Second Defendants").
 pub(crate) fn party_label() -> &'static Regex {
@@ -52,11 +18,6 @@ pub(crate) fn party_label() -> &'static Regex {
         ))
         .expect("party label")
     })
-}
-
-/// Whether a line opens on a heading's enumerator, alone or before its title.
-pub(crate) fn enumerated(text: &str) -> bool {
-    heading_inline_re().is_match(text) || heading_standalone_re().is_match(text)
 }
 
 /// "[12]" alone on its line; four digits would be a bracketed year.

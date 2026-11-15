@@ -4,8 +4,10 @@
 use crate as processor;
 use crate::ExtractedPdf;
 use legal_pdf_core::{profile, Result};
+#[cfg(feature = "full")]
 use std::collections::HashMap;
 
+#[cfg(feature = "full")]
 pub fn extract_pdf(bytes: &[u8]) -> Result<ExtractedPdf> {
     let document = profile::measure("extract.load_document", || processor::load_extraction_document(bytes))?;
     let page_geometries = profile::measure("extract.page_geometry", || processor::page_geometries(&document));
@@ -95,7 +97,21 @@ pub fn extract_pdf(bytes: &[u8]) -> Result<ExtractedPdf> {
     Ok(extracted)
 }
 
+/// Fast text-and-OCR extraction for triage/dedup: skips structure tree, outline, page labels, and rect regions.
+pub fn extract_pdf_text_only(bytes: &[u8]) -> Result<ExtractedPdf> {
+    let document = profile::measure("extract.load_document", || processor::load_extraction_document(bytes))?;
+    let page_geometries = profile::measure("extract.page_geometry", || processor::page_geometries(&document));
+    let ((items, rects, lines, painted_rules), detection) =
+        profile::measure("extract.fidelity", || pdf_inspector::extract_fidelity_from_doc(&document, None))
+            .map_err(processor::pdf::unreadable)?;
+    drop(document);
+    drop(lines);
+    drop(rects);
+    profile::measure("extract.assemble", || processor::assemble_pdf(&page_geometries, items, painted_rules, detection))
+}
+
 /// Native opening-page witnesses for identifying a downloaded source. No recognition or structure inference.
+#[cfg(feature = "full")]
 #[derive(serde::Serialize)]
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +120,7 @@ pub struct PdfOpening {
     pub pages: Vec<PdfOpeningPage>,
 }
 
+#[cfg(feature = "full")]
 #[derive(serde::Serialize)]
 #[cfg_attr(feature = "binding-types", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +130,7 @@ pub struct PdfOpeningPage {
     pub margin_text: String,
 }
 
+#[cfg(feature = "full")]
 pub fn pdf_opening(bytes: &[u8]) -> Result<PdfOpening> {
     use pdf_inspector::types::{ItemType, TextLine};
     use std::collections::{BTreeMap, HashSet};

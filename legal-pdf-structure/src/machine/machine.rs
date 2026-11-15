@@ -14,7 +14,7 @@ use crate::model::regions::{NOTE, QUOTE, TEXT};
 
 /// Regions whose lines set reference marks notes answer: the body's, and headings' and titles'.
 pub(crate) const REFERRING: [u8; 8] = [1, 2, 3, 4, 8, 9, 14, 16];
-/// The body regions that take a depth (the tagger's ranked regions, headings aside).
+/// The body regions that take a depth (headings aside).
 pub(crate) const RANKED_BODY: [u8; 7] = [1, 16, 2, 4, 6, 8, 9];
 /// A stack holds at most this many open units; headings run nine levels deep.
 const DEPTH: usize = 8;
@@ -23,7 +23,7 @@ const DEPTH: usize = 8;
 /// with the line above it in one heading, caption or unit, and the unit its marker opens (`decide::Decision`); its
 /// region, whether it opens a unit, what the unit counts on (one of the line's grammar readings, `reading`, an index; or
 /// a note's number, `note`), and a heading's level.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Move {
     pub(crate) role: Role,
     pub(crate) rule: Rule,

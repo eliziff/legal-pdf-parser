@@ -18,6 +18,7 @@ attribution = ["dep:sha2"]
 legal-pdf-core = { path = "../legal-pdf-core", features = ["ort-runtime", "render"] }
 legal-pdf-pages = { path = "../legal-pdf-pages" }
 image = { version = "0.25", default-features = false, features = ["png"] }
+mimalloc = { version = "0.1.52", default-features = false }
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

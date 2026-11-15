@@ -7,9 +7,10 @@
 use std::collections::{HashMap, HashSet};
 use legal_pdf_core::model::{Line, Page};
 use crate::decide::{Decision, Notes};
-use crate::evidence::{marker_readings, reference_spans};
+use crate::evidence::marker_readings;
 use crate::fences::Fences;
 use crate::layout::Geometry;
+use legal_structure::numbering_repair::{misread_digits, DigitReading};
 use crate::model::{
     Evidence, Held, MarkerReading, Role, Slot, Slots, LOOK_BOLD, LOOK_CAPS, LOOK_ITALIC, REFERENCE_DETACHED,
     REFERENCE_GLUED, REFERENCE_RAISED, REFERENCE_SUPERSCRIPT, WORD_DIVISION,
@@ -37,14 +38,12 @@ pub(crate) const LINE_FEATURES: &[&str] = &[
 pub(crate) const WORD_BITS: usize = 32;
 pub(crate) const LOOK_BITS: usize = 4;
 pub(crate) const WIDTH: usize = LINE_FEATURES.len() + WORD_BITS + LOOK_BITS;
-/// The features read again off the lines around a line (two before, two after): its place and type
-/// (the first twenty) and its marker's.
-const AROUND: std::ops::Range<usize> = 0..20;
-const MARKER: std::ops::Range<usize> = 72..92;
-/// Every feature a line has: its own, those of the two lines before and after it in reading order
-/// (`AROUND` and `MARKER` of each), whether the next and previous are on its page, and the document's
-/// shape.
-pub(crate) const ALL: usize = WIDTH + 4 * (20 + 20) + 2 + 4;
+/// The marker's first feature (`marker`): a line opens on a marker where it is set.
+const MARKER: usize = 72;
+/// The document's shape, four measures: the share of its lines opening on a marker, the share a note label opens, whether
+/// it is an instrument, and its lines' count (log). What DOC reads of the lines around each line it reads off their own
+/// features (its context graph), not a copy of them on every line.
+pub(crate) const SHAPE: usize = 4;
 /// The roles `Role` names (`docparse.T0`).
 const ROLES: usize = 14;
 /// What t0 decided of a line: its role, one of `ROLES`, twelve flags and its heading's level (`docparse.T0`).
@@ -128,34 +127,9 @@ const WRAPS: [&str; 5] = ["()", "[]", ")", ".", ""];
 /// count's and wrap's places among `COUNTS` and `WRAPS`.
 pub(crate) fn marker_family(reading: &MarkerReading) -> (bool, Option<usize>, Option<usize>) {
     let family = reading.family.as_str();
-    let (word, plain) = if family.matches(':').count() > 1 { family.split_once(':').unwrap_or(("", family)) } else { ("", family) };
+    let (word, plain) = if reading.worded() { family.split_once(':').unwrap_or(("", family)) } else { ("", family) };
     let (wrap, count) = plain.rsplit_once(':').unwrap_or(("", plain));
     (!word.is_empty(), COUNTS.iter().position(|c| *c == count), WRAPS.iter().position(|c| *c == wrap))
-}
-
-/// The line's text with its opening token read as recognition likely misread it (`confusions`, each
-/// misread character's meant ones at a twentieth or more): each character read as its likeliest meaning
-/// alone, and all of them at once; at most six variants.
-fn misread_variants(text: &str, confusions: &HashMap<char, Vec<(char, f32)>>) -> Vec<String> {
-    let start = text.len() - text.trim_start().len();
-    let token_end = text[start..].find(char::is_whitespace).map_or(text.len(), |at| start + at);
-    let token: Vec<char> = text[start..token_end].chars().collect();
-    let meant: Vec<Option<char>> = token.iter().map(|c| confusions.get(c).and_then(|m| m.first()).filter(|(_, p)| *p >= 0.05).map(|(c, _)| *c)).collect();
-    let rebuild = |chars: &[char]| format!("{}{}{}", &text[..start], chars.iter().collect::<String>(), &text[token_end..]);
-    let mut variants = Vec::new();
-    for (k, m) in meant.iter().enumerate() {
-        if let Some(c) = m {
-            let mut chars = token.clone();
-            chars[k] = *c;
-            variants.push(rebuild(&chars));
-        }
-    }
-    if variants.len() > 1 {
-        let all: Vec<char> = token.iter().zip(&meant).map(|(c, m)| m.unwrap_or(*c)).collect();
-        variants.push(rebuild(&all));
-    }
-    variants.truncate(6);
-    variants
 }
 
 /// A line's opening as the numbering grammar would read the markers the print runs together or
@@ -192,10 +166,11 @@ fn marker_variants(text: &str) -> Vec<String> {
 }
 
 /// Each line's readings and features, in reading order (`fences.order`): `WIDTH` own features per
-/// line, then `ALL` with the lines around it and the document's shape.
+/// line.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct LineTable {
     pub(crate) readings: Vec<Vec<MarkerReading>>,
-    /// Each line's reference marks: value, first and past-last UTF-16 code unit (`reference_spans`).
+    /// Each line's reference marks: value, first and past-last UTF-16 code unit (`evidence::references`).
     pub(crate) references: Vec<Vec<(u32, u32, u32)>>,
     /// Each line's look: its face, half-point size, bold, italic and capitals, as one number.
     pub(crate) looks: Vec<u32>,
@@ -207,17 +182,18 @@ pub(crate) struct LineTable {
     pub(crate) margins: HashMap<usize, usize>,
 }
 
-/// What the walk measures over the line table, in reading order: each line's features (`ALL` a line) and what t0
-/// decided of it (`T0` a line), the DOC reader's input.
+/// What the walk measures over the line table, in reading order: each line's own features (`WIDTH` a line), the
+/// document's shape (`SHAPE`) and what t0 decided of each line (`T0` a line), the DOC reader's input.
 pub(crate) struct Measures {
-    pub(crate) features: Vec<f32>,
+    pub(crate) own: Vec<f32>,
+    pub(crate) shape: [f32; SHAPE],
     pub(crate) t0: Vec<u8>,
 }
 
 impl Measures {
     /// The line's features.
     pub(crate) fn row(&self, k: usize) -> &[f32] {
-        &self.features[k * ALL..(k + 1) * ALL]
+        &self.own[k * WIDTH..(k + 1) * WIDTH]
     }
 }
 
@@ -318,7 +294,7 @@ impl LineTable {
             values.extend(marker);
             let row = &mut own[k * WIDTH..(k + 1) * WIDTH];
             for (cell, value) in row.iter_mut().zip(&values) {
-                *cell = (*value * 1e4).round() as f32 / 1e4;
+                *cell = legal_pdf_core::rounded(*value * 1e4) as f32 / 1e4;
             }
             for bit in 0..WORD_BITS {
                 row[LINE_FEATURES.len() + bit] = ((evidence.words[at] >> bit) & 1) as f32;
@@ -327,32 +303,10 @@ impl LineTable {
                 row[LINE_FEATURES.len() + WORD_BITS + bit] = ((evidence.look[at] >> bit) & 1) as f32;
             }
         }
-        // The lines around each line, and the document's shape.
-        let opens_on_marker = (0..n).filter(|&k| own[k * WIDTH + MARKER.start] > 0.0).count() as f32 / n.max(1) as f32;
+        // The document's shape.
+        let opens_on_marker = (0..n).filter(|&k| own[k * WIDTH + MARKER] > 0.0).count() as f32 / n.max(1) as f32;
         let labelled = (0..n).filter(|&k| evidence.label[order[k].index()].is_some()).count() as f32 / n.max(1) as f32;
-        let mut features = vec![0f32; n * ALL];
-        for k in 0..n {
-            let row = &mut features[k * ALL..(k + 1) * ALL];
-            row[..WIDTH].copy_from_slice(&own[k * WIDTH..(k + 1) * WIDTH]);
-            let mut at = WIDTH;
-            for offset in [-1isize, 1, -2, 2] {
-                let other = k as isize + offset;
-                let source = (0..n as isize).contains(&other).then(|| &own[other as usize * WIDTH..(other as usize + 1) * WIDTH]);
-                for range in [AROUND, MARKER] {
-                    for c in range {
-                        row[at] = source.map_or(-9.0, |s| s[c]);
-                        at += 1;
-                    }
-                }
-            }
-            let page = |k: usize| slots.page(order[k]);
-            row[at] = f32::from(u8::from(k > 0 && page(k - 1) == page(k)));
-            row[at + 1] = f32::from(u8::from(k + 1 < n && page(k + 1) == page(k)));
-            row[at + 2] = opens_on_marker;
-            row[at + 3] = labelled;
-            row[at + 4] = f32::from(u8::from(evidence.instrument));
-            row[at + 5] = (1.0 + n as f32).ln();
-        }
+        let shape = [opens_on_marker, labelled, f32::from(u8::from(evidence.instrument)), (1.0 + n as f32).ln()];
         // What t0 decided of each line, for the DOC reader that works from it: the role the machine settled on, the note
         // band, whether the judgment reader opens or holds a paragraph on it and whether that paragraph goes on from the
         // line before in its language, whether it is a margin's number or a line one numbers, whether it goes on with the
@@ -378,21 +332,20 @@ impl LineTable {
                 last_held[usize::from(mine.translation)] = held;
             }
         }
-        Measures { features, t0 }
+        Measures { own, shape, t0 }
     }
 
-    /// The table both tiers read, nothing measured: each line's readings (with the recognizer's likely misreadings,
-    /// `confusions`), its reference marks (with the note marks recognition misread, `unmarked_notes`), its look and its
+    /// The table both tiers read, nothing measured: each line's readings, its reference marks (with the note marks recognition misread, `unmarked_notes`), its look and its
     /// margin number. `before`: the text of each line whose marker the recognition repair rewrote, as recognized; its
     /// markers' readings stand beside the repaired text's, the parser's to choose between.
-    pub(crate) fn plain(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, before: &[(Slot, String)], confusions: &HashMap<char, Vec<(char, f32)>>) -> Self {
+    pub(crate) fn plain(pages: &[Page], slots: &Slots, evidence: &Evidence, fences: &Fences, before: &[(Slot, String)]) -> Self {
         let order = &fences.order;
         let recognized: HashMap<Slot, &str> = before.iter().map(|(slot, text)| (*slot, text.as_str())).collect();
         let readings: Vec<Vec<MarkerReading>> = order.iter().map(|&slot| {
             let word = evidence.words[slot.index()] & WORD_DIVISION != 0;
-            line_readings(slots.line(pages, slot), word, recognized.get(&slot).copied(), confusions)
+            line_readings(slots.line(pages, slot), &evidence.readings[slot.index()], word, recognized.get(&slot).copied())
         }).collect();
-        let mut references: Vec<Vec<(u32, u32, u32)>> = order.iter().map(|&slot| reference_spans(slots.line(pages, slot), slots.line(pages, slot).size)).collect();
+        let mut references: Vec<Vec<(u32, u32, u32)>> = order.iter().map(|&slot| evidence.marks[slot.index()].clone()).collect();
         unmarked_notes(order, slots, pages, evidence, &mut references);
         let looks = order.iter().map(|slot| look_id(evidence, slot.index())).collect();
         let (margin_rows, margins) = margin_lines(order, &readings, fences);
@@ -405,9 +358,6 @@ fn look_id(evidence: &Evidence, at: usize) -> u32 {
     u32::from(evidence.face[at]) << 20 | u32::from(evidence.half_points[at].min(0xffff)) << 4 | u32::from(evidence.look[at] & LOOK_STYLE)
 }
 
-/// A line's markers as the numbering grammar reads them (`word`: it opens on a division's word): its text's, those of the
-/// print's run-ons taken apart, those of its text as recognized before the repair (`recognized`), and those of each likely
-/// misreading of a recognized line's characters.
 /// The marks a page's notes call for that no line of its body sets, found as recognition likely misread them: a note's
 /// number in figures read as letters ("3o" for 30, "Ioo" for 100, "l2" for 12) or standing loose after a word ("64"),
 /// and a note symbol read as another sign (a dagger as "t" or "+", a double dagger as "f", an asterisk as "^", "!", "?"
@@ -418,10 +368,10 @@ fn unmarked_notes(order: &[Slot], slots: &Slots, pages: &[Page], evidence: &Evid
     static SYMBOL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let number = NUMBER.get_or_init(|| regex::Regex::new(r"(?:^|[\p{L}.,;:)\]\u{201d}\u{2019}\u{bb}'\s])([0-9oOIl|]{1,3})(?:[\s.,;:)\u{2014}-]|$)").unwrap());
     let symbol = SYMBOL.get_or_init(|| regex::Regex::new(r"[\p{L}\p{N}.,;:)\]\u{201d}\u{2019}]([tf+^!?*\u{fffd}\u{2020}\u{2021}])(?:[\s.,;:]|$)").unwrap());
-    // The figures a run of confusable signs stands for; a run with no figure stands for a number only when longer than
-    // one sign ("Ioo"; a lone "I" is the pronoun).
+    // The figures a run of confusable signs stands for (the engine's `misread_digits`); a run with no figure stands for a
+    // number only when longer than one sign ("Ioo"; a lone "I" is the pronoun).
     let figures = |run: &str| -> Option<u32> {
-        let text: Option<String> = run.chars().map(|c| match c { '0'..='9' => Some(c), 'o' | 'O' => Some('0'), 'I' | 'l' | '|' => Some('1'), _ => None }).collect();
+        let text: Option<String> = run.chars().map(|c| misread_digits(c, DigitReading::default()).first().copied()).collect();
         if !run.chars().any(|c| c.is_ascii_digit()) && run.chars().count() < 2 { return None; }
         text?.parse().ok()
     };
@@ -462,8 +412,10 @@ fn unmarked_notes(order: &[Slot], slots: &Slots, pages: &[Page], evidence: &Evid
     }
 }
 
-fn line_readings(line: &Line, word: bool, recognized: Option<&str>, confusions: &HashMap<char, Vec<(char, f32)>>) -> Vec<MarkerReading> {
-    let mut found = marker_readings(&line.text, word);
+/// A line's markers as the numbering grammar reads them (`word`: it opens on a division's word): its text's, those of the
+/// print's run-ons taken apart, and those of its text as recognized before the repair (`recognized`).
+fn line_readings(line: &Line, read: &[MarkerReading], word: bool, recognized: Option<&str>) -> Vec<MarkerReading> {
+    let mut found: Vec<MarkerReading> = read.iter().filter(|reading| word || !reading.worded()).cloned().collect();
     let mut add = |readings: Vec<MarkerReading>| {
         for reading in readings {
             if !found.contains(&reading) {
@@ -476,11 +428,6 @@ fn line_readings(line: &Line, word: bool, recognized: Option<&str>, confusions: 
     }
     if let Some(text) = recognized {
         add(marker_readings(text, word));
-    }
-    if line.recognized() {
-        for variant in misread_variants(&line.text, confusions) {
-            add(marker_readings(&variant, word));
-        }
     }
     found
 }

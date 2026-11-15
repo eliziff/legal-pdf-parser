@@ -7,6 +7,9 @@
 //! its number must be, and takes the value that reading fits, or the only value left for it. A
 //! value the run does not bound on both sides is written only when the re-reading shows it.
 //! Printed text is exact and never touched.
+//!
+//! A scan's note labels ("14 Ibid.", in a note's smaller type) are one more such run: their lines, set smaller than the
+//! page's body, carry the labels between the run's in the same way.
 
 use legal_pdf_core::model::{Line, Page, Word};
 use legal_pdf_core::{OcrLine, PdfOcrProvider};
@@ -25,6 +28,8 @@ pub(crate) enum Family {
     Bracket,
     /// "12."
     Dot,
+    /// "12 Ibid.", a note's label: read only on lines set smaller than the page's body.
+    Note,
 }
 
 impl Family {
@@ -32,8 +37,35 @@ impl Family {
         match self {
             Family::Bracket => format!("[{value}]"),
             Family::Dot => format!("{value}."),
+            Family::Note => value.to_string(),
         }
     }
+
+    /// A line's reading in this family: a note's label is read apart from the paragraph numbers' readings, and only
+    /// on a line set in a note's type.
+    fn of(self, place: &Place) -> Option<&Reading> {
+        if self == Family::Note { place.note.as_ref() } else { place.reading.as_ref() }
+    }
+
+    /// A text's opening token read in this family.
+    fn read(self, text: &str) -> Option<Reading> {
+        if self == Family::Note { read_note(text) } else { read_marker(text).filter(|reading| reading.family == self) }
+    }
+}
+
+/// The opening token of `text` read as a note's label: figures (however misread) then a space and the note's words, as
+/// a scan prints "14 Ibid." or "15 Adam v. Newbigging".
+fn read_note(text: &str) -> Option<Reading> {
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.iter().take_while(|c| **c == ' ').count();
+    let body: Vec<char> = chars[start..].iter().take_while(|c| digit_of(**c).is_some() && !matches!(c, ']' | 'j' | 'J')).copied().collect();
+    let k = start + body.len();
+    if body.is_empty() || body.len() > 3 || chars.get(k) != Some(&' ') || !chars.get(k + 1).is_some_and(|c| !c.is_ascii_digit()) {
+        return None;
+    }
+    let value = body.iter().fold(0u32, |v, &c| v * 10 + digit_of(c).unwrap_or(0));
+    let taken = k + chars[k..].iter().take_while(|c| **c == ' ').count();
+    (value > 0).then(|| Reading { family: Family::Note, values: vec![value], exact: body.iter().all(char::is_ascii_digit), taken })
 }
 
 /// A reading of a line's opening token as a paragraph number: the family, the value, and whether
@@ -127,6 +159,7 @@ fn read_marker_with(text: &str, misread_open: bool) -> Option<Reading> {
         && match family {
             Family::Bracket => open_char == Some('[') && close == Some(']'),
             Family::Dot => close == Some('.'),
+            Family::Note => false,
         };
     let value = body.iter().fold(0u32, |v, &c| v * 10 + digit_of(c).unwrap_or(0));
     if value == 0 || value > 999 {
@@ -150,6 +183,10 @@ struct Place {
     /// Rank in the document's reading order.
     rank: usize,
     reading: Option<Reading>,
+    /// Its opening token read as a note's label, on a line set smaller than its page's body (`Family::Note`).
+    note: Option<Reading>,
+    /// Whether the line is set smaller than its page's body, or stands under its note rule, as a note does.
+    small: bool,
     /// Whether the line opens a paragraph by its place: at the left edge, under a gap or a
     /// sentence's end or a short last line.
     opens: bool,
@@ -161,7 +198,7 @@ fn height(line: &Line) -> f64 {
 
 /// Every line of the scanned pages in reading order, with its number reading and whether its place
 /// opens a paragraph.
-fn places(pages: &[Page], scanned: &[usize]) -> Vec<Place> {
+fn places(pages: &[Page], scanned: &[usize], separators: &[Option<f64>]) -> Vec<Place> {
     let mut out = Vec::new();
     for &p in scanned {
         let Some(page) = pages.get(p) else { continue };
@@ -182,6 +219,12 @@ fn places(pages: &[Page], scanned: &[usize]) -> Vec<Place> {
             xs.get(xs.len() / 10).copied().unwrap_or(0.0)
         };
         let width = (right - left).max(1.0);
+        // The page's body type: the median height of its lines of three words or more; a note's is set smaller.
+        let body_height = {
+            let mut hs: Vec<f64> = body.iter().map(|l| height(l)).collect();
+            hs.sort_by(f64::total_cmp);
+            hs.get(hs.len() / 2).copied().unwrap_or(0.0)
+        };
         for (k, &n) in order.iter().enumerate() {
             let line = &page.lines[n];
             let h = height(line);
@@ -195,7 +238,10 @@ fn places(pages: &[Page], scanned: &[usize]) -> Vec<Place> {
                     gap > 0.35 * h || ends || short
                 }
             };
-            out.push(Place { page: p, line: n, rank: out.len(), reading: read_marker(&line.text), opens });
+            // A note's line: set smaller than the body, or under the page's note rule (a kept layer sets every line in one height).
+            let small = h < 0.88 * body_height || separators.get(p).copied().flatten().is_some_and(|rule| line.bbox[1] >= rule - 0.5 * h);
+            let note = small.then(|| read_note(&line.text)).flatten();
+            out.push(Place { page: p, line: n, rank: out.len(), reading: read_marker(&line.text), note, small, opens });
         }
     }
     out
@@ -205,10 +251,10 @@ fn places(pages: &[Page], scanned: &[usize]) -> Vec<Place> {
 /// the first of a run from its count's start.
 fn supported(places: &[Place], family: Family) -> Vec<usize> {
     let exact: Vec<usize> = places.iter().enumerate()
-        .filter(|(_, p)| p.reading.as_ref().is_some_and(|r| r.family == family && r.exact))
+        .filter(|(_, p)| family.of(p).is_some_and(|r| r.family == family && r.exact))
         .map(|(k, _)| k)
         .collect();
-    let value = |k: usize| places[k].reading.as_ref().map(Reading::value).unwrap_or(0);
+    let value = |k: usize| family.of(&places[k]).map(Reading::value).unwrap_or(0);
     exact.iter().enumerate().filter(|(i, &k)| {
         let v = value(k);
         let low = i.saturating_sub(SUPPORT_WINDOW);
@@ -290,8 +336,8 @@ fn margin_region(line: &Line, column: f64) -> [f64; 4] {
 /// The number a re-reading of the margin shows at the line's band, if any: its possible values.
 fn reread_value(lines: &[OcrLine], family: Family) -> Option<(Vec<u32>, bool, OcrLine)> {
     lines.iter().filter_map(|l| {
-        let reading = read_marker(l.text.trim())?;
-        (reading.family == family).then(|| (reading.values, reading.exact, l.clone()))
+        let reading = family.read(l.text.trim())?;
+        Some((reading.values, reading.exact, l.clone()))
     }).max_by_key(|(_, exact, l)| (u8::from(*exact), (l.confidence * 1000.0) as u32))
 }
 
@@ -412,14 +458,18 @@ pub(crate) fn picture_numbers(
 }
 
 /// Recover the lost paragraph numbers of the scanned pages; returns how many lines took a number.
-pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], provider: &mut dyn PdfOcrProvider) -> usize {
+pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], separators: &[Option<f64>], provider: &mut dyn PdfOcrProvider) -> usize {
     // LEGALPDF_PARAGRAPH_RECOVERY=off: the yardstick's baseline without this pass.
     if std::env::var("LEGALPDF_PARAGRAPH_RECOVERY").is_ok_and(|v| v == "off") {
         return 0;
     }
     let mut repaired = 0;
-    for family in [Family::Bracket, Family::Dot] {
-        let places = places(pages, scanned);
+    for family in [Family::Bracket, Family::Dot, Family::Note] {
+        let places = places(pages, scanned, separators);
+        // A note's label stands only on a line set in a note's type. A scan's notes are read in its kept text layer too:
+        // a scanned page's layer is a recognizer's reading of it, not the printer's text.
+        let typed = |place: &Place| family != Family::Note || place.small;
+        let readable = |line: &Line| line.recognized() || family == Family::Note;
         let supported = supported(&places, family);
         if supported.len() < 2 {
             continue;
@@ -434,7 +484,7 @@ pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], provide
         let mut writes: Vec<(usize, usize, u32, usize, Option<OcrLine>)> = Vec::new();
         for pair in supported.windows(2) {
             let (a, b) = (pair[0], pair[1]);
-            let (va, vb) = (places[a].reading.as_ref().unwrap().value(), places[b].reading.as_ref().unwrap().value());
+            let (va, vb) = (family.of(&places[a]).unwrap().value(), family.of(&places[b]).unwrap().value());
             if vb <= va + 1 || vb - va - 1 > GAP_VALUES || places[b].rank <= places[a].rank + 1 {
                 continue;
             }
@@ -444,11 +494,18 @@ pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], provide
             let mut candidates: Vec<Candidate> = (places[a].rank + 1..places[b].rank).filter_map(|k| {
                 let place = &places[k];
                 let line = &pages[place.page].lines[place.line];
-                if !line.recognized() || !at_column(place) {
+                if !readable(line) || !at_column(place) || !typed(place) {
                     return None;
                 }
-                match &place.reading {
+                match family.of(place) {
                     Some(r) if r.family == family && !r.exact => Some(Candidate { place: k, fit: Fit::Some(r.values.clone()), reread: None }),
+                    // A note's label read exactly between two of the run's fits its own value, or the run with a digit
+                    // before or after it left out ("45" for 5, "56" for 6: a stray mark read as a digit).
+                    Some(r) if family == Family::Note => {
+                        let digits = r.value().to_string();
+                        let fits: Vec<u32> = [&digits[..], &digits[1..], &digits[..digits.len() - 1]].iter().filter_map(|d| d.parse().ok()).filter(|&v| v > 0).collect();
+                        Some(Candidate { place: k, fit: Fit::Some(fits), reread: None })
+                    }
                     Some(_) => None,
                     None if place.opens => Some(Candidate { place: k, fit: Fit::Any, reread: None }),
                     None => None,
@@ -481,14 +538,17 @@ pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], provide
                     continue;
                 }
                 let place = &places[candidate.place];
-                let taken = place.reading.as_ref().map_or(0, |r| r.taken);
+                if family.of(place).is_some_and(|r| r.exact && r.value() == value) {
+                    continue;
+                }
+                let taken = family.of(place).map_or(0, |r| r.taken);
                 writes.push((place.page, place.line, value, taken, candidate.reread.clone()));
             }
         }
         // The run's open ends: before its first and after its last supported value, a line at the
         // column takes the next value only where the margin re-read shows that very value.
         for (edge, forward) in [(supported[0], false), (*supported.last().unwrap(), true)] {
-            let va = places[edge].reading.as_ref().unwrap().value();
+            let va = family.of(&places[edge]).unwrap().value();
             let mut expected = if forward { va + 1 } else { va.saturating_sub(1) };
             let range: Box<dyn Iterator<Item = usize>> = if forward {
                 Box::new(places[edge].rank + 1..places.len())
@@ -502,19 +562,19 @@ pub(crate) fn recover(pdf: &[u8], pages: &mut [Page], scanned: &[usize], provide
                 }
                 let place = &places[k];
                 let line = &pages[place.page].lines[place.line];
-                if !line.recognized() || !at_column(place) || !place.opens {
+                if !readable(line) || !at_column(place) || !place.opens || !typed(place) {
                     continue;
                 }
-                if place.reading.as_ref().is_some_and(|r| r.exact) {
+                if family.of(place).is_some_and(|r| r.exact) {
                     break;
                 }
-                let own: Vec<u32> = place.reading.as_ref().filter(|r| r.family == family).map(|r| r.values.clone()).unwrap_or_default();
+                let own: Vec<u32> = family.of(place).filter(|r| r.family == family).map(|r| r.values.clone()).unwrap_or_default();
                 let region = margin_region(line, column_at(place.page));
                 let read = provider.read_region(pdf, place.page, region, REREAD_SCALE).unwrap_or_default();
                 let shown = reread_value(&read, family);
                 let confirmed = shown.as_ref().is_some_and(|(v, _, _)| v.contains(&expected)) || own.contains(&expected);
                 if confirmed {
-                    let taken = place.reading.as_ref().map_or(0, |r| r.taken);
+                    let taken = family.of(place).map_or(0, |r| r.taken);
                     writes.push((place.page, place.line, expected, taken, shown.map(|(_, _, l)| l)));
                     expected = if forward { expected + 1 } else { expected - 1 };
                 } else {

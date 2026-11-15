@@ -11,10 +11,6 @@ impl Fences {
     /// misread digit), with the lines its block goes on into (`continues`) and the editorial lines under it ("[Emphasis
     /// added]"), each a quotation of its own. Whether it found any.
     pub(crate) fn read_quotations(&mut self, pages: &[Page], slots: &Slots) -> bool {
-        // LEGALPDF_ABLATE=sequence leaves the quotations out, for their measure under the tagger.
-        if legal_structure_model::ablated("sequence") {
-            return false;
-        }
         let mut own = HashMap::<(u16, bool), HashSet<u32>>::new();
         for at in 0..self.paragraphs.count.len() {
             if let Some(number) = self.paragraphs.count[at] {

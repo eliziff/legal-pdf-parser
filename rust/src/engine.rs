@@ -1,6 +1,6 @@
 use crate::{PdfRequest, RecognitionProgress};
 use legal_pdf_core::model::{PARSER_VERSION, SCHEMA_VERSION};
-use legal_pdf_core::{read_gzip_json, write_gzip_json, Error, FailureKind, Result};
+use legal_pdf_core::{read_gzip_json, read_gzip_packed, write_gzip_json, write_gzip_packed, Error, FailureKind, Result};
 use legal_pdf_extraction_processor::{extract_pdf, recognize_pdf, ExtractedPdf};
 #[cfg(feature = "ocr")]
 use legal_pdf_ocr::{OcrOptions, OcrProvider, PreparedOcrProvider};
@@ -314,12 +314,14 @@ fn doc_identity(doc: &crate::contract::DocOptions) -> Result<String> {
     fs::read(&path).map(|settings| Sha256::digest(settings).iter().map(|byte| format!("{byte:02x}")).collect::<String>()).map_err(|source| Error::Io { path, source })
 }
 
-/// The extraction's structure, its moves DOC's where the request names `doc` and the PDF's mode is promoted, else tier 0's.
+/// The extraction's structure, its moves DOC's where the request names `doc` and the PDF's mode is promoted, else tier 0's;
+/// its dump entry written to `dump` where named (the structure gold's).
 fn derive_extracted(
     extracted: &mut ExtractedPdf,
     source_hash: &str,
     semantic_profile: Option<DetectionProfile>,
     doc: Option<&crate::contract::DocOptions>,
+    dump: Option<legal_pdf_structure::Keep<'_>>,
 ) -> Result<StructureOutput> {
     let mode = if extracted.pages.iter().any(|page| page.source != "native") { "recognized" } else { "born-digital" };
     let doc = doc.filter(|_| DOC_PROMOTED.contains(&mode)).map(|doc| Doc::load(&doc.model_pack, doc.runtime.as_deref(), false))
@@ -335,6 +337,7 @@ fn derive_extracted(
         },
         std::env::var_os("LEGALPDF_DECISION_TRACE").map(PathBuf::from).as_deref(),
         doc.as_ref(),
+        dump,
     )?;
     extracted.diagnostics.append(&mut derived.diagnostics);
     Ok(derived)
@@ -374,27 +377,23 @@ fn finish_recognition(
     }
 }
 
-/// A recognized extraction's structure, checked and projected as the document consumers read;
-/// `pages`, where given, receives the pages as the structure stage left them.
+/// A recognized extraction's structure, projected as the document consumers read, over the pages as the structure
+/// stage left them: its source fragments and line labels name those lines (a transcript's line number split off its line).
 fn derive_document(
     mut extracted: ExtractedPdf,
     source_hash: &str,
     key: &str,
     semantic_profile: Option<DetectionProfile>,
     doc: Option<&crate::contract::DocOptions>,
-    pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
+    dump: Option<legal_pdf_structure::Keep<'_>>,
 ) -> Result<PdfDocument> {
-    // The witnesses passages read: the pages as extracted, before the structure stage rewrites their lines.
-    let passage_pages = extracted.pages.clone();
     let derived = profile::measure("derive_document", || {
-        derive_extracted(&mut extracted, source_hash, semantic_profile, doc)
+        derive_extracted(&mut extracted, source_hash, semantic_profile, doc, dump)
     })?;
     let document_status = if extracted.diagnostics.is_empty() { PdfStatus::Ready } else { PdfStatus::Degraded };
-    if let Some(pages) = pages {
-        pages.clone_from(&extracted.pages);
-    }
+    let qualities = extracted.pages.iter().map(|page| page.text_quality).collect();
     Ok(profile::measure("project_document", || {
-        PdfDocument::from_parts(source_hash, key, document_status, extracted.metadata, extracted.outline, extracted.pages.iter().map(|page| page.text_quality).collect(), passage_pages, derived.authority_text_units, derived.structure_graph)
+        PdfDocument::from_parts(source_hash, key, document_status, extracted.metadata, extracted.outline, qualities, extracted.pages, derived.authority_text_units, derived.structure_graph)
     }))
 }
 
@@ -406,8 +405,13 @@ fn derive_document(
 /// lines these are, so nothing here is chosen by the gold.
 #[cfg(feature = "ocr")]
 #[doc(hidden)]
-pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPdf> {
-    let source_hash = Sha256::digest(pdf).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+pub fn gold_structure_inputs(pdf: &Path, source_hash: &str, cache_dir: &Path) -> Result<ExtractedPdf> {
+    // Read back where kept: the PDF is read only to extract it.
+    let identity = gold_inputs_identity();
+    if let Some(kept) = kept_extraction(&prepared_path(cache_dir, &identity, source_hash)) {
+        return Ok(kept);
+    }
+    let pdf = &fs::read(pdf).map_err(|source| Error::Io { path: pdf.to_owned(), source })?;
     let options = PdfRequest {
         cache_dir: Some(cache_dir.to_owned()),
         // Always the recognizer (LEGALPDF_INDRA_MODEL_PACK, LEGALPDF_ONNXRUNTIME), else a failure: a scan read without one is empty pages.
@@ -430,7 +434,29 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
         #[cfg(feature = "ppdoc")]
         ppdoc: options.ppdoc.as_ref().map(PPDocLayout::new).transpose()?,
     };
-    recognized_extraction(pdf, &source_hash, &options, Some(cache_dir), providers, None, false)
+    recognized_extraction(pdf, source_hash, &options, Some(cache_dir), providers, None, false, &identity)
+}
+
+/// The structure gold's parses resumed from their dump entries (`legal_pdf_structure::resume_many`): each source's pages
+/// and outline from its extraction as kept under `cache_dir` (never the PDF), its entry's kept tier 0 laid over them.
+/// Each source's structure; a failure where its extraction is not kept.
+#[cfg(feature = "ocr")]
+#[doc(hidden)]
+pub fn gold_structure_resume(entries: Vec<(String, legal_pdf_structure::Entry)>, cache_dir: &Path) -> Vec<Result<StructureOutput>> {
+    let identity = gold_inputs_identity();
+    let mut out: Vec<Option<Result<StructureOutput>>> = Vec::with_capacity(entries.len());
+    let mut present = Vec::new();
+    for (sha256, entry) in entries {
+        match kept_extraction(&prepared_path(cache_dir, &identity, &sha256)) {
+            Some(extracted) => {
+                out.push(None);
+                present.push((sha256, entry, extracted.pages, extracted.outline));
+            }
+            None => out.push(Some(Err(Error::Message(format!("{sha256}: its extraction is not kept"))))),
+        }
+    }
+    let mut resumed = legal_pdf_structure::resume_many(present, None).into_iter();
+    out.into_iter().map(|done| done.unwrap_or_else(|| resumed.next().unwrap_or_else(|| Err(Error::Message("a resumed parse went missing".to_owned()))))).collect()
 }
 
 /// What the structure gold's inputs are keyed by: the extraction schema and the models the
@@ -439,24 +465,21 @@ pub fn gold_structure_inputs(pdf: &[u8], cache_dir: &Path) -> Result<ExtractedPd
 #[doc(hidden)]
 pub fn gold_inputs_identity() -> String {
     let models = ["LEGALPDF_INDRA_MODEL_PACK", "LEGALPDF_ONNXRUNTIME", "LEGALPDF_PPDOC_MODEL_PACK"].map(|name| std::env::var(name).ok());
-    let identity = serialization_sha256(&("legalpdf.gold-inputs.v2", EXTRACTION_CACHE_SCHEMA, models));
+    // v3: a scan's note labels recovered in extraction (paragraph_recovery's Family::Note).
+    let identity = serialization_sha256(&("legalpdf.gold-inputs.v3", EXTRACTION_CACHE_SCHEMA, models));
     identity[..16.min(identity.len())].to_owned()
 }
-/// The structure gold's replay: a recognized extraction through the structure stage, uncached;
-/// `pages`, where given, receives the pages as the structure stage left them.
+/// The structure gold's replay: a recognized extraction through the structure stage, uncached; its dump entry written to
+/// `dump` where named (`legal_pdf_structure::Entry`).
 #[doc(hidden)]
-pub fn gold_structure_document(
-    extracted: ExtractedPdf,
-    source_hash: &str,
-    pages: Option<&mut Vec<legal_pdf_core::model::Page>>,
-) -> Result<PdfDocument> {
-    derive_document(extracted, source_hash, "structure-gold", None, None, pages)
+pub fn gold_structure_document(extracted: ExtractedPdf, source_hash: &str, dump: Option<legal_pdf_structure::Keep<'_>>) -> Result<PdfDocument> {
+    derive_document(extracted, source_hash, "structure-gold", None, None, dump)
 }
 
 /// A cached extraction through the structure stage, as a parse reads it, checked: the pages as the stage left them and the
 /// structure, its revision taken, with the extraction's diagnostics.
 fn corpus_structure(source_hash: &str, mut extracted: ExtractedPdf) -> Result<(ExtractedPdf, DocumentStructure)> {
-    let mut derived = derive_extracted(&mut extracted, source_hash, None, None)?;
+    let mut derived = derive_extracted(&mut extracted, source_hash, None, None, None)?;
     derived.structure_graph.refresh_revision()?;
     Ok((extracted, derived.structure_graph))
 }
@@ -517,13 +540,13 @@ fn prune_cache(directories: &[PathBuf]) {
     }
 }
 
-fn maybe_prune_document_cache(root: &Path, ocr_root: &Path) {
+fn maybe_prune_document_cache(root: &Path, prepared: &Path, ocr_root: &Path) {
     static WRITES: AtomicUsize = AtomicUsize::new(0);
     // ponytail: amortized maintenance; rescan sooner if cache overshoot becomes material.
     if WRITES.fetch_add(1, Ordering::Relaxed) % 32 == 0 {
         // Each is bounded apart: a parse never evicts an extraction or recognition.
         prune_cache(&[parse_cache_root(root).join("documents")]);
-        prune_cache(&[parse_cache_root(root).join("extractions")]);
+        prune_cache(&[prepared.to_owned()]);
         prune_cache(&[ocr_root.join("recognition")]);
     }
 }
@@ -593,7 +616,7 @@ fn parsed_pdf(
         }
         return Ok(cached);
     }
-    let (key, providers) = reading(&source_hash, options)?;
+    let (key, prepared, providers) = reading(&source_hash, options)?;
     if let Some(cached) = cached_document(&cache_root, &key, &source_hash) {
         validate_output_size(&cached, options)?;
         return Ok(Some(cached));
@@ -601,21 +624,22 @@ fn parsed_pdf(
     let Some(bytes) = bytes else {
         return Ok(None);
     };
-    let extracted = recognized_extraction(bytes, &source_hash, options, Some(&cache_root), providers, progress, require_cache_write)?;
+    let extracted = recognized_extraction(bytes, &source_hash, options, Some(&cache_root), providers, progress, require_cache_write, &prepared)?;
     let parsed = derive_document(extracted, &source_hash, &key, options.profile, options.doc.as_ref(), None)?;
     validate_output_size(&parsed, options)?;
     let cache_path = parse_cache_root(&cache_root).join("documents").join(format!("{key}.json.gz"));
     match profile::measure("document_cache_write", || write_gzip_json(&cache_path, &parsed)) {
-        Ok(()) => maybe_prune_document_cache(&cache_root, &ocr_cache_root(&cache_root, options)),
+        Ok(()) => maybe_prune_document_cache(&cache_root, &cache_root.join(&prepared), &ocr_cache_root(&cache_root, options)),
         Err(error) if require_cache_write => return Err(error),
         Err(_) => {}
     }
     Ok(Some(parsed))
 }
 
-/// The cache key the reading `options` asks for of the PDF with `source_hash` is kept under, and the providers
-/// that reading is made with, prepared (their identities are part of the key).
-fn reading(source_hash: &str, options: &PdfRequest) -> Result<(String, Providers)> {
+/// The cache key the reading `options` asks for of the PDF with `source_hash` is kept under, the identity its finished
+/// extraction is kept under (`prepared_identity`), and the providers that reading is made with, prepared (their
+/// identities are part of both).
+fn reading(source_hash: &str, options: &PdfRequest) -> Result<(String, String, Providers)> {
     #[cfg(feature = "ocr")]
     let ocr_prepared = profile::measure("provider_identity_ocr", || options.ocr.as_ref().map(OcrProvider::prepare).transpose())
         .map_err(|error| error.failure(FailureKind::OcrRuntime))?;
@@ -637,7 +661,9 @@ fn reading(source_hash: &str, options: &PdfRequest) -> Result<(String, Providers
     let doc = options.doc.as_ref().map(doc_identity).transpose()?;
     let ocr_pair = ocr_identity.as_ref().map(|provider| (provider.0.as_str(), provider.1.as_str()));
     let key = cache_key(source_hash, document_identity(), ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref(), options.profile, doc.as_deref());
-    Ok((key, Providers {
+    let prepared = prepared_identity(ocr_pair, ppdoc_identity.as_deref(), options.ocr_pages.as_deref());
+    Ok((key, prepared, Providers {
+        #[cfg(feature = "ocr")]
         ocr_identity,
         #[cfg(feature = "ocr")]
         ocr: ocr_prepared,
@@ -652,19 +678,49 @@ pub fn pages_needing_ocr(bytes: &[u8], options: &PdfRequest) -> Result<Vec<usize
     let source_hash = source_hash(Some(bytes), options)?;
     let cache_root = options.cache_dir.clone().unwrap_or_else(default_cache_dir);
     let providers = Providers {
+        #[cfg(feature = "ocr")]
         ocr_identity: None,
         #[cfg(feature = "ocr")]
         ocr: None,
         #[cfg(feature = "ppdoc")]
         ppdoc: None,
     };
-    Ok(recognized_extraction(bytes, &source_hash, options, Some(&cache_root), providers, None, false)?.metadata.pages_needing_ocr)
+    let prepared = prepared_identity(None, None, options.ocr_pages.as_deref());
+    Ok(recognized_extraction(bytes, &source_hash, options, Some(&cache_root), providers, None, false, &prepared)?.metadata.pages_needing_ocr)
 }
 
 /// The cache key a PDF's reading is kept under: of `bytes` where given (they must be the source expected), else of
 /// the source expected.
 pub fn pdf_cache_key(bytes: Option<&[u8]>, options: &PdfRequest) -> Result<String> {
     Ok(reading(&source_hash(bytes, options)?, options)?.0)
+}
+
+/// Where a PDF's finished extraction is kept: under the identity of what made it, by the PDF, packed
+/// (`write_gzip_packed`).
+fn prepared_path(root: &Path, identity: &str, source_hash: &str) -> PathBuf {
+    root.join(identity).join(format!("{source_hash}.pack.gz"))
+}
+
+/// Where the structure gold's inputs keep a source's extraction (`gold_structure_inputs`): under `cache_dir`, by the
+/// gold inputs' identity. Its reader is `legal_pdf_core::read_gzip_packed`.
+#[doc(hidden)]
+pub fn gold_inputs_file(cache_dir: &Path, source_hash: &str) -> PathBuf {
+    prepared_path(cache_dir, &gold_inputs_identity(), source_hash)
+}
+
+/// A finished extraction kept at `path`, read back (and its time touched, for the cache's pruning), where it is whole.
+fn kept_extraction(path: &Path) -> Option<ExtractedPdf> {
+    let kept = profile::measure("extraction_cache_read", || read_gzip_packed::<ExtractedPdf>(path).ok())
+        .filter(|kept| !kept.pages.is_empty() && kept.pages.len() == kept.separators.len())?;
+    touch_cache(path);
+    Some(kept)
+}
+
+/// What a finished extraction is kept under: the extraction's schema and the providers that made it (the recognizer's
+/// and the layout model's identities, the pages recognition was asked to read).
+fn prepared_identity(ocr: Option<(&str, &str)>, ppdoc: Option<&str>, ocr_pages: Option<&[usize]>) -> String {
+    let identity = serialization_sha256(&("legalpdf.prepared.v1", EXTRACTION_CACHE_SCHEMA, ocr, ppdoc, ocr_pages));
+    identity[..16.min(identity.len())].to_owned()
 }
 
 /// The source's SHA-256: of its bytes, a PDF's, where given, which must be the source expected; else the source
@@ -686,6 +742,7 @@ fn source_hash(bytes: Option<&[u8]>, options: &PdfRequest) -> Result<String> {
 /// The providers a parse reads its pages with, prepared: its recognizer and the identity its
 /// readings are cached under, and its layout model.
 struct Providers {
+    #[cfg(feature = "ocr")]
     ocr_identity: Option<(String, String)>,
     #[cfg(feature = "ocr")]
     ocr: Option<PreparedOcrProvider>,
@@ -702,9 +759,10 @@ fn recognized_extraction(
     source_hash: &str,
     options: &PdfRequest,
     cache_root: Option<&Path>,
-    mut providers: Providers,
+    #[cfg_attr(not(feature = "ocr"), allow(unused_variables, unused_mut))] mut providers: Providers,
     #[cfg_attr(not(feature = "ocr"), allow(unused_variables))] progress: RecognitionProgress<'_>,
     require_cache_write: bool,
+    prepared: &str,
 ) -> Result<ExtractedPdf> {
     #[cfg(feature = "ocr")]
     let mut ocr_provider = {
@@ -733,33 +791,16 @@ fn recognized_extraction(
         Some(provider) => Some(provider as &mut dyn legal_pdf_core::PdfOcrProvider),
         None => selected_ocr,
     };
-    // A PDF's extraction is keyed by the PDF and the schema, never by a fingerprint of source files: work after
-    // extraction never re-extracts, and a change to extraction itself bumps EXTRACTION_CACHE_SCHEMA.
-    let extraction_key = serialization_sha256(&(EXTRACTION_CACHE_SCHEMA, source_hash));
-    let extraction_path = cache_root.map(|root| parse_cache_root(root).join("extractions").join(format!("{extraction_key}.json.gz")));
-    let cached = extraction_path
-        .as_ref()
-        .and_then(|path| profile::measure("extraction_cache_read", || read_gzip_json::<CachedExtraction>(path)).ok())
-        .filter(|cached| {
-            let extraction = &cached.extraction;
-            cached.schema_version == EXTRACTION_CACHE_SCHEMA && cached.source_sha256 == source_hash && !extraction.pages.is_empty() && extraction.pages.len() == extraction.separators.len()
-        });
-    let mut extracted = if let Some(cached) = cached {
-        if let Some(path) = &extraction_path {
-            touch_cache(path);
-        }
-        cached.extraction
-    } else {
-        let extracted = profile::measure("extract_pdf", || extract_pdf(bytes))?;
-        if let Some(path) = &extraction_path {
-            let entry = CachedExtraction { schema_version: EXTRACTION_CACHE_SCHEMA.to_owned(), source_sha256: source_hash.to_owned(), extraction: &extracted };
-            let result = profile::measure("extraction_cache_write", || write_gzip_json(path, &entry));
-            if require_cache_write {
-                result?;
-            }
-        }
-        extracted
-    };
+    // The finished extraction (the PDF's text layer, recognition where it reads pages, the layout model's annotations),
+    // kept once under what made it (`prepared`: the schema and the providers' identities, or the caller's), by the
+    // PDF: a PDF read before by the same extraction is read back, its pages neither recognized nor laid out again. Never
+    // keyed by a fingerprint of source files: work after extraction never re-extracts, and a change to extraction
+    // itself bumps EXTRACTION_CACHE_SCHEMA.
+    let prepared_path = cache_root.map(|root| prepared_path(root, prepared, source_hash));
+    if let Some(cached) = prepared_path.as_deref().and_then(kept_extraction) {
+        return Ok(cached);
+    }
+    let mut extracted = profile::measure("extract_pdf", || extract_pdf(bytes))?;
     recognize_pdf(bytes, &mut extracted, selected_ocr, options.ocr_pages.as_deref())?;
     #[cfg(feature = "ocr")]
     let rasters = ocr_provider.as_mut().map(|provider| std::mem::take(&mut provider.rasters)).unwrap_or_default();
@@ -770,6 +811,12 @@ fn recognized_extraction(
     if let Some(provider) = providers.ppdoc.as_mut() {
         profile::measure("ppdoc_annotate", || provider.annotate_pdf(bytes, &mut extracted.pages))
             .map_err(|error| error.failure(FailureKind::LayoutRuntime))?;
+    }
+    if let Some(path) = &prepared_path {
+        let result = profile::measure("extraction_cache_write", || write_gzip_packed(path, &extracted));
+        if require_cache_write {
+            result?;
+        }
     }
     Ok(extracted)
 }

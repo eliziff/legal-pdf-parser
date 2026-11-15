@@ -46,3 +46,26 @@ impl<'a> PageRenderer<'a> {
         (pixmap.width() > 0 && pixmap.height() > 0).then_some(pixmap)
     }
 }
+
+/// Every page of `bytes` drawn so its long side is `long_side` pixels, at most `dpi_cap` dpi (whole
+/// dpi, rounded down), as PNG: each page's dpi and image, in page order. What a model reading the
+/// pages is shown beside the lines this engine extracted from them.
+pub fn page_images(bytes: &[u8], long_side: f64, dpi_cap: u32) -> Result<Vec<(u32, Vec<u8>)>> {
+    let pdf = open_pdf(bytes)?;
+    let mut renderer: Option<(u32, PageRenderer)> = None;
+    (0..pdf.pages().len())
+        .map(|index| {
+            let (width, height) = pdf.pages()[index].render_dimensions();
+            let dpi = dpi_cap.min((long_side * 72.0 / f64::from(width.max(height).max(1.0))) as u32);
+            if renderer.as_ref().is_none_or(|(drawn, _)| *drawn != dpi) {
+                renderer = Some((dpi, PageRenderer::new(&pdf, f64::from(dpi))));
+            }
+            let pixmap = renderer.as_ref().and_then(|(_, renderer)| renderer.render(index));
+            let png = pixmap
+                .ok_or_else(|| Error::Message(format!("page {} draws to nothing", index + 1)))?
+                .into_png()
+                .map_err(|error| Error::Message(format!("page {} could not be written as PNG: {error}", index + 1)))?;
+            Ok((dpi, png))
+        })
+        .collect()
+}

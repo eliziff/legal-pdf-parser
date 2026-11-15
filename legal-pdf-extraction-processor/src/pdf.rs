@@ -162,6 +162,7 @@ pub fn assemble_pdf(
         u32::try_from(index + 1).is_ok_and(|number| !layer_pages.contains(&number))
             && pages.get(index).is_some_and(|page| !page.lines.is_empty())
     }));
+    #[cfg(feature = "full")]
     crate::paragraph_recovery::picture_numbers(&mut pages, &pictures, &weak_pages);
     let image_regions = image_regions(&pages, pictures, &weak_pages);
     let metadata = PdfExtractionMetadata { embedded_page_labels: Vec::new(), pages_needing_ocr: weak_pages.into_iter().collect(), ocr_routed_pages: Vec::new(), scanned_pages };

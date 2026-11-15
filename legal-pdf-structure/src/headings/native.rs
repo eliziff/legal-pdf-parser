@@ -9,7 +9,7 @@ use legal_pdf_core::{flag_share, off_grid_sizes, BOLD};
 use legal_pdf_core::model::sentence_ended;
 use crate::model::SourceTag;
 use crate::text::text::{
-    bracket_excess, closes_before_opening, dangling_end, enumerated, hyphen_continuation, hyphen_fragment_tail,
+    bracket_excess, closes_before_opening, dangling_end, hyphen_continuation, hyphen_fragment_tail,
     starts_note_or_list,
 };
 use legal_pdf_core::regex;
@@ -36,7 +36,7 @@ pub(crate) fn continues_prose_from(page: &Page, prior: usize, slot: usize, body:
         && line.bbox[1] - prior.bbox[3] < height * 0.5
         && !sentence_ended(text)
         && !text.ends_with([':', '\u{201d}', '"'])
-        && !enumerated(text)
+        && !crate::evidence::enumerated(text)
         && runs_the_column(page, prior, body)
 }
 

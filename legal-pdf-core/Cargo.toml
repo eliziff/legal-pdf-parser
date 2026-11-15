@@ -5,7 +5,8 @@ edition = "2021"
 license = "MIT"
 
 [features]
-default = []
+default = ["structure-inference"]
+structure-inference = ["dep:legal-structure", "legal-structure/structure-inference"]
 ort-runtime = ["dep:ort"]
 # Drawing a PDF's pages (render.rs), for what reads their images.
 render = ["dep:hayro"]
@@ -14,14 +15,19 @@ render = ["dep:hayro"]
 binding-types = ["dep:ts-rs", "legal-layout/binding-types", "legal-structure-model/binding-types"]
 
 [dependencies]
-flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 hayro = { version = "0.7.0", default-features = false, optional = true }
-legal-structure = { workspace = true, features = ["structure-inference"] }
+legal-structure = { workspace = true, default-features = false, optional = true }
 legal-layout = { workspace = true }
 legal-structure-model = { workspace = true }
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+rmp-serde = "1.3"
 sha2 = "0.11"
 thiserror = "2.0"
 ts-rs = { version = "12", optional = true, features = ["serde-json-impl"] }
+
+# `parallel::each`'s pool, where there are threads.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.10"

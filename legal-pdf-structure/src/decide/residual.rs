@@ -324,8 +324,9 @@ pub(crate) fn weigh(pages: &[Page],
             let text = sequence[k..end].iter().map(|&slot| line(slot).text.trim()).collect::<Vec<_>>().join(" ");
             // A numbered title is set as its title's line is, whatever its number's type.
             let (look, typeset) = look_of(pages, slots, evidence, fences, geometry, title, &text, families.of(readings, fences, first));
-            let enumerated = headings::rules::enumerator(&text);
-            let division_word = enumerated.as_ref().is_some_and(|(_, punctuation)| punctuation.chars().any(char::is_alphabetic));
+            let enumerated = crate::evidence::heading_numbers(&text);
+            // A number read under its word ("PART II") counts under the word's family, "part:.:I".
+            let division_word = enumerated.iter().any(MarkerReading::worded);
             let next = sequence.get(end).copied();
             let after = sequence.get(end + 1).copied();
             let above = k
@@ -373,13 +374,13 @@ pub(crate) fn weigh(pages: &[Page],
                 // A number in the body's own type numbers the body (its paragraphs, provisions, items).
                 typeset.body && !look.caps && !division_word,
                 division_word,
-                !division_word && enumerated.is_some() && !typeset.body,
+                !division_word && !enumerated.is_empty() && !typeset.body,
                 opens_prose,
                 fields_follow,
                 above >= 0.8,
                 text.ends_with(':'),
                 words > 12,
-                end - k > 1 + usize::from(alone) && enumerated.is_none(),
+                end - k > 1 + usize::from(alone) && enumerated.is_empty(),
             ];
             let own = terms.iter().zip(OWN).fold(OWN_BASE, |own, (&holds, weight)| own + if holds { weight } else { 0.0 });
             if traced {
