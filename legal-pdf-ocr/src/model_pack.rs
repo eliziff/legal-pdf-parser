@@ -33,6 +33,8 @@ struct Manifest {
     tiers: BTreeMap<String, Tier>,
     models: BTreeMap<String, Model>,
     detector: Asset,
+    #[serde(default)]
+    fallback: Option<Model>,
 }
 
 #[derive(Clone)]
@@ -42,6 +44,7 @@ pub(crate) struct ModelPack {
     pub detector: PathBuf,
     pub detector_side: usize,
     pub orientation: Option<PathBuf>,
+    pub fallback: Option<(PathBuf, PathBuf)>,
 }
 
 impl ModelPack {
@@ -81,12 +84,23 @@ impl ModelPack {
             backend,
             OrtBackend::Cuda | OrtBackend::TensorRt | OrtBackend::DirectMl
         );
+        let fallback = manifest
+            .fallback
+            .as_ref()
+            .map(|fb| {
+                Ok::<_, Error>((
+                    checked_asset(&root, if accelerated { &fb.gpu } else { &fb.cpu })?,
+                    checked_asset(&root, &fb.codec)?,
+                ))
+            })
+            .transpose()?;
         Ok(Self {
             model: checked_asset(&root, if accelerated { &model.gpu } else { &model.cpu })?,
             codec: checked_asset(&root, &model.codec)?,
             detector: checked_asset(&root, &manifest.detector)?,
             detector_side: selected.detector_side,
             orientation: Some(root.join("orientation.onnx")).filter(|path| path.is_file()),
+            fallback,
         })
     }
 }

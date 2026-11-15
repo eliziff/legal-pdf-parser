@@ -18,13 +18,13 @@ pub(crate) fn init_runtime(runtime: Option<&Path>, missing: &str) -> std::result
     Ok(())
 }
 
-/// The graph at `path` in a session of one thread, its error named `name`. No CPU memory arena and no memory-pattern
+/// The graph at `path` in a session of `threads` threads, its error named `name`. No CPU memory arena and no memory-pattern
 /// plan: DOC's graphs take a document's sizes (lines, regions, a tree's nodes), and an arena kept by each pooled session
 /// grows to the largest document it has read and never gives it back; a grade of the gold store held 53 GB so. Each
 /// run's buffers are freed when it ends.
 /// On the backend LEGALPDF_DOC_BACKEND names ("directml", "cuda", as the recognizer's backends are named; LEGALPDF_DOC_DEVICE
 /// its device), else the CPU.
-pub(crate) fn session(path: &Path, name: impl std::fmt::Display) -> std::result::Result<Session, String> {
+pub(crate) fn session(path: &Path, name: impl std::fmt::Display, threads: usize) -> std::result::Result<Session, String> {
     let backend: legal_pdf_core::OrtBackend = std::env::var("LEGALPDF_DOC_BACKEND").ok()
         .map(|value| serde_json::from_value(serde_json::Value::String(value)).map_err(|e| format!("LEGALPDF_DOC_BACKEND: {e}")))
         .transpose()?.unwrap_or_default();
@@ -33,7 +33,7 @@ pub(crate) fn session(path: &Path, name: impl std::fmt::Display) -> std::result:
     providers.push(CPUExecutionProvider::default().with_arena_allocator(false).build());
     Session::builder()
         .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-        .and_then(|b| b.with_intra_threads(1))
+        .and_then(|b| b.with_intra_threads(threads.max(1)))
         .and_then(|b| b.with_inter_threads(1))
         .and_then(|b| b.with_memory_pattern(false))
         .and_then(|b| b.with_parallel_execution(false))

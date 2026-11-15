@@ -13,6 +13,8 @@ pub(crate) struct LineDetector {
     side: usize,
     input: Vec<f32>,
     scratch: crate::simd_kernel::DownsampleScratch,
+    mask: Vec<u8>,
+    queue: Vec<usize>,
 }
 
 impl LineDetector {
@@ -22,6 +24,8 @@ impl LineDetector {
             side,
             input: Vec::new(),
             scratch: crate::simd_kernel::DownsampleScratch::default(),
+            mask: Vec::new(),
+            queue: Vec::new(),
         })
     }
 
@@ -65,6 +69,8 @@ impl LineDetector {
                 scale,
                 width as usize,
                 height as usize,
+                &mut self.mask,
+                &mut self.queue,
             ),
         );
         xycut(&mut boxes);
@@ -92,13 +98,12 @@ fn decode(
     scale: f64,
     page_width: usize,
     page_height: usize,
+    mask: &mut Vec<u8>,
+    queue: &mut Vec<usize>,
 ) -> Vec<LineBox> {
     let plane = width * height;
-    let mut mask: Vec<u8> = data[..plane]
-        .iter()
-        .map(|value| u8::from(*value > 0.0))
-        .collect();
-    let mut queue = Vec::new();
+    mask.clear();
+    mask.extend(data[..plane].iter().map(|value| u8::from(*value > 0.0)));
     let mut boxes = Vec::new();
     for seed in 0..plane {
         if mask[seed] == 0 {

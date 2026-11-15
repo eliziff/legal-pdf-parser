@@ -60,11 +60,12 @@ pub use doc::{Doc, Entry};
 pub const PARSE_VERSION: &str = "1";
 
 /// Where a parse is kept (`Entry`): its folder, and the key it is kept under (what made it), which its reader reads it
-/// back by.
+/// back by; and whether the entry keeps DOC's inputs too, which DOC reading the parse later and its fit read (`inputs`).
 #[derive(Clone, Copy)]
 pub struct Keep<'a> {
     pub folder: &'a Path,
     pub key: &'a str,
+    pub inputs: bool,
 }
 /// DOC's fit targets from the gold's rows (the grader's `labels` writes them into the parse's dump).
 #[doc(hidden)]

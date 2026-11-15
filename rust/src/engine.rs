@@ -314,6 +314,23 @@ fn doc_identity(doc: &crate::contract::DocOptions) -> Result<String> {
     fs::read(&path).map(|settings| Sha256::digest(settings).iter().map(|byte| format!("{byte:02x}")).collect::<String>()).map_err(|source| Error::Io { path, source })
 }
 
+/// DOC's stages loaded once for every parse that reads with them, by their export and runtime: an app's parse reads one
+/// document at a time, on every core.
+fn loaded_doc(doc: &crate::contract::DocOptions) -> Result<std::sync::Arc<Doc>> {
+    type Loaded = Vec<((PathBuf, Option<PathBuf>), std::sync::Arc<Doc>)>;
+    static LOADED: std::sync::Mutex<Loaded> = std::sync::Mutex::new(Vec::new());
+    let key = (doc.model_pack.clone(), doc.runtime.clone());
+    let mut loaded = LOADED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, reader)) = loaded.iter().find(|(known, _)| *known == key) {
+        return Ok(std::sync::Arc::clone(reader));
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let reader = std::sync::Arc::new(Doc::load(&doc.model_pack, doc.runtime.as_deref(), false, threads)
+        .map_err(|error| Error::Message(error).failure(FailureKind::Parser))?);
+    loaded.push((key, std::sync::Arc::clone(&reader)));
+    Ok(reader)
+}
+
 /// The extraction's structure, its moves DOC's where the request names `doc` and the PDF's mode is promoted, else tier 0's;
 /// its dump entry written to `dump` where named (the structure gold's).
 fn derive_extracted(
@@ -324,8 +341,7 @@ fn derive_extracted(
     dump: Option<legal_pdf_structure::Keep<'_>>,
 ) -> Result<StructureOutput> {
     let mode = if extracted.pages.iter().any(|page| page.source != "native") { "recognized" } else { "born-digital" };
-    let doc = doc.filter(|_| DOC_PROMOTED.contains(&mode)).map(|doc| Doc::load(&doc.model_pack, doc.runtime.as_deref(), false))
-        .transpose().map_err(|error| Error::Message(error).failure(FailureKind::Parser))?;
+    let doc = doc.filter(|_| DOC_PROMOTED.contains(&mode)).map(loaded_doc).transpose()?;
     let mut derived = legal_pdf_structure::derive(
         &mut extracted.pages,
         &extracted.separators,
@@ -336,7 +352,7 @@ fn derive_extracted(
             page_labels: extracted.metadata.embedded_page_labels.clone(),
         },
         std::env::var_os("LEGALPDF_DECISION_TRACE").map(PathBuf::from).as_deref(),
-        doc.as_ref(),
+        doc.as_deref(),
         dump,
     )?;
     extracted.diagnostics.append(&mut derived.diagnostics);

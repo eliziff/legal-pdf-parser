@@ -42,7 +42,7 @@ pub use reader::Reader as Doc;
 pub enum Doc {}
 #[cfg(not(feature = "encoder"))]
 impl Doc {
-    pub fn load(_: &Path, _: Option<&Path>, _: bool) -> Result<Self, String> {
+    pub fn load(_: &Path, _: Option<&Path>, _: bool, _: usize) -> Result<Self, String> {
         Err("this parser was built without DOC (the encoder feature)".to_owned())
     }
 }
@@ -85,7 +85,7 @@ impl Settings {
             text: var("LEGALPDF_DOC_TEXT").and_then(|dir| reader::TextModel::load(&dir).map_err(|e| eprintln!("DOC text model: {e}")).ok()),
             #[cfg(feature = "encoder")]
             doc: var("LEGALPDF_DOC").and_then(|dir| {
-                reader::Reader::load(&dir, None, std::env::var_os("LEGALPDF_DOC_TIMES").is_some())
+                reader::Reader::load(&dir, None, std::env::var_os("LEGALPDF_DOC_TIMES").is_some(), 1)
                     .map_err(|e| eprintln!("DOC: {e}")).ok()
             }),
         }
@@ -168,7 +168,13 @@ pub(crate) fn over_tier0(pages: &[Page], slots: &Slots, evidence: &Evidence, fen
     let reader = doc.or(s.doc.as_ref());
     #[cfg(not(feature = "encoder"))]
     let reader = doc;
-    if reader.is_none() && !oracle && dump.is_none() { return None; }
+    if reader.is_none() && !oracle && dump.is_none_or(|(kept, _)| !kept.inputs) {
+        // (A parse kept for itself alone: DOC's inputs, its measuring's whole cost, are not made.)
+        if let Some((kept, parse)) = dump {
+            keep_parse(kept, sha256, parse).unwrap_or_else(|error| eprintln!("DOC dump {sha256}: {error}"));
+        }
+        return None;
+    }
     let measured = measure(pages, slots, evidence, fences, geometry, sha256, notes, decision, table, reader)?;
     if let Some((kept, parse)) = dump {
         keep(kept, sha256, &measured, table, views, parse).unwrap_or_else(|error| eprintln!("DOC dump {sha256}: {error}"));
@@ -226,6 +232,14 @@ fn measure<'a>(pages: &'a [Page], slots: &Slots, evidence: &Evidence, fences: &F
         row
     }).collect();
     Some(Measured { texts, ids, inputs, gold, gold_rows, ranks, note_refs })
+}
+
+/// A document's parse kept in its dump entry under its key, the entry's other parts as they were.
+fn keep_parse(kept: crate::Keep<'_>, sha256: &str, parse: &[u8]) -> std::io::Result<()> {
+    let mut entry = Entry::read(kept.folder, sha256).unwrap_or_default();
+    entry.set_bytes("parse", parse);
+    entry.record["read_key"] = serde_json::Value::from(kept.key);
+    entry.write(kept.folder, sha256)
 }
 
 /// A document's dump entry written (`Entry`): its inputs, its record (the lines and their places, reference marks and

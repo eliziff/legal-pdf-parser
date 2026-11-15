@@ -234,6 +234,10 @@ pub struct OcrProvider {
     plan: RuntimePlan,
     orientation: Option<Orientation>,
     identity: String,
+    fallback: Option<(PathBuf, PathBuf)>,
+    fallback_session: Option<(Vec<Session>, Codec)>,
+    cpu_arena: bool,
+    independent_pool: bool,
 }
 
 /// A recognizer's models found, checked and planned for this machine, and its identity known,
@@ -315,6 +319,10 @@ impl OcrProvider {
             orientation: pack.orientation.as_deref().map(Orientation::open).transpose()?,
             plan: plan.clone(),
             identity: prepared.identity.clone(),
+            fallback: pack.fallback.clone(),
+            fallback_session: None,
+            cpu_arena: options.cpu_arena,
+            independent_pool,
         })
     }
     pub fn configuration(&self) -> &RuntimePlan {
@@ -334,46 +342,78 @@ impl OcrProvider {
         if images.is_empty() {
             return Ok(Vec::new());
         }
+        let mut use_fallback = vec![false; images.len()];
         let adjusted: Vec<std::borrow::Cow<'_, GrayImage>> = images
             .iter()
-            .map(|img| {
+            .enumerate()
+            .map(|(idx, img)| {
                 let prof = crate::simd_kernel::analyze_gray_page(img);
+                let is_crisp_legal = prof.white_frac >= 0.78 && prof.mid_frac <= 0.015 && prof.line_energy >= 3.50;
+                if self.fallback.is_some() && !is_crisp_legal {
+                    use_fallback[idx] = true;
+                }
                 match crate::simd_kernel::upright_and_deskew(img, prof) {
                     Some(fixed) => std::borrow::Cow::Owned(fixed),
                     None => std::borrow::Cow::Borrowed(img),
                 }
             })
             .collect();
-        let owned_or_borrowed: Vec<GrayImage> = adjusted.into_iter().map(|c| c.into_owned()).collect();
-        // Balance bounded windows so overlap never leaves a one-page tail.
-        let window_size = if owned_or_borrowed.len() <= 4 { owned_or_borrowed.len() } else { preparation_window_size(owned_or_borrowed.len()) };
-        let mut pages = {
-            let Self { sessions, codec, layouts, plan, .. } = self;
-            std::thread::scope(|scope| -> Result<Vec<Vec<OcrLine>>> {
-                let (sender, receiver) = sync_channel(1);
-                let slice = owned_or_borrowed.as_slice();
-                scope.spawn(move || {
-                    for window in slice.chunks(window_size) {
-                        let value = prepare_window(layouts, window, window);
-                        let failed = value.is_err();
-                        if sender.send(value).is_err() || failed {
-                            break;
-                        }
-                    }
-                });
-                let mut pages = Vec::with_capacity(owned_or_borrowed.len());
-                for window in receiver {
-                    pages.extend(recognize_pages(sessions, codec, plan, window?)?);
-                }
-                Ok(pages)
-            })?
+        let refs: Vec<&GrayImage> = adjusted.iter().map(std::borrow::Cow::as_ref).collect();
+        let mut prep_all = {
+            let layouts = &mut self.layouts;
+            let window_size = if refs.len() <= 4 { refs.len() } else { preparation_window_size(refs.len()) };
+            let mut prepared = Vec::with_capacity(refs.len());
+            for chunk in refs.chunks(window_size) {
+                prepared.extend(prepare_window_refs(layouts, chunk, chunk)?);
+            }
+            prepared
         };
-        let Self { sessions, codec, layouts, plan, .. } = self;
+
+        let mut pages = vec![Vec::new(); images.len()];
+        let primary_indices: Vec<usize> = (0..images.len()).filter(|&i| !use_fallback[i]).collect();
+        if !primary_indices.is_empty() {
+            let primary_prep: Vec<Vec<PreparedLine>> = primary_indices.iter().map(|&i| std::mem::take(&mut prep_all[i])).collect();
+            let recognized = recognize_pages(&mut self.sessions, &self.codec, &self.plan, primary_prep)?;
+            for (idx, lines) in primary_indices.into_iter().zip(recognized) {
+                pages[idx] = lines;
+            }
+        }
+        let fallback_indices: Vec<usize> = (0..images.len()).filter(|&i| use_fallback[i]).collect();
+        if !fallback_indices.is_empty() {
+            if self.fallback_session.is_none() {
+                if let Some((ref model_path, ref codec_path)) = self.fallback {
+                    let weights = PrepackedWeights::new();
+                    let fb_sessions = (0..self.plan.workers)
+                        .map(|_| open_session(model_path, self.plan.threads, self.plan.backend, &self.plan.device, self.cpu_arena, &weights, self.independent_pool))
+                        .collect::<Result<Vec<_>>>()?;
+                    let fb_codec = Codec::load(codec_path)?;
+                    self.fallback_session = Some((fb_sessions, fb_codec));
+                }
+            }
+            if let Some((ref mut fb_sessions, ref fb_codec)) = self.fallback_session {
+                let fb_prep: Vec<Vec<PreparedLine>> = fallback_indices.iter().map(|&i| std::mem::take(&mut prep_all[i])).collect();
+                let recognized = recognize_pages(fb_sessions, fb_codec, &self.plan, fb_prep)?;
+                for (idx, lines) in fallback_indices.into_iter().zip(recognized) {
+                    pages[idx] = lines;
+                }
+            }
+        }
+
         for (i, page_lines) in pages.iter_mut().enumerate() {
             if crate::simd_kernel::needs_180_check(page_lines) {
-                let flipped = [imageops::rotate180(&owned_or_borrowed[i])];
-                let prep = prepare_window(layouts, &flipped, &flipped)?;
-                if let Some(re_lines) = recognize_pages(sessions, codec, plan, prep)?.into_iter().next() {
+                let flipped = imageops::rotate180(refs[i]);
+                let flip_ref = [&flipped];
+                let prep = prepare_window_refs(&mut self.layouts, &flip_ref, &flip_ref)?;
+                let re = if use_fallback[i] {
+                    if let Some((ref mut fb_sessions, ref fb_codec)) = self.fallback_session {
+                        recognize_pages(fb_sessions, fb_codec, &self.plan, prep)?
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    recognize_pages(&mut self.sessions, &self.codec, &self.plan, prep)?
+                };
+                if let Some(re_lines) = re.into_iter().next() {
                     if crate::simd_kernel::text_quality_score(&re_lines) > crate::simd_kernel::text_quality_score(page_lines) {
                         *page_lines = re_lines;
                     }
@@ -501,8 +541,14 @@ fn place_pages(
 /// A window's images' lines found on `seen` and cut for reading from `ink`, the same page in the
 /// recognizer's own grey.
 fn prepare_window(layouts: &mut [LineDetector], seen: &[GrayImage], ink: &[GrayImage]) -> Result<Vec<Vec<PreparedLine>>> {
-    let boxes = measure("ocr.layout", || layout_boxes(layouts, seen))?;
-    measure("ocr.prepare_lines", || prepare_pages(ink, &boxes))
+    let seen_refs: Vec<&GrayImage> = seen.iter().collect();
+    let ink_refs: Vec<&GrayImage> = ink.iter().collect();
+    prepare_window_refs(layouts, &seen_refs, &ink_refs)
+}
+
+fn prepare_window_refs(layouts: &mut [LineDetector], seen: &[&GrayImage], ink: &[&GrayImage]) -> Result<Vec<Vec<PreparedLine>>> {
+    let boxes = measure("ocr.layout", || layout_boxes_refs(layouts, seen))?;
+    measure("ocr.prepare_lines", || prepare_pages_refs(ink, &boxes))
 }
 
 /// Pages' prepared lines read, each kept where it reads as text: a line the page analysis left
@@ -538,7 +584,7 @@ fn recognize_pages(sessions: &mut [Session], codec: &Codec, plan: &RuntimePlan, 
 }
 
 /// Each image's line boxes, the images shared among the line detectors.
-fn layout_boxes(layouts: &mut [LineDetector], images: &[GrayImage]) -> Result<Vec<Vec<LineBox>>> {
+fn layout_boxes_refs(layouts: &mut [LineDetector], images: &[&GrayImage]) -> Result<Vec<Vec<LineBox>>> {
     let workers = images.len().min(layouts.len());
     let next = AtomicUsize::new(0);
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -554,7 +600,7 @@ fn layout_boxes(layouts: &mut [LineDetector], images: &[GrayImage]) -> Result<Ve
                     if index >= images.len() {
                         break;
                     }
-                    let value = layout.lines(&images[index]);
+                    let value = layout.lines(images[index]);
                     let failed = value.is_err();
                     if sender.send((index, value)).is_err() || failed {
                         break;
@@ -1045,7 +1091,7 @@ fn prepare_line(image: &GrayImage, bbox: LineBox) -> Option<PreparedLine> {
 }
 
 /// Each image's lines prepared, the images shared among the machine's threads.
-fn prepare_pages(images: &[GrayImage], boxes: &[Vec<LineBox>]) -> Result<Vec<Vec<PreparedLine>>> {
+fn prepare_pages_refs(images: &[&GrayImage], boxes: &[Vec<LineBox>]) -> Result<Vec<Vec<PreparedLine>>> {
     let workers = images.len().min(std::thread::available_parallelism().map_or(1, |value| value.get()).max(1));
     let next = AtomicUsize::new(0);
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -1059,7 +1105,7 @@ fn prepare_pages(images: &[GrayImage], boxes: &[Vec<LineBox>]) -> Result<Vec<Vec
                     if index >= images.len() {
                         break;
                     }
-                    let lines = boxes[index].iter().filter_map(|&bbox| prepare_line(&images[index], bbox)).collect();
+                    let lines = boxes[index].iter().filter_map(|&bbox| prepare_line(images[index], bbox)).collect();
                     if sender.send((index, lines)).is_err() {
                         break;
                     }

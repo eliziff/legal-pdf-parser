@@ -490,6 +490,13 @@ mod model {
         /// (`docparse.LINE_WINDOW`); the successor's and predecessor's bias for the pairs beyond (`line_far`).
         line_window: usize,
         line_far: [f32; 2],
+        /// Order's pairs within this many regions of each other in reading order, or whose note's number is a mark the
+        /// other sets, take each head's pair term (`docparse.ORDER_WINDOW`); the pairs beyond, its bias (`order_far`).
+        /// An export without them reads every pair's term.
+        #[serde(default = "every_region")]
+        order_window: usize,
+        #[serde(default)]
+        order_far: HashMap<String, f32>,
         /// Each tree's pair tables (`headings`, `bodies`), which its candidates' scores add (`trees::Scores`).
         trees: HashMap<String, super::trees::Tables>,
     }
@@ -580,8 +587,8 @@ mod model {
     }
 
     impl Sessions {
-        fn load(dir: &Path) -> std::result::Result<Self, String> {
-            let load = |name: &str| { let path = dir.join(format!("{name}.onnx")); session(&path, path.display()) };
+        fn load(dir: &Path, threads: usize) -> std::result::Result<Self, String> {
+            let load = |name: &str| { let path = dir.join(format!("{name}.onnx")); session(&path, path.display(), threads) };
             Ok(Self { context: load("context")?, detect: load("detect")?, stylesheet: load("stylesheet")?, spatial: load("spatial")?, lines: load("lines")?, order: load("order")?, headings: load("headings")?, bodies: load("bodies")? })
         }
     }
@@ -589,11 +596,19 @@ mod model {
     /// DOC's stages, loaded: tier 1, which a parse reads with (`derive`) where it is given one.
     pub struct Reader {
         dir: PathBuf,
+        /// Each session's threads: one where documents are read at once each on its own (a grade), every core where a
+        /// document is read alone (an app's parse).
+        threads: usize,
         sessions: Mutex<Vec<Sessions>>,
         /// Whether each document's stages' times are written, for the reader's speed.
         times: bool,
         text: TextModel,
         meta: Meta,
+    }
+
+    /// An export's Order window where it names none: every pair within it.
+    fn every_region() -> usize {
+        usize::MAX
     }
 
     /// The Order graph's attention block (`docparse.BLOCK`): its regions come padded to whole blocks.
@@ -706,8 +721,8 @@ mod model {
 
     impl Reader {
         /// The stages under `dir`, their ONNX Runtime at `runtime` (else the one LEGALPDF_ONNX_RUNTIME or
-        /// LEGALPDF_ONNXRUNTIME names), and its text model.
-        pub fn load(dir: &Path, runtime: Option<&Path>, times: bool) -> std::result::Result<Self, String> {
+        /// LEGALPDF_ONNXRUNTIME names), and its text model; each session run on `threads` threads.
+        pub fn load(dir: &Path, runtime: Option<&Path>, times: bool, threads: usize) -> std::result::Result<Self, String> {
             let read = |name: &str| std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"));
             let meta: Meta = serde_json::from_str(&read("docparse.json")?).map_err(|e| format!("docparse.json: {e}"))?;
             if meta.width != WIDTH || meta.classes != CLASSES {
@@ -715,8 +730,8 @@ mod model {
             }
             init_runtime(runtime, "the DOC reader needs LEGALPDF_ONNX_RUNTIME")?;
             let text = TextModel::load(&meta.text)?;
-            let first = Sessions::load(dir)?;
-            Ok(Self { dir: dir.to_path_buf(), sessions: Mutex::new(vec![first]), times, text, meta })
+            let first = Sessions::load(dir, threads)?;
+            Ok(Self { dir: dir.to_path_buf(), threads, sessions: Mutex::new(vec![first]), times, text, meta })
         }
 
         /// The text model the reader reads the lines' texts with.
@@ -736,7 +751,7 @@ mod model {
         /// another document's it reads as alone), Order and the trees a document at a time; read with a set of sessions
         /// of the reader's own, given back after.
         pub(crate) fn read_many(&self, docs: &[Reading]) -> Vec<std::result::Result<Vec<Move>, String>> {
-            let mut sessions = match self.sessions.lock().ok().and_then(|mut pool| pool.pop()).map_or_else(|| Sessions::load(&self.dir), Ok) {
+            let mut sessions = match self.sessions.lock().ok().and_then(|mut pool| pool.pop()).map_or_else(|| Sessions::load(&self.dir, self.threads), Ok) {
                 Ok(sessions) => sessions,
                 Err(error) => return docs.iter().map(|_| Err(error.clone())).collect(),
             };
@@ -981,17 +996,23 @@ mod model {
             let region_valid: Vec<bool> = (0..padded).map(|i| i < count).collect();
             region_boxes.resize(padded * 4, 0.0);
             region_pages.resize(padded, -1);
+            // The pairs whose term the graph reads: those within the window, or a note's against a mark of its number.
+            let near: Vec<usize> = (0..pair_i.len()).filter(|&p| pair_match[p] || pair_i[p].abs_diff(pair_j[p]) <= self.meta.order_window as u64).collect();
+            let (near_i, near_j, near_match): (Vec<i64>, Vec<i64>, Vec<bool>) =
+                (near.iter().map(|&p| pair_i[p]).collect(), near.iter().map(|&p| pair_j[p]).collect(), near.iter().map(|&p| pair_match[p]).collect());
             let (region_states, goes_on, note_of) = {
                 let outputs = sessions.order.run(ort::inputs!["line_states" => tensor!([line_region.len(), d], &line_states[..]),
                     "line_region" => tensor!([line_region.len()], &line_region[..]), "region_roles" => tensor!([padded], &kinds[..]),
                     "region_valid" => tensor!([padded], &region_valid[..]), "region_boxes" => tensor!([padded, 4], &region_boxes[..]),
-                    "region_pages" => tensor!([padded], &region_pages[..]), "pair_i" => tensor!([pair_i.len()], &pair_i[..]),
-                    "pair_j" => tensor!([pair_j.len()], &pair_j[..]), "pair_match" => tensor!([pair_match.len()], &pair_match[..])]).map_err(|e| format!("order: {e}"))?;
+                    "region_pages" => tensor!([padded], &region_pages[..]), "pair_i" => tensor!([near_i.len()], &near_i[..]),
+                    "pair_j" => tensor!([near_j.len()], &near_j[..]), "pair_match" => tensor!([near_match.len()], &near_match[..])]).map_err(|e| format!("order: {e}"))?;
                 let take = |name: &str| outputs[name].try_extract_tensor::<f32>().map(|(_, v)| v.to_vec()).map_err(|e| e.to_string());
                 // A head's scores a pair: its scaled query of the pair's region against its key of the other, and the
-                // pair's term.
+                // pair's term (the graph's within the window, the head's far bias beyond).
                 let head = |name: &str| -> std::result::Result<Vec<f32>, String> {
-                    let (q, k, r) = (take(&format!("{name}_q"))?, take(&format!("{name}_k"))?, take(&format!("{name}_r"))?);
+                    let (q, k, near_r) = (take(&format!("{name}_q"))?, take(&format!("{name}_k"))?, take(&format!("{name}_r"))?);
+                    let mut r = vec![self.meta.order_far.get(name).copied().unwrap_or(0.0); pair_i.len()];
+                    near.iter().zip(&near_r).for_each(|(&p, &term)| r[p] = term);
                     Ok((0..pair_i.len()).map(|p| {
                         let (i, j) = (pair_i[p] as usize, pair_j[p] as usize);
                         q[i * d..(i + 1) * d].iter().zip(&k[j * d..(j + 1) * d]).map(|(a, b)| a * b).sum::<f32>() + r[p]
