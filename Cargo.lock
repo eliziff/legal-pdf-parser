@@ -1122,6 +1122,7 @@ dependencies = [
  "diff-match-patch-rs",
  "fancy-regex 0.19.0",
  "flate2",
+ "legal-citations-model",
  "legal-grammar",
  "legal-text",
  "num-bigint",
@@ -1134,6 +1135,23 @@ dependencies = [
  "unicode-casefold",
  "unicode-normalization",
  "url",
+]
+
+[[package]]
+name = "legal-citations-data"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "legal-grammar",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "legal-citations-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -1155,6 +1173,7 @@ dependencies = [
  "fancy-regex 0.19.0",
  "flate2",
  "regex",
+ "regex-automata",
  "regex-syntax",
  "serde",
  "serde_json",
@@ -1179,13 +1198,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "legal-pdf-constituents"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "legal-structure-model",
+ "regex",
+]
+
+[[package]]
 name = "legal-pdf-core"
 version = "0.1.0"
 dependencies = [
  "flate2",
  "hayro",
  "legal-layout",
- "legal-structure",
  "legal-structure-model",
  "ort",
  "rayon",
@@ -1195,6 +1224,46 @@ dependencies = [
  "sha2",
  "thiserror",
  "ts-rs",
+]
+
+[[package]]
+name = "legal-pdf-decide"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-graph",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "legal-structure-lines",
+ "legal-structure-model",
+ "pdf-inspector",
+ "regex",
+ "serde",
+]
+
+[[package]]
+name = "legal-pdf-doc"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "ort",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
+name = "legal-pdf-evidence"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "legal-structure-lines",
+ "legal-structure-model",
+ "regex",
 ]
 
 [[package]]
@@ -1213,14 +1282,79 @@ dependencies = [
 ]
 
 [[package]]
+name = "legal-pdf-fences"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-constituents",
+ "legal-pdf-core",
+ "legal-pdf-furniture",
+ "legal-pdf-headings",
+ "legal-pdf-layout",
+ "legal-pdf-pages",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "legal-pdf-tables",
+ "legal-structure-lines",
+ "legal-structure-model",
+]
+
+[[package]]
+name = "legal-pdf-furniture"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-layout",
+ "legal-pdf-pages",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "legal-structure-lines",
+ "pdf-inspector",
+ "regex",
+]
+
+[[package]]
+name = "legal-pdf-gold"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-parser",
+ "legal-pdf-structure",
+ "legal-structure-model",
+ "serde_json",
+]
+
+[[package]]
+name = "legal-pdf-graph"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-constituents",
+ "legal-pdf-core",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "legal-structure-model",
+ "pdf-inspector",
+ "regex",
+]
+
+[[package]]
+name = "legal-pdf-headings"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "legal-structure-lines",
+ "regex",
+]
+
+[[package]]
 name = "legal-pdf-language"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "diff-match-patch-rs",
- "fancy-regex 0.14.0",
+ "fancy-regex 0.19.0",
  "icu_collator",
- "legal-pdf-core",
  "legal-structure",
  "legal-structure-model",
  "libc",
@@ -1229,8 +1363,45 @@ dependencies = [
  "serde",
  "serde_json",
  "spellbook",
+ "thiserror",
  "ts-rs",
  "zip",
+]
+
+[[package]]
+name = "legal-pdf-layout"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "legal-structure-model",
+ "pdf-inspector",
+]
+
+[[package]]
+name = "legal-pdf-machine"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "legal-structure-lines",
+ "legal-structure-model",
+ "regex",
+]
+
+[[package]]
+name = "legal-pdf-notes"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-layout",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "legal-structure-model",
+ "pdf-inspector",
+ "regex",
 ]
 
 [[package]]
@@ -1252,7 +1423,7 @@ dependencies = [
 name = "legal-pdf-pages"
 version = "0.1.0"
 dependencies = [
- "legal-pdf-core",
+ "legal-layout",
  "regex",
  "serde",
  "ts-rs",
@@ -1262,10 +1433,11 @@ dependencies = [
 name = "legal-pdf-parser"
 version = "0.1.0"
 dependencies = [
+ "legal-citations",
+ "legal-citations-data",
  "legal-document-query",
  "legal-pdf-core",
  "legal-pdf-extraction-processor",
- "legal-pdf-language",
  "legal-pdf-ocr",
  "legal-pdf-pages",
  "legal-pdf-structure",
@@ -1280,20 +1452,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "legal-pdf-rules"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-structure-model",
+ "legal-structure-lines",
+ "legal-structure-model",
+ "pdf-inspector",
+ "regex",
+]
+
+[[package]]
+name = "legal-pdf-runs"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-structure-model",
+ "legal-structure",
+ "legal-structure-lines",
+ "legal-structure-model",
+]
+
+[[package]]
 name = "legal-pdf-structure"
 version = "0.1.0"
 dependencies = [
  "legal-pdf-core",
+ "legal-pdf-decide",
+ "legal-pdf-doc",
+ "legal-pdf-evidence",
+ "legal-pdf-fences",
+ "legal-pdf-furniture",
+ "legal-pdf-graph",
+ "legal-pdf-machine",
+ "legal-pdf-notes",
  "legal-pdf-pages",
+ "legal-pdf-rules",
+ "legal-pdf-runs",
+ "legal-pdf-structure-model",
  "legal-structure",
  "legal-structure-model",
- "ort",
  "pdf-inspector",
- "regex",
  "rmp-serde",
  "serde",
- "serde_json",
- "tokenizers",
+]
+
+[[package]]
+name = "legal-pdf-structure-model"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-structure-model",
+ "pdf-inspector",
+ "serde",
 ]
 
 [[package]]
@@ -1306,7 +1518,6 @@ dependencies = [
  "legal-pdf-core",
  "legal-structure-model",
  "libloading",
- "pdf-inspector",
  "regex",
  "serde",
  "serde_json",
@@ -1316,18 +1527,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "legal-pdf-tables"
+version = "0.1.0"
+dependencies = [
+ "legal-pdf-core",
+ "legal-pdf-rules",
+ "legal-pdf-structure-model",
+ "pdf-inspector",
+]
+
+[[package]]
 name = "legal-structure"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
- "legal-citations",
+ "legal-citations-model",
+ "legal-grammar",
  "legal-locator",
+ "legal-structure-lines",
  "legal-structure-model",
  "regex",
  "serde",
  "serde_json",
  "sha2",
  "url",
+]
+
+[[package]]
+name = "legal-structure-lines"
+version = "0.1.0"
+dependencies = [
+ "legal-citations-model",
+ "legal-structure-model",
+ "regex",
 ]
 
 [[package]]

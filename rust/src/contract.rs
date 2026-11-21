@@ -18,7 +18,7 @@ const MAX_SELECTED_PAGES: usize = 1_000;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PdfRequest {
     pub(crate) profile: Option<legal_structure_model::DetectionProfile>,
-    pub(crate) cache_dir: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
     /// Where page recognition (OCR) and its scanner rasters are cached: apart from the parse cache, keyed by the OCR
     /// code and settings alone, so no parser change discards them. Defaults to `ocr` in the cache directory.
     pub(crate) ocr_cache_dir: Option<PathBuf>,
@@ -37,13 +37,13 @@ pub struct PdfRequest {
     pub(crate) url: Option<String>,
     #[cfg(feature = "ocr")]
     #[serde(default, deserialize_with = "ocr")]
-    pub(crate) ocr: Option<OcrOptions>,
+    pub ocr: Option<OcrOptions>,
     #[cfg(not(feature = "ocr"))]
     #[serde(default, rename = "ocr", deserialize_with = "unsupported")]
     _ocr: Option<()>,
     #[cfg(feature = "ppdoc")]
     #[serde(default, rename = "layout", deserialize_with = "layout")]
-    pub(crate) ppdoc: Option<PPDocOptions>,
+    pub ppdoc: Option<PPDocOptions>,
     #[cfg(not(feature = "ppdoc"))]
     #[serde(default, rename = "layout", deserialize_with = "unsupported")]
     _layout: Option<()>,
@@ -57,7 +57,7 @@ pub struct PdfRequest {
 /// (else the one LEGALPDF_ONNX_RUNTIME names).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DocOptions {
+pub struct DocOptions {
     pub(crate) model_pack: PathBuf,
     pub(crate) runtime: Option<PathBuf>,
 }

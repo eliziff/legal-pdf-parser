@@ -2,9 +2,8 @@ mod asset;
 mod error;
 pub mod model;
 pub mod parallel;
-pub mod profile;
+pub use legal_layout::profile;
 mod ocr_contract;
-#[cfg(feature = "structure-inference")]
 mod ocr_markers;
 mod ort_backend;
 #[cfg(feature = "ort-runtime")]
@@ -14,9 +13,8 @@ pub mod render;
 mod storage;
 pub use asset::{canonical_file, pack_file, provider_asset_sha256, required_path};
 pub use error::{Error, FailureKind, Result};
-pub use legal_structure_model::{AuthoritySource, AuthorityTextUnit, SourceMapping};
+pub use legal_structure_model::{lever, AuthoritySource, AuthorityTextUnit, SourceMapping};
 pub use model::*;
-#[cfg(feature = "structure-inference")]
 pub use ocr_markers::associate_ocr_markers;
 pub use ocr_contract::{OcrLine, OcrPageRequest, OcrPageResult, OcrWord, PdfOcrProvider, RasterReading};
 pub use ort_backend::OrtBackend;

@@ -143,6 +143,11 @@ pub fn assemble_pdf(
     }
 
     for page in &detection.pages_needing_ocr {
+        // A page with no text and no image to read (`no_text`: a blank page) has nothing to recognize.
+        if detection.ocr_reasons_by_page.get(page).is_some_and(|reasons|
+            reasons.iter().all(|reason| reason == pdf_inspector::OCR_REASON_NO_TEXT)) {
+            continue;
+        }
         if let Ok(index) = usize::try_from(page.saturating_sub(1)) {
             // A scan whose invisible text layer was read as its text needs no recognition when
             // that text reads well: the layer is the scan already recognized. One that reads

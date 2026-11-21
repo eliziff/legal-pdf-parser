@@ -1,0 +1,12 @@
+[package]
+name = "legal-pdf-structure-model"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The PDF structure stage's contract: the data its stages read and write, and nothing that decides"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-structure-model = { workspace = true }
+pdf-inspector = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }

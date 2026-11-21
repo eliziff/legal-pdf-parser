@@ -2,7 +2,7 @@
 //! read it (a paragraph by its path, a note by its id; UTF-16 offsets): a span replaced as a tracked change,
 //! highlighted, or linked; and tracked revisions rejected by id. Only the runs an edit touches are rewritten.
 
-use legal_pdf_core::{Error, Result};
+use crate::{Error, Result};
 use quick_xml::events::Event;
 use regex::Regex;
 use serde::Deserialize;

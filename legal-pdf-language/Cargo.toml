@@ -9,7 +9,7 @@ license = "MIT"
 binding-types = ["dep:ts-rs"]
 
 [dependencies]
-legal-pdf-core = { path = "../legal-pdf-core" }
+thiserror = "2.0"
 ts-rs = { version = "12", optional = true }
 legal-structure-model = { workspace = true }
 legal-structure = { workspace = true, features = ["structure-inference"] }
@@ -20,7 +20,7 @@ icu_collator = "2.1"
 # The minimal changes an assistant's edit makes (src/docx_tracked.rs).
 diff-match-patch-rs = { path = "../../common-law-cite/crates/legal-citations/vendor/diff-match-patch-rs" }
 # The text ops' lookarounds and spelling (src/text_ops.rs).
-fancy-regex = "0.14"
+fancy-regex = "0.19"
 spellbook = "0.4"
 quick-xml = "0.42"
 regex = "1.11"
@@ -31,6 +31,3 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Unit tests run the structure engine, which programs supply at run time.
-[dev-dependencies]
-legal-pdf-core = { path = "../legal-pdf-core" }

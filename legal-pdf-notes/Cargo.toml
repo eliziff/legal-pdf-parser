@@ -1,0 +1,15 @@
+[package]
+name = "legal-pdf-notes"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The PDF structure stage's the notes: their band, labels, lanes and references: on its contract, its rules and the stages it reads"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
+legal-pdf-rules = { path = "../legal-pdf-rules" }
+legal-structure-model = { workspace = true }
+pdf-inspector = { workspace = true }
+regex = "1.11"
+legal-pdf-layout = { path = "../legal-pdf-layout" }

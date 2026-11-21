@@ -1,0 +1,19 @@
+[package]
+name = "legal-pdf-fences"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The PDF structure stage's the fences: what each line is, its context and the reading order: on its contract, its rules and the stages it reads"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
+legal-pdf-rules = { path = "../legal-pdf-rules" }
+legal-pdf-furniture = { path = "../legal-pdf-furniture" }
+legal-pdf-constituents = { path = "../legal-pdf-constituents" }
+legal-pdf-headings = { path = "../legal-pdf-headings" }
+legal-pdf-layout = { path = "../legal-pdf-layout" }
+legal-pdf-tables = { path = "../legal-pdf-tables" }
+legal-pdf-pages = { path = "../legal-pdf-pages" }
+legal-structure-model = { workspace = true }
+legal-structure-lines = { workspace = true }

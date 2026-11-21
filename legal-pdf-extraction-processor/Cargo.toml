@@ -6,7 +6,7 @@ license = "MIT"
 
 [features]
 default = ["full"]
-full = ["dep:ttf-parser", "legal-pdf-core/structure-inference"]
+full = ["dep:ttf-parser"]
 # TypeScript declarations of the types the engine hands JavaScript (the engine's export-types), never a runtime build.
 binding-types = ["dep:ts-rs", "legal-pdf-core/binding-types"]
 

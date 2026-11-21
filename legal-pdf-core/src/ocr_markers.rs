@@ -13,7 +13,7 @@ pub fn associate_ocr_markers(pages: &mut [Page]) {
             let Some(ocr) = &line.ocr else { continue };
             let text = line.text.trim();
             let column = (line.bbox[0] / page.width.max(1.0) * 50.0).round() as i32;
-            let Some(marker) = legal_structure::candidates::numbering_marker(text, previous.get(&column)) else { continue };
+            let Some(marker) = legal_layout::numbering::numbering_marker(text, previous.get(&column)) else { continue };
             previous.insert(column, marker.clone());
             let height = line.bbox[3] - line.bbox[1];
             let width = line.bbox[2] - line.bbox[0];
@@ -30,7 +30,7 @@ pub fn associate_ocr_markers(pages: &mut [Page]) {
                     || overlap < height.min(body_height) * 0.5
                     || (line.bbox[1] + line.bbox[3] - body.bbox[1] - body.bbox[3]).abs() > body_height * 0.8
                     || body.text.chars().filter(|c| c.is_alphabetic()).count() < 4
-                    || legal_structure::candidates::numbering_marker(body.text.trim(), None).is_some()
+                    || legal_layout::numbering::numbering_marker(body.text.trim(), None).is_some()
                 {
                     return None;
                 }

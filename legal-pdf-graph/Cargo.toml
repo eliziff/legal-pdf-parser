@@ -1,0 +1,15 @@
+[package]
+name = "legal-pdf-graph"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The PDF structure stage's the structure graph the decided pages are written as: on its contract, its rules and the stages it reads"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
+legal-pdf-rules = { path = "../legal-pdf-rules" }
+legal-pdf-constituents = { path = "../legal-pdf-constituents" }
+pdf-inspector = { workspace = true }
+legal-structure-model = { workspace = true }
+regex = "1.11"

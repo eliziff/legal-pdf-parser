@@ -4,7 +4,7 @@
 //! insertion at a place in the package as read, made last first, so the brief's own bytes are kept.
 
 use crate::docx_spans::{escaped, open, parse, part, reading, text_element, text_of, units_in, DocxUnit, Node};
-use legal_pdf_core::Result;
+use crate::Result;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -133,7 +133,7 @@ impl Edits {
         let mut state = Walk::default();
         descend(unit, None, None, None, None, xml, offset, &mut state);
         let Some((text, run)) = state.target else {
-            return Err(legal_pdf_core::Error::Message("A reviewed citation no longer matches the Word document.".to_owned()));
+            return Err(crate::Error::Message("A reviewed citation no longer matches the Word document.".to_owned()));
         };
         match (state.after, state.link) {
             (Some(After::Target), Some(link)) => self.insert(part, link.end, nodes.to_owned()),
@@ -647,7 +647,7 @@ pub fn apply_table_of_authorities(bytes: &[u8], units: &[DocxUnit], marks: &[Doc
     for at in order {
         let mark = &marks[at];
         let &(part, unit) = targets.get(mark.unit_id.as_str())
-            .ok_or_else(|| legal_pdf_core::Error::Message(format!("Reviewed Word location is missing: {}.", mark.unit_id)))?;
+            .ok_or_else(|| crate::Error::Message(format!("Reviewed Word location is missing: {}.", mark.unit_id)))?;
         let xml = parts[part].as_str();
         if let Some((_, start, end)) = page_marks.get(&at) {
             edits.at_offset(part, xml, unit, mark.offset, &format!("{start}{end}"))?;

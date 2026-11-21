@@ -2,7 +2,7 @@
 //! removes or moves a paragraph ("\n"), reporting the sites it left unchanged. docx_tracked.rs writes the difference.
 
 use fancy_regex::{Captures, Regex as Lookaround};
-use legal_pdf_core::{Error, Result};
+use crate::{Error, Result};
 use legal_structure::javascript_whitespace;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -49,7 +49,7 @@ fn lookaround(source: &str) -> Lookaround {
     Lookaround::new(source).expect("text op pattern")
 }
 
-fn replaced(pattern: &Lookaround, text: &str, with: impl FnMut(&Captures) -> String) -> String {
+fn replaced(pattern: &Lookaround, text: &str, with: impl FnMut(&Captures<'_, str>) -> String) -> String {
     pattern.replace_all(text, with).into_owned()
 }
 

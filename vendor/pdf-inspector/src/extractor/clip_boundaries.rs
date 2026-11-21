@@ -20,15 +20,23 @@ pub(super) struct ClipRect {
     bottom: f32,
     right: f32,
     top: f32,
+    /// A rectangle of no area (`x y 0 0 re W n`): it paints nothing, so it
+    /// hides all it clips. Publishers draw a second, hidden copy of a
+    /// line's text this way (LégisQuébec's linked citations).
+    empty: bool,
 }
 
 impl ClipRect {
     fn intersection(self, other: Self) -> Option<Self> {
+        if self.empty || other.empty {
+            return Some(Self { empty: true, ..self });
+        }
         let rect = Self {
             left: self.left.max(other.left),
             bottom: self.bottom.max(other.bottom),
             right: self.right.min(other.right),
             top: self.top.min(other.top),
+            empty: false,
         };
         (rect.left < rect.right && rect.bottom < rect.top).then_some(rect)
     }
@@ -53,12 +61,14 @@ impl ClipRect {
             right: xs[0].max(xs[1]),
             bottom: ys[0].min(ys[1]),
             top: ys[0].max(ys[1]),
+            empty: w == 0.0 || h == 0.0,
         };
-        (rect.left < rect.right && rect.bottom < rect.top).then_some(rect)
+        (rect.empty || (rect.left < rect.right && rect.bottom < rect.top)).then_some(rect)
     }
 
     fn contains_advance(self, item: &TextItem) -> bool {
-        item.is_upright()
+        !self.empty
+            && item.is_upright()
             && item.advance_known
             && item.width > 0.0
             && [item.x, item.y, item.width].iter().all(|x| x.is_finite())
@@ -75,6 +85,9 @@ impl ClipRect {
     /// is an estimate), a rotated run and a non-text item are never
     /// excluded.
     fn excludes_run(self, item: &TextItem) -> bool {
+        if self.empty {
+            return matches!(item.item_type, ItemType::Text);
+        }
         if !matches!(item.item_type, ItemType::Text)
             || !item.is_upright()
             || !item.advance_known
@@ -341,6 +354,7 @@ mod tests {
         bottom: 200.0,
         right: 300.0,
         top: 400.0,
+        empty: false,
     };
 
     fn run(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextItem {
@@ -464,6 +478,7 @@ mod tests {
             bottom: 200.0,
             right: 300.0,
             top: 400.0,
+            empty: false,
         };
         let mut clips = vec![Some(CLIP), Some(CLIP), None, Some(inner)];
         let mut replaced = vec![false, false, false, true];

@@ -19,6 +19,48 @@ pub struct PdfDocument {
     pub(crate) evidence: Arc<Vec<Page>>,
     #[serde(skip)]
     pub(crate) printed: OnceLock<Vec<PrintedParagraph>>,
+    /// The page nodes (`page_nodes`) by their page, read once for every lookup.
+    #[serde(skip)]
+    page_index: OnceLock<PageNodes>,
+    /// The source fragments in the order their text opens, read once for every passage placed.
+    #[serde(skip)]
+    fragment_index: OnceLock<FragmentIndex>,
+}
+
+/// The page nodes, in page order (their indexes among the structure's nodes), and where each page's stand among them.
+struct PageNodes {
+    nodes: Vec<usize>,
+    by_page: std::collections::HashMap<usize, Vec<usize>>,
+}
+
+/// The source fragments (their indexes) in the order their text opens, the furthest any of them up to each reaches, and
+/// each line's fragments by its id: a span's fragments are found without reading every fragment.
+pub(crate) struct FragmentIndex {
+    by_start: Vec<usize>,
+    reach: Vec<usize>,
+    pub(crate) by_id: std::collections::HashMap<String, Vec<usize>>,
+}
+
+impl FragmentIndex {
+    fn of(fragments: &[legal_structure_model::SourceFragment]) -> Self {
+        let mut by_start: Vec<usize> = (0..fragments.len()).collect();
+        by_start.sort_by_key(|&at| fragments[at].range.start);
+        let mut furthest = 0;
+        let reach = by_start.iter().map(|&at| { furthest = furthest.max(fragments[at].range.end); furthest }).collect();
+        let mut by_id = std::collections::HashMap::<String, Vec<usize>>::new();
+        for (at, fragment) in fragments.iter().enumerate() {
+            by_id.entry(fragment.id.clone()).or_default().push(at);
+        }
+        Self { by_start, reach, by_id }
+    }
+
+    /// The fragments whose text `range` overlaps, each once, in no order.
+    pub(crate) fn overlapping<'a>(&'a self, fragments: &'a [legal_structure_model::SourceFragment], range: ScalarRange)
+        -> impl Iterator<Item = usize> + 'a {
+        let low = self.reach.partition_point(|&end| end <= range.start);
+        let high = self.by_start.partition_point(|&at| fragments[at].range.start < range.end);
+        self.by_start[low..high.max(low)].iter().copied().filter(move |&at| fragments[at].range.end > range.start)
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -106,7 +148,45 @@ impl PdfDocument {
                 line.text = line.words.iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" ");
             }
         }
-        Self { evidence: Arc::new(evidence), printed: OnceLock::new(), structure, authority_text_units, summary }
+        Self { evidence: Arc::new(evidence), printed: OnceLock::new(), page_index: OnceLock::new(), fragment_index: OnceLock::new(),
+            structure, authority_text_units, summary }
+    }
+
+    fn page_index(&self) -> &PageNodes {
+        self.page_index.get_or_init(|| {
+            let nodes: Vec<usize> = (0..self.structure.nodes.len()).filter(|&at| {
+                let node = &self.structure.nodes[at];
+                node.kind == NodeKind::Page && !node.page_indexes.is_empty()
+            }).collect();
+            let mut by_page = std::collections::HashMap::<usize, Vec<usize>>::new();
+            for (at, &node) in nodes.iter().enumerate() {
+                by_page.entry(page_index(&self.structure.nodes[node])).or_default().push(at);
+            }
+            PageNodes { nodes, by_page }
+        })
+    }
+
+    /// The page nodes of the pages (from 1) `numbers` names, in page order (`page_nodes`' order).
+    pub(crate) fn page_nodes_numbered(&self, numbers: impl IntoIterator<Item = u32>) -> Vec<&StructureNode> {
+        let index = self.page_index();
+        let mut places: Vec<usize> = numbers.into_iter()
+            .filter_map(|number| index.by_page.get(&(number as usize).checked_sub(1)?))
+            .flatten().copied().collect();
+        places.sort_unstable();
+        places.dedup();
+        places.into_iter().map(|at| &self.structure.nodes[index.nodes[at]]).collect()
+    }
+
+    /// A page's node by its index: the first of its page's nodes, or the last.
+    pub(crate) fn page_node(&self, page: usize, last: bool) -> Option<&StructureNode> {
+        let index = self.page_index();
+        let places = index.by_page.get(&page)?;
+        let at = if last { places.last() } else { places.first() }?;
+        Some(&self.structure.nodes[index.nodes[*at]])
+    }
+
+    pub(crate) fn fragment_index(&self) -> &FragmentIndex {
+        self.fragment_index.get_or_init(|| FragmentIndex::of(&self.structure.source_fragments))
     }
 
     /// The pages as the structure read them, whose lines its source fragments and line labels name.
@@ -125,6 +205,8 @@ impl PdfDocument {
 
     pub fn structure_mut(&mut self) -> &mut legal_structure_model::DocumentStructure {
         self.printed.take();
+        self.page_index.take();
+        self.fragment_index.take();
         &mut self.structure
     }
 

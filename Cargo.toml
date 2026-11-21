@@ -16,6 +16,7 @@ resolver = "2"
 legal-structure = { path = "../legal-structure", default-features = false }
 legal-layout = { path = "../legal-structure/layout" }
 legal-structure-model = { path = "../legal-structure/model" }
+legal-structure-lines = { path = "../legal-structure/lines" }
 legal-locator = { path = "../legal-structure/locator" }
 legal-document-query = { path = "../legal-structure/query" }
 legal-structure-features = { path = "../legal-structure/features" }
@@ -25,18 +26,17 @@ pdf-inspector = { path = "vendor/pdf-inspector", default-features = false }
 default = []
 pdf-lite = ["dep:legal-pdf-pages", "dep:legal-pdf-core", "dep:legal-pdf-extraction-processor", "dep:legal-pdf-structure", "dep:legal-pdf-support", "dep:serde", "dep:serde_json", "dep:sha2"]
 pdf = ["pdf-lite", "legal-structure/default"]
-language = ["dep:legal-pdf-core", "dep:legal-pdf-language"]
 ocr = ["pdf", "dep:legal-pdf-ocr"]
 indra = ["ocr"]
 fast-allocator = ["dep:mimalloc"]
 ppdoc = ["pdf", "legal-pdf-support/ppdoc"]
 # DOC, the structure stage's tier 1: its ONNX heads over tier 0's reading.
 doc = ["pdf", "legal-pdf-core/ort-runtime", "legal-pdf-structure/encoder"]
-full = ["language", "indra", "ppdoc", "doc"]
+full = ["indra", "ppdoc", "doc"]
 # TypeScript declarations of the types the engine hands JavaScript (the engine's export-types), never a runtime build.
-binding-types = ["legal-pdf-core?/binding-types", "legal-pdf-support?/binding-types", "legal-pdf-extraction-processor?/binding-types", "legal-pdf-pages?/binding-types", "legal-pdf-language?/binding-types"]
+binding-types = ["legal-pdf-core?/binding-types", "legal-pdf-support?/binding-types", "legal-pdf-extraction-processor?/binding-types", "legal-pdf-pages?/binding-types"]
 # The command-line tools, which run this checkout's structure engine.
-cli = ["pdf"]
+cli = ["pdf", "dep:legal-citations-data", "dep:legal-citations"]
 
 [lib]
 name = "legalpdf"
@@ -50,8 +50,10 @@ required-features = ["cli"]
 [dependencies]
 legal-pdf-core = { path = "legal-pdf-core", optional = true }
 legal-pdf-extraction-processor = { path = "legal-pdf-extraction-processor", optional = true }
-legal-pdf-language = { path = "legal-pdf-language", optional = true }
 legal-pdf-ocr = { path = "legal-pdf-ocr", optional = true }
+# For the command-line tools only (the `cli` feature): the engine never links it through this crate.
+legal-citations-data = { path = "../common-law-cite/crates/legal-citations-data", optional = true }
+legal-citations = { path = "../common-law-cite/crates/legal-citations", optional = true }
 legal-pdf-structure = { path = "legal-pdf-structure", default-features = false, optional = true }
 legal-pdf-support = { path = "legal-pdf-support", optional = true }
 legal-pdf-pages = { path = "legal-pdf-pages", optional = true }
@@ -66,9 +68,6 @@ sha2 = { version = "0.11", optional = true }
 [dev-dependencies]
 legal-pdf-core = { path = "legal-pdf-core" }
 lopdf = { version = "0.45.0", default-features = false }
-
-[build-dependencies]
-sha2 = "0.11"
 
 [patch.crates-io]
 hayro-jpeg2000 = { git = "https://github.com/LaurenzV/hayro.git", rev = "ff7e2e407f6b9c429b44dc29a851180727892b6c" }

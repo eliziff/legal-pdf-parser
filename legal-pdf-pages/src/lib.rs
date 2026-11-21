@@ -134,13 +134,13 @@ pub struct PageRows(Vec<Vec<Row>>);
 
 impl PageRows {
     pub fn of(pages: &[PageEvidence]) -> Self {
-        Self(legal_pdf_core::profile::tally("pages.rows", || pages.iter().map(rows).collect()))
+        Self(legal_layout::profile::tally("pages.rows", || pages.iter().map(rows).collect()))
     }
 
     /// Page `at`'s rows read again, its lines changed.
     pub fn reread(&mut self, pages: &[PageEvidence], at: usize) {
         if let (Some(rows_at), Some(page)) = (self.0.get_mut(at), pages.get(at)) {
-            *rows_at = legal_pdf_core::profile::tally("pages.rows", || rows(page));
+            *rows_at = legal_layout::profile::tally("pages.rows", || rows(page));
         }
     }
 }
@@ -148,18 +148,18 @@ impl PageRows {
 /// The page map over pages whose rows are read (`PageRows`).
 pub fn page_map_rowed(pages: &[PageEvidence], rowed: &PageRows, starts: &[u32], is_citation: &dyn Fn(&str, &str) -> bool) -> Vec<PdfPageBinding> {
     let rowed: &[Vec<Row>] = &rowed.0;
-    let mut read: Vec<Option<(String, usize)>> = legal_pdf_core::profile::tally("pages.printed", || pages.iter().zip(rowed).map(|(page, rows)| printed(page, rows)).collect());
+    let mut read: Vec<Option<(String, usize)>> = legal_layout::profile::tally("pages.printed", || pages.iter().zip(rowed).map(|(page, rows)| printed(page, rows)).collect());
     if !starts.is_empty() && !read.iter().flatten().any(|(label, _)| label.parse::<u32>().is_ok_and(|n| starts.contains(&n))) {
         margin_labels(&mut read, pages, starts, is_citation);
     }
     let observed: Vec<Option<String>> = read.iter().map(|read| read.as_ref().map(|(label, _)| label.clone())).collect();
-    let chained = legal_pdf_core::profile::tally("pages.chains", || chains(pages, rowed));
-    let mut bindings = legal_pdf_core::profile::tally("pages.resolve", || resolve(&observed, &pages.iter().map(|page| page.embedded.clone()).collect::<Vec<_>>()));
-    legal_pdf_core::profile::tally("pages.sequence", || sequence(&mut bindings, &observed, pages, rowed, starts, &chained));
-    legal_pdf_core::profile::tally("pages.counters", || counters(&mut bindings, pages, rowed));
-    legal_pdf_core::profile::tally("pages.anchor", || anchor(&mut bindings, &observed, starts));
-    legal_pdf_core::profile::tally("pages.numberings", || numberings(&mut bindings, &chained));
-    legal_pdf_core::profile::tally("pages.printing_lines", || printing_lines(&mut bindings, pages, rowed, &read));
+    let chained = legal_layout::profile::tally("pages.chains", || chains(pages, rowed));
+    let mut bindings = legal_layout::profile::tally("pages.resolve", || resolve(&observed, &pages.iter().map(|page| page.embedded.clone()).collect::<Vec<_>>()));
+    legal_layout::profile::tally("pages.sequence", || sequence(&mut bindings, &observed, pages, rowed, starts, &chained));
+    legal_layout::profile::tally("pages.counters", || counters(&mut bindings, pages, rowed));
+    legal_layout::profile::tally("pages.anchor", || anchor(&mut bindings, &observed, starts));
+    legal_layout::profile::tally("pages.numberings", || numberings(&mut bindings, &chained));
+    legal_layout::profile::tally("pages.printing_lines", || printing_lines(&mut bindings, pages, rowed, &read));
     bindings
 }
 
@@ -979,12 +979,12 @@ fn sequence(bindings: &mut [PdfPageBinding], observed: &[Option<String>], pages:
     if total == 0 {
         return;
     }
-    let (candidates, ranked) = legal_pdf_core::profile::tally("pages.ranked_sequences", || ranked_sequences(observed, pages, rowed, chained));
+    let (candidates, ranked) = legal_layout::profile::tally("pages.ranked_sequences", || ranked_sequences(observed, pages, rowed, chained));
     let required = if total == 1 { 1 } else { 2 };
     // a PDF binding documents of their own numberings (a book of authorities, a volume's plates): each part its own run
     let parts = parts(&ranked, total);
     if parts.len() >= 2 {
-        let roman = legal_pdf_core::profile::tally("pages.roman_runs", || roman_runs(bindings, pages, rowed));
+        let roman = legal_layout::profile::tally("pages.roman_runs", || roman_runs(bindings, pages, rowed));
         let mut numbered = vec![false; total];
         for part in &parts {
             let (first, last) = (part.anchors[0].0, part.anchors.last().unwrap().0);
@@ -1013,7 +1013,7 @@ fn sequence(bindings: &mut [PdfPageBinding], observed: &[Option<String>], pages:
         return;
     }
     let required_span = if total <= 4 { 1 } else { 2.max((total as f64 * 0.15).ceil() as usize) };
-    let chosen = legal_pdf_core::profile::tally("pages.choose", || choose(&ranked, total, required, required_span));
+    let chosen = legal_layout::profile::tally("pages.choose", || choose(&ranked, total, required, required_span));
     // the PDF's own count of its pages (its 1 on the PDF's first page) says nothing the PDF's page does not: where another
     // numbering is printed through the document, that numbering is the page's
     let chosen = match chosen {
@@ -1022,7 +1022,7 @@ fn sequence(bindings: &mut [PdfPageBinding], observed: &[Option<String>], pages:
             && row.anchors.len() * 2 >= best.anchors.len() && row.y_span.is_none_or(|y| y <= 0.10)).or(Some(best)),
         other => other,
     };
-    let roman = legal_pdf_core::profile::tally("pages.roman_runs", || roman_runs(bindings, pages, rowed));
+    let roman = legal_layout::profile::tally("pages.roman_runs", || roman_runs(bindings, pages, rowed));
     let (shift, range) = match chosen {
         Some(best) => {
             let competitors = ranked.iter().filter(|row| !std::ptr::eq(*row, best)).take(7)
@@ -1303,11 +1303,11 @@ fn numberings(bindings: &mut [PdfPageBinding], chained: &[Chain]) {
 /// (`ranked_delta_sequences`).
 fn ranked_sequences(observed: &[Option<String>], pages: &[PageEvidence], rowed: &[Vec<Row>], chained: &[Chain]) -> (Vec<Vec<Candidate>>, Vec<Sequence>) {
     let total = observed.len();
-    let mut candidates: Vec<Vec<Candidate>> = legal_pdf_core::profile::tally("pages.candidates", || observed.iter().enumerate().map(|(at, observed)| page_candidates(observed.as_deref(), pages.get(at).zip(rowed.get(at).map(Vec::as_slice)))).collect());
-    for (page, runs) in candidates.iter_mut().zip(legal_pdf_core::profile::tally("pages.folio_runs", || folio_runs(pages.len(), chained))) {
+    let mut candidates: Vec<Vec<Candidate>> = legal_layout::profile::tally("pages.candidates", || observed.iter().enumerate().map(|(at, observed)| page_candidates(observed.as_deref(), pages.get(at).zip(rowed.get(at).map(Vec::as_slice)))).collect());
+    for (page, runs) in candidates.iter_mut().zip(legal_layout::profile::tally("pages.folio_runs", || folio_runs(pages.len(), chained))) {
         page.extend(runs);
     }
-    legal_pdf_core::profile::tally("pages.running_heads", || running_heads(&mut candidates));
+    legal_layout::profile::tally("pages.running_heads", || running_heads(&mut candidates));
     let valid = |shift: i64| {
         let skipped = (1..=total as i64).filter(|page| page + shift <= 0).count();
         // pages before the sequence's 1 (an issue's front matter, a repository's cover) are left unnumbered
@@ -1330,7 +1330,7 @@ fn ranked_sequences(observed: &[Option<String>], pages: &[PageEvidence], rowed: 
         }
     }
     let shifts = by_shift.len();
-    let mut ranked: Vec<Sequence> = legal_pdf_core::profile::tally("pages.sequences", || by_shift.into_iter().map(|(shift, anchors)| Sequence::new(shift, anchors, total)).collect());
+    let mut ranked: Vec<Sequence> = legal_layout::profile::tally("pages.sequences", || by_shift.into_iter().map(|(shift, anchors)| Sequence::new(shift, anchors, total)).collect());
     if std::env::var_os("LEGALPDF_PHASE_TIMING").is_some() { eprintln!("phase	pages.shifts	{shifts}"); }
     ranked.sort_by(|a, b| b.anchors.len().cmp(&a.anchors.len()).then(b.span_ratio.total_cmp(&a.span_ratio))
         .then(b.support.total_cmp(&a.support)).then(b.score.total_cmp(&a.score)).then(a.shift.abs().cmp(&b.shift.abs())));

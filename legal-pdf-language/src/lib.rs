@@ -1,3 +1,10 @@
+mod error;
+// Word's structure: its numbering derived and the document read and checked (analyze_docx).
+mod docx_lint;
+mod docx_numbering;
+pub use docx_lint::*;
+pub use docx_numbering::*;
+pub use error::{Error, Result};
 mod docx;
 mod docx_spans;
 mod docx_toa;

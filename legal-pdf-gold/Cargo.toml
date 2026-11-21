@@ -1,0 +1,18 @@
+[package]
+name = "legal-pdf-gold"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "What the structure gold and the corpus tools ask of a parse; no engine links it"
+
+[features]
+default = ["ocr", "ppdoc"]
+ocr = ["legalpdf/ocr"]
+ppdoc = ["legalpdf/ppdoc"]
+
+[dependencies]
+legalpdf = { package = "legal-pdf-parser", path = "..", features = ["full", "binding-types"] }
+legal-pdf-structure = { path = "../legal-pdf-structure" }
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-structure-model = { workspace = true }
+serde_json = "1.0"

@@ -1,0 +1,14 @@
+[package]
+name = "legal-pdf-rules"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The PDF structure stage's line rules: what a line's text, markers, geometry and words show, on the stage's contract"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
+legal-structure-lines = { workspace = true }
+legal-structure-model = { workspace = true }
+pdf-inspector = { workspace = true }
+regex = "1.11"

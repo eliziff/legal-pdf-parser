@@ -1,7 +1,7 @@
 //! A lookup by page, paragraph, section or footnote: the request, the units it returns, and how
 //! each locator finds its units.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use legal_pdf_core::model::{Page, ScalarRange};
 use legal_structure_model::{serialization_sha256, utf16_len, DocumentStructure, NodeKind, ScalarText, StructureNode};
 use serde::{Deserialize, Serialize};
@@ -210,7 +210,7 @@ pub(crate) fn printed_unit(
     let mut ranges: Vec<ScalarRange> = nodes.iter().flat_map(|node| document.structure.query_ranges(node).into_owned()).collect();
     ScalarRange::normalize_union(&mut ranges);
     let first = nodes.iter().flat_map(|node| node.page_indexes.iter().copied()).min();
-    let page = first.and_then(|index| document.page_nodes().find(|page| page_index(page) == index));
+    let page = first.and_then(|index| document.page_node(index, false));
     let mut unit = PdfLookupUnit::new(nodes[0], range_text(text, &ranges),
         page.map(|page| page_confidence(&document.summary.page_text_quality, page)));
     unit.printings = nodes[1..].iter().map(|node| (*node).clone()).collect();
@@ -288,16 +288,11 @@ pub(crate) fn footnote_unit(text: &ScalarText<'_>, document: &PdfDocument, notes
 }
 
 /// A provision as a lookup returns it, trusted as the least trusted of its pages.
-pub(crate) fn section_unit(
-    document: &DocumentStructure,
-    text: &ScalarText<'_>,
-    quality: &[f64],
-    pages: &HashMap<usize, &StructureNode>,
-    section: &StructureNode,
-) -> PdfLookupUnit {
-    let confidence = section.page_indexes.iter().filter_map(|index| pages.get(index))
-        .map(|page| page_confidence(quality, page)).reduce(f64::min);
-    PdfLookupUnit::new(section, rendered_slice(text, document, section).trim().to_owned(), confidence)
+pub(crate) fn section_unit(document: &PdfDocument, text: &ScalarText<'_>, section: &StructureNode) -> PdfLookupUnit {
+    // (A page's node, its last where a page has several.)
+    let confidence = section.page_indexes.iter().filter_map(|&index| document.page_node(index, true))
+        .map(|page| page_confidence(&document.summary.page_text_quality, page)).reduce(f64::min);
+    PdfLookupUnit::new(section, rendered_slice(text, &document.structure, section).trim().to_owned(), confidence)
 }
 
 pub(crate) fn exact_footnotes(document: &PdfDocument, notes: &[&StructureNode], locator: &str, input: &PdfLookupRequest) -> Vec<usize> {
@@ -382,8 +377,8 @@ where
         .collect();
     // The text of each page a unit is on, as a page lookup returns it (`PdfDocument::page_texts`).
     let pages = document
-        .page_nodes()
-        .filter(|page| page_numbers.contains(&page_number(page)))
+        .page_nodes_numbered(page_numbers)
+        .into_iter()
         .filter_map(|page| {
             let text = rendered_slice(text, &document.structure, page);
             (!text.is_empty()).then_some(PdfLookupPage { page_number: page_number(page), text })
@@ -415,7 +410,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
         );
     }
     let kind = lookup_kind(&input.locator_kind);
-    let text = ScalarText::new(document.structure.query_text());
+    let text = query.text(&document.structure);
     let end_locator = input
         .end_locator
         .as_deref()
@@ -541,7 +536,6 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
     }
     // The provisions the locator names, as the query reads them for every document (`DocumentQuery::provisions`).
     let kind = input.locator_kind.as_str();
-    let pages: HashMap<_, _> = document.page_nodes().map(|page| (page_index(page), page)).collect();
     match query.provisions(&document.structure, kind, &input.locator, end_locator, input.instrument.as_deref(), true) {
         Provisions::Unavailable => {
             let kind = if kind == "rule" { "section" } else { kind };
@@ -554,7 +548,7 @@ pub(crate) fn structure_lookup(document: &PdfDocument,
             lookup
         }
         Provisions::Found { order, first, last } => finish(document, &text, input, order.len(), first, last, |at| {
-            section_unit(&document.structure, &text, &document.summary.page_text_quality, &pages, &document.structure.nodes[order[at]])
+            section_unit(document, &text, &document.structure.nodes[order[at]])
         }),
     }
 }

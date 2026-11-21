@@ -183,14 +183,22 @@ impl PdfDocument {
             instrument: target.instrument.clone(),
             ..PdfLookupRequest::new(&target.locator_kind, &target.locator)
         });
-        let ranges = if lookup.status == PdfLookupStatus::Ambiguous { Vec::new() } else {
-            lookup.units.iter().map(|unit| &unit.node)
-                .flat_map(|node| {
-                    if (matches!(node.kind, NodeKind::Heading | NodeKind::Section) || node.role == Some(PrimaryRole::Heading)) && !node.extent.is_empty() { &node.extent[..] }
-                    else if !node.ranges.is_empty() { &node.ranges[..] }
-                    else { std::slice::from_ref(&node.range) }
-                }).copied().collect()
+        let held = |node: &'_ legal_structure_model::StructureNode| -> Vec<ScalarRange> {
+            if (matches!(node.kind, NodeKind::Heading | NodeKind::Section) || node.role == Some(PrimaryRole::Heading)) && !node.extent.is_empty() { node.extent.clone() }
+            else if !node.ranges.is_empty() { node.ranges.clone() }
+            else { vec![node.range] }
         };
+        let mut ranges: Vec<ScalarRange> = if lookup.status == PdfLookupStatus::Ambiguous { Vec::new() } else {
+            lookup.units.iter().flat_map(|unit| held(&unit.node)).collect()
+        };
+        // TEMP lever (remove before landing): "section-printings" in LEGALPDF_LEVERS. A bilingual instrument prints a
+        // provision in each language, as a bilingual judgment prints a paragraph: the passage is every printing of it.
+        if lookup.status == PdfLookupStatus::Found && lookup.units.len() == 1
+            && legal_structure_model::lever("section-printings") {
+            if let Some(index) = query.translated_provision(&self.structure, &target.locator_kind, &target.locator, lookup.units.first().map(|unit| unit.node.range.start)) {
+                ranges.extend(held(&self.structure.nodes[index]));
+            }
+        }
         let pages = lookup.units.iter().flat_map(|unit| unit.pages.iter().copied()).collect();
         (lookup.status, ranges, pages)
     }
@@ -200,9 +208,13 @@ impl PdfDocument {
         let whole_page = target.locator_kind == "page";
         let (status, mut ranges, wanted) = self.passage_of(query, &target);
         ScalarRange::normalize_union(&mut ranges);
-        // The passage's part of each source line, in the line's own UTF-16.
+        // The passage's part of each source line, in the line's own UTF-16: of each fragment its spans overlap.
+        let index = self.fragment_index();
+        let mut overlapped: Vec<usize> = ranges.iter().flat_map(|range| index.overlapping(fragments, *range)).collect();
+        overlapped.sort_unstable();
+        overlapped.dedup();
         let mut selected = HashMap::<&str, Vec<ScalarRange>>::new();
-        for fragment in fragments {
+        for fragment in overlapped.into_iter().map(|at| &fragments[at]) {
             let own = selected.entry(fragment.id.as_str()).or_default();
             let start = ranges.partition_point(|range| range.end <= fragment.range.start);
             for range in ranges[start..].iter().take_while(|range| range.start < fragment.range.end) {
@@ -214,14 +226,15 @@ impl PdfDocument {
             ScalarRange::normalize_union(own);
         }
         selected.retain(|_, ranges| !ranges.is_empty());
-        let selected_pages = fragments.iter().filter(|fragment| selected.contains_key(fragment.id.as_str()))
-            .map(|fragment| fragment.page_index as u32 + 1).collect::<HashSet<_>>();
+        // (Every fragment of a line the passage holds part of: a line's fragments may stand on more than one page.)
+        let held = selected.keys().flat_map(|id| &index.by_id[*id]).map(|&at| &fragments[at]).collect::<Vec<_>>();
+        let selected_pages = held.iter().map(|fragment| fragment.page_index as u32 + 1).collect::<HashSet<_>>();
         let read = pages.iter()
             .filter(|page| wanted.contains(&page.number) || selected_pages.contains(&page.number))
             .map(|page| {
                 let available = !unavailable.contains(&((page.number - 1) as usize))
-                    && (whole_page || fragments.iter()
-                        .filter(|fragment| fragment.page_index as u32 + 1 == page.number && selected.contains_key(fragment.id.as_str()))
+                    && (whole_page || held.iter()
+                        .filter(|fragment| fragment.page_index as u32 + 1 == page.number)
                         .all(|fragment| page.lines.iter().any(|line| line.id == fragment.id)));
                 let lines = if available { read_lines(page, whole_page, &selected) } else { Vec::new() };
                 ReadPage { page, available, lines }

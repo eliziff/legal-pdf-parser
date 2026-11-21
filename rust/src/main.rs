@@ -1,3 +1,6 @@
+// The citation engine's data (legal-citations-data): this program runs the citation engine, whose data the program supplies.
+use legal_citations_data as _;
+use legal_citations as _;
 #[cfg(feature = "fast-allocator")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

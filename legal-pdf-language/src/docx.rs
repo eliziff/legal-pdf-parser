@@ -1,4 +1,4 @@
-use legal_pdf_core::{Error, Result};
+use crate::{Error, Result};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
@@ -679,7 +679,7 @@ fn footnote_numbering(parent: &XmlElement, inherited: FootnoteNumbering) -> Foot
 }
 
 /// Return body paragraphs followed by Word footnotes in citation-review order.
-pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<legal_pdf_core::AuthorityTextUnit>> {
+pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<legal_structure_model::AuthorityTextUnit>> {
     let files = read_docx_files(bytes, Some(&["word/document.xml", "word/footnotes.xml", "word/_rels/footnotes.xml.rels", "word/settings.xml"]))?;
     let document = parse_xml(file_bytes(&files, "word/document.xml").ok_or_else(|| Error::Message("DOCX has no word/document.xml".to_owned()))?, true)?;
     let body = document.root()?.child("body").ok_or_else(|| Error::Message("DOCX has no document body".to_owned()))?;
@@ -757,7 +757,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<legal_pdf_core::Author
         }
     }
     let mut units = Vec::with_capacity(body_units.len() + footnotes.len());
-    units.extend(body_units.into_iter().map(|(ordinal, text, references, _, path)| legal_pdf_core::AuthorityTextUnit {
+    units.extend(body_units.into_iter().map(|(ordinal, text, references, _, path)| legal_structure_model::AuthorityTextUnit {
         key: format!("body:{ordinal}"),
         kind: "body".to_owned(),
         ordinal,
@@ -768,7 +768,7 @@ pub fn docx_to_toa_text_units(bytes: &[u8]) -> Result<Vec<legal_pdf_core::Author
     }));
     units.extend(footnotes.into_iter().map(|(raw_id, ordinal, text, links)| {
         let (number, sequence, mark) = note_numbers.get(&raw_id).cloned().unwrap_or((None, 0, None));
-        legal_pdf_core::AuthorityTextUnit {
+        legal_structure_model::AuthorityTextUnit {
             key: format!("footnote:{raw_id}"),
             kind: "footnote".to_owned(),
             ordinal,
@@ -1311,7 +1311,7 @@ pub fn docx_text(bytes: &[u8], drafting: bool) -> Result<String> {
 /// feed the canonical Rust detector directly.
 pub fn analyze_docx_bytes(bytes: &[u8], document_id: String) -> Result<legal_structure_model::DocumentStructure> {
     let (paragraphs, table_cells) = docx_structure_input(bytes, true)?;
-    legal_structure::analyze_docx(document_id, paragraphs, &table_cells).map_err(|error| Error::Message(error.to_string()))
+    crate::analyze_docx(document_id, paragraphs, &table_cells).map_err(|error| Error::Message(error.to_string()))
 }
 
 fn drafting_docx_text(bytes: &[u8]) -> Result<String> {

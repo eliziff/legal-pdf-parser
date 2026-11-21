@@ -1,0 +1,17 @@
+[package]
+name = "legal-pdf-decide"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The PDF structure stage's tier 0's decision: on its contract, its rules and the stages it reads"
+
+[dependencies]
+legal-pdf-core = { path = "../legal-pdf-core" }
+legal-pdf-structure-model = { path = "../legal-pdf-structure-model" }
+legal-pdf-rules = { path = "../legal-pdf-rules" }
+legal-pdf-graph = { path = "../legal-pdf-graph" }
+legal-structure-model = { workspace = true }
+legal-structure-lines = { workspace = true }
+pdf-inspector = { workspace = true }
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }

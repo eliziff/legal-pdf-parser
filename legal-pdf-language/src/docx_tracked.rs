@@ -6,7 +6,7 @@
 use crate::docx::{read_docx_files, replace_file, write_docx_files};
 use crate::docx_spans::{escaped, parse, part, text_of, Node, ID};
 use diff_match_patch_rs::{Compat, DiffMatchPatch, Ops};
-use legal_pdf_core::{Error, Result};
+use crate::{Error, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
