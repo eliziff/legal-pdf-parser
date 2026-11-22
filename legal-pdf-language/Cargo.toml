@@ -18,7 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Word's sort of a table of authorities (ICU's root collation, as Intl.Collator sorts the book).
 icu_collator = "2.1"
 # The minimal changes an assistant's edit makes (src/docx_tracked.rs).
-diff-match-patch-rs = { path = "../../common-law-cite/crates/legal-citations/vendor/diff-match-patch-rs" }
+diff-match-patch-rs = { path = "../vendor/diff-match-patch-rs" }
 # The text ops' lookarounds and spelling (src/text_ops.rs).
 fancy-regex = "0.19"
 spellbook = "0.4"
