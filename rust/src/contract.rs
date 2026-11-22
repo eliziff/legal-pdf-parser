@@ -59,6 +59,7 @@ pub struct PdfRequest {
 #[serde(deny_unknown_fields)]
 pub struct DocOptions {
     pub(crate) model_pack: PathBuf,
+    #[allow(dead_code)]
     pub(crate) runtime: Option<PathBuf>,
 }
 

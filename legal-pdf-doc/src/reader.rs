@@ -1,7 +1,6 @@
 //! Detect-Order-Construct (Wang et al., Pattern Recognition 2024) in the engine: the stages `docparse.py`
-//! fits on the gold and exports (LEGALPDF_DOC, a folder of `detect.onnx`, `order.onnx`,
-//! `headings.onnx`, `bodies.onnx` and `docparse.json`, which names the text model's folder: its `tokenizer.json`
-//! and `embeddings.f32`), and the paper's decoding of what they score into the parser's moves:
+//! fits on the gold and exports (`doc.safetensors`: pruned Unigram vocabulary, 4-bit text embeddings, row-wise
+//! INT8 neural weights, and `config` metadata), and the paper's decoding of what they score into the parser's moves:
 //! - Detect, a page at a time, its lines' states then given their templates' across the document (the parser's
 //!   stylesheet, `stylesheet`: each template a node of its measured row and its lines' states) and each line its
 //!   outline anchor (the level the bookmarks name it at): each line's role, its successor
@@ -948,93 +947,438 @@ pub use model::{Reader, TextModel};
 #[cfg(feature = "encoder")]
 mod model {
     use super::*;
-    use crate::doc::onnx::{init_runtime, session, softmax_rows};
-    use ort::session::Session;
-    use std::sync::Mutex;
+    use super::net::{softmax_rows, Meta, Net};
+    use super::tensors::{read_bytes_with_metadata, Tensor};
 
-    fn default_line_block() -> usize {
-        32
+    #[derive(Default)]
+    struct TrieNode {
+        edges: Vec<(u8, u32)>,
+        token: Option<(u32, f32)>,
     }
 
-    fn default_link_dim() -> usize {
-        64
-    }
-
-    fn default_text_parts() -> usize {
-        1
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Meta {
-        width: usize,
-        text_dim: usize,
-        #[serde(default = "default_text_parts")]
-        text_parts: usize,
-        d: usize,
-        classes: usize,
-        /// A template row's width (`Stylesheet::rows`).
-        row_width: usize,
-        /// The text model's folder, which the fit read the lines' texts with.
-        text: PathBuf,
-        /// The lines within this many places of a line on its page take the line heads' spatial term
-        /// (`docparse.LINE_WINDOW`); the successor's and predecessor's bias for the pairs beyond (`line_far`).
-        line_window: usize,
-        line_far: [f32; 2],
-        /// Detect's document-stream local attention block (`docparse.LINE_BLOCK`).
-        #[serde(default = "default_line_block")]
-        line_block: usize,
-        /// Line-link query/key projection width (`docparse.RelationHead.link_dim`).
-        #[serde(default = "default_link_dim")]
-        link_dim: usize,
-        /// Order's pairs within this many regions of each other in reading order, or whose note's number is a mark the
-        /// other sets, take each head's pair term (`docparse.ORDER_WINDOW`); the pairs beyond, its bias (`order_far`).
-        /// An export without them reads every pair's term.
-        #[serde(default = "every_region")]
-        order_window: usize,
-        #[serde(default)]
-        order_far: HashMap<String, f32>,
-        /// Each tree's pair tables (`headings`, `bodies`), which its candidates' scores add (`trees::Scores`).
-        trees: HashMap<String, super::trees::Tables>,
-    }
-
-    /// The text model as its folder holds it (`tokenizer.json`, `embeddings.f32`, `docparse.json`'s text fields): what
-    /// the dump writes each line's tokens with (LEGALPDF_DOC_TEXT), and the reader each line's text vector, the fit's
-    /// `Text` read the same: one tokenizing, one table, read once (where a reading first wants it), never copied.
-    pub struct TextModel {
-        dir: PathBuf,
-        tokenizer: tokenizers::Tokenizer,
-        vocabulary: usize,
-        unknown: Option<u32>,
-        normalize: bool,
-        table: std::sync::OnceLock<std::result::Result<Vec<f32>, String>>,
-    }
-
-    impl TextModel {
-        pub fn load(dir: &Path) -> std::result::Result<Self, String> {
-            #[derive(serde::Deserialize)]
-            struct Fields {
-                vocabulary: usize,
-                unknown: Option<u32>,
-                normalize: bool,
+    impl TrieNode {
+        fn child(&self, b: u8) -> Option<u32> {
+            if self.edges.len() <= 8 {
+                self.edges.iter().find(|&&(eb, _)| eb == b).map(|&(_, id)| id)
+            } else {
+                self.edges
+                    .binary_search_by_key(&b, |&(eb, _)| eb)
+                    .ok()
+                    .map(|idx| self.edges[idx].1)
             }
-            let fields: Fields = serde_json::from_str(
-                &std::fs::read_to_string(dir.join("docparse.json"))
-                    .map_err(|e| format!("docparse.json: {e}"))?,
-            )
-            .map_err(|e| format!("docparse.json: {e}"))?;
-            let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
-                .map_err(|e| format!("tokenizer.json: {e}"))?;
+        }
+
+        fn insert_edge(&mut self, b: u8, next: u32) {
+            match self.edges.binary_search_by_key(&b, |&(eb, _)| eb) {
+                Ok(idx) => self.edges[idx].1 = next,
+                Err(idx) => self.edges.insert(idx, (b, next)),
+            }
+        }
+    }
+
+    struct Unigram {
+        nodes: Vec<TrieNode>,
+        vocab_size: usize,
+        unknown: u32,
+        unk_score: f32,
+    }
+
+    impl Unigram {
+        fn from_pieces<'a>(
+            pieces: impl Iterator<Item = (&'a str, f32)>,
+            unknown: u32,
+        ) -> Self {
+            let mut nodes = vec![TrieNode::default()];
+            let mut vocab_size = 0usize;
+            let mut min_score = 0.0f32;
+            let mut has_score = false;
+            for (id, (piece, score)) in pieces.enumerate() {
+                vocab_size = id + 1;
+                if id >= 2 && piece != "[PAD]" && piece != "[UNK]" && !piece.is_empty() {
+                    if !has_score || score < min_score {
+                        min_score = score;
+                        has_score = true;
+                    }
+                    let mut cur = 0usize;
+                    for &b in piece.as_bytes() {
+                        if let Some(next) = nodes[cur].child(b) {
+                            cur = next as usize;
+                        } else {
+                            let next = nodes.len() as u32;
+                            nodes.push(TrieNode::default());
+                            nodes[cur].insert_edge(b, next);
+                            cur = next as usize;
+                        }
+                    }
+                    nodes[cur].token = Some((id as u32, score));
+                }
+            }
+            Self {
+                nodes,
+                vocab_size,
+                unknown,
+                unk_score: if has_score { min_score - 10.0 } else { -20.0 },
+            }
+        }
+
+        fn from_safetensors(
+            tensors: &HashMap<String, Tensor>,
+            unknown: u32,
+        ) -> std::result::Result<Self, String> {
+            let vbytes = tensors
+                .get("vocab.bytes")
+                .ok_or_else(|| "missing vocab.bytes tensor".to_owned())?;
+            let vlens = tensors
+                .get("vocab.lens")
+                .ok_or_else(|| "missing vocab.lens tensor".to_owned())?;
+            let vscores = tensors
+                .get("vocab.scores")
+                .ok_or_else(|| "missing vocab.scores tensor".to_owned())?;
+            let scores = vscores.f32s();
+            if vlens.bytes.len() != scores.len() {
+                return Err("vocab.lens and vocab.scores length mismatch".to_owned());
+            }
+            let mut at = 0usize;
+            let mut pieces = Vec::with_capacity(scores.len());
+            for (&len, &score) in vlens.bytes.iter().zip(&scores) {
+                let end = at + usize::from(len);
+                let slice = vbytes
+                    .bytes
+                    .get(at..end)
+                    .ok_or_else(|| "vocab.bytes truncated".to_owned())?;
+                let piece = std::str::from_utf8(slice)
+                    .map_err(|e| format!("vocab UTF-8 error: {e}"))?;
+                pieces.push((piece, score));
+                at = end;
+            }
+            Ok(Self::from_pieces(pieces.into_iter(), unknown))
+        }
+
+        fn encode(&self, text: &str, out: &mut Vec<u32>) {
+            let norm = normalize_text(text);
+            if norm.is_empty() {
+                return;
+            }
+            let mut input = String::with_capacity(norm.len() + 4);
+            input.push('\u{2581}');
+            for ch in norm.chars() {
+                input.push(if ch == ' ' { '\u{2581}' } else { ch });
+            }
+            let bytes = input.as_bytes();
+            let n = bytes.len();
+            let mut dp = vec![(f32::NEG_INFINITY, 0usize, self.unknown); n + 1];
+            dp[0] = (0.0, 0, 0);
+            let mut pos = 0usize;
+            while pos < n {
+                let base = dp[pos].0;
+                if base.is_finite() {
+                    let mut cur = 0usize;
+                    let mut at = pos;
+                    while at < n {
+                        let Some(next) = self.nodes[cur].child(bytes[at]) else {
+                            break;
+                        };
+                        cur = next as usize;
+                        at += 1;
+                        if let Some((id, score)) = self.nodes[cur].token {
+                            let cand = base + score;
+                            if cand > dp[at].0 {
+                                dp[at] = (cand, pos, id);
+                            }
+                        }
+                    }
+                    let char_len = input[pos..].chars().next().map_or(1, char::len_utf8);
+                    let next_pos = pos + char_len;
+                    let cand = base + self.unk_score;
+                    if cand > dp[next_pos].0 {
+                        dp[next_pos] = (cand, pos, self.unknown);
+                    }
+                }
+                pos += input[pos..].chars().next().map_or(1, char::len_utf8);
+            }
+            let start = out.len();
+            let mut cur = n;
+            while cur > 0 {
+                let (_, prev, id) = dp[cur];
+                if id != self.unknown && id != 0 && (id as usize) < self.vocab_size {
+                    out.push(id);
+                }
+                if prev >= cur {
+                    break;
+                }
+                cur = prev;
+            }
+            out[start..].reverse();
+        }
+    }
+
+    fn normalize_text(input: &str) -> String {
+        let mut out = String::with_capacity(input.len() + 8);
+        let mut prev_space = true;
+        let push_char = |out: &mut String, prev_space: &mut bool, ch: char| {
+            let is_punct = matches!(
+                ch,
+                '!' | '"'
+                    | '#'
+                    | '$'
+                    | '%'
+                    | '&'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '*'
+                    | '+'
+                    | ','
+                    | '-'
+                    | '.'
+                    | '/'
+                    | ':'
+                    | ';'
+                    | '<'
+                    | '='
+                    | '>'
+                    | '?'
+                    | '@'
+                    | '['
+                    | '\\'
+                    | ']'
+                    | '^'
+                    | '_'
+                    | '`'
+                    | '{'
+                    | '|'
+                    | '}'
+                    | '~'
+            );
+            if ch == ' ' {
+                if !*prev_space {
+                    out.push(' ');
+                    *prev_space = true;
+                }
+            } else if is_punct {
+                if !*prev_space {
+                    out.push(' ');
+                }
+                out.push(ch);
+                out.push(' ');
+                *prev_space = true;
+            } else {
+                out.push(ch);
+                *prev_space = false;
+            }
+        };
+        let push_str = |out: &mut String, prev_space: &mut bool, s: &str| {
+            for c in s.chars() {
+                push_char(out, prev_space, c);
+            }
+        };
+        for ch in input.chars() {
+            match ch {
+                '\u{0000}'..='\u{0008}'
+                | '\u{000E}'..='\u{001B}'
+                | '\u{007F}'
+                | '\u{200B}'..='\u{200D}'
+                | '\u{FEFF}' => {}
+                '\t'
+                | '\n'
+                | '\u{000B}'..='\u{000D}'
+                | '\u{001C}'..='\u{001F}'
+                | ' '
+                | '\u{00A0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}' => push_char(&mut out, &mut prev_space, ' '),
+                '\u{00B2}' => push_char(&mut out, &mut prev_space, '2'),
+                '\u{00B3}' => push_char(&mut out, &mut prev_space, '3'),
+                '\u{00B9}' => push_char(&mut out, &mut prev_space, '1'),
+                '\u{00BC}' => push_str(&mut out, &mut prev_space, "1/4"),
+                '\u{00BD}' => push_str(&mut out, &mut prev_space, "1/2"),
+                '\u{00BE}' => push_str(&mut out, &mut prev_space, "3/4"),
+                '\u{2026}' => push_str(&mut out, &mut prev_space, "..."),
+                '\u{2116}' => push_str(&mut out, &mut prev_space, "No"),
+                '\u{2122}' => push_str(&mut out, &mut prev_space, "TM"),
+                '\u{FB00}' => push_str(&mut out, &mut prev_space, "ff"),
+                '\u{FB01}' => push_str(&mut out, &mut prev_space, "fi"),
+                '\u{FB02}' => push_str(&mut out, &mut prev_space, "fl"),
+                '\u{FB03}' => push_str(&mut out, &mut prev_space, "ffi"),
+                '\u{FB04}' => push_str(&mut out, &mut prev_space, "ffl"),
+                '\u{FF01}'..='\u{FF5E}' => {
+                    if let Some(mapped) = char::from_u32(ch as u32 - 0xFEE0) {
+                        push_char(&mut out, &mut prev_space, mapped);
+                    }
+                }
+                other => push_char(&mut out, &mut prev_space, other),
+            }
+        }
+        if out.ends_with(' ') {
+            out.pop();
+        }
+        out
+    }
+
+    struct Embeddings4 {
+        dim: usize,
+        packed_dim: usize,
+        q: Vec<u8>,
+        min: Vec<f32>,
+        scale: Vec<f32>,
+    }
+
+    impl Embeddings4 {
+        fn from_tensors(
+            tensors: &HashMap<String, Tensor>,
+            vocab_size: usize,
+            dim: usize,
+        ) -> std::result::Result<Self, String> {
+            let tq = tensors
+                .get("text.q")
+                .ok_or_else(|| "missing text.q tensor".to_owned())?;
+            let tmin = tensors
+                .get("text.min")
+                .ok_or_else(|| "missing text.min tensor".to_owned())?;
+            let tscale = tensors
+                .get("text.scale")
+                .ok_or_else(|| "missing text.scale tensor".to_owned())?;
+            let packed_dim = dim / 2;
+            if dim == 0
+                || dim % 2 != 0
+                || tq.shape != [vocab_size, packed_dim]
+                || tq.bytes.len() != vocab_size * packed_dim
+            {
+                return Err(format!("text.q shape mismatch for vocab={vocab_size}, dim={dim}"));
+            }
+            let min = tmin.f32s();
+            let scale = tscale.f32s();
+            if min.len() != vocab_size || scale.len() != vocab_size {
+                return Err("text.min/text.scale length mismatch".to_owned());
+            }
             Ok(Self {
-                dir: dir.to_path_buf(),
-                tokenizer,
-                vocabulary: fields.vocabulary,
-                unknown: fields.unknown,
-                normalize: fields.normalize,
-                table: std::sync::OnceLock::new(),
+                dim,
+                packed_dim,
+                q: tq.bytes.clone(),
+                min,
+                scale,
             })
         }
 
-        /// Each text's vector as Model2Vec reads one (`parts = 1`: mean; `parts = 3`: [mean, first, last]),
+        fn accum_into(&self, id: u32, dst: &mut [f32]) {
+            let idx = id as usize;
+            if idx >= self.min.len() {
+                return;
+            }
+            let mn = self.min[idx];
+            let sc = self.scale[idx];
+            let row = &self.q[idx * self.packed_dim..(idx + 1) * self.packed_dim];
+            for (k, &byte) in row.iter().enumerate() {
+                dst[2 * k] += mn + sc * f32::from(byte & 0x0F);
+                dst[2 * k + 1] += mn + sc * f32::from(byte >> 4);
+            }
+        }
+
+        fn write_into(&self, id: u32, dst: &mut [f32]) {
+            let idx = id as usize;
+            if idx >= self.min.len() {
+                dst.fill(0.0);
+                return;
+            }
+            let mn = self.min[idx];
+            let sc = self.scale[idx];
+            let row = &self.q[idx * self.packed_dim..(idx + 1) * self.packed_dim];
+            for (k, &byte) in row.iter().enumerate() {
+                dst[2 * k] = mn + sc * f32::from(byte & 0x0F);
+                dst[2 * k + 1] = mn + sc * f32::from(byte >> 4);
+            }
+        }
+    }
+
+    /// Pure-Rust Unigram tokenizer and 4-bit asymmetric embedding table loaded from `doc.safetensors`
+    /// (or a legacy Unigram `tokenizer.json` folder when tokenizing training dumps).
+    pub struct TextModel {
+        unigram: Unigram,
+        embeddings: Option<Embeddings4>,
+        normalize: bool,
+    }
+
+    fn resolve_bundle_path(path: &Path) -> PathBuf {
+        if path.is_file() {
+            path.to_path_buf()
+        } else {
+            path.join("doc.safetensors")
+        }
+    }
+
+    impl TextModel {
+        pub fn load(path: &Path) -> std::result::Result<Self, String> {
+            let bundle = resolve_bundle_path(path);
+            if bundle.is_file() {
+                let bytes = std::fs::read(&bundle)
+                    .map_err(|e| format!("{}: {e}", bundle.display()))?;
+                return Self::load_bytes(&bytes);
+            }
+            // Training dumps (`LEGALPDF_DOC_TEXT`) may supply a folder of `docparse.json` + Unigram `tokenizer.json`.
+            #[derive(serde::Deserialize)]
+            struct Fields {
+                normalize: bool,
+            }
+            #[derive(serde::Deserialize)]
+            struct TokJson {
+                model: TokModel,
+            }
+            #[derive(serde::Deserialize)]
+            struct TokModel {
+                unk_id: Option<u32>,
+                vocab: Vec<(String, f32)>,
+            }
+            let fields: Fields = serde_json::from_str(
+                &std::fs::read_to_string(path.join("docparse.json"))
+                    .map_err(|e| format!("docparse.json: {e}"))?,
+            )
+            .map_err(|e| format!("docparse.json: {e}"))?;
+            let tok: TokJson = serde_json::from_str(
+                &std::fs::read_to_string(path.join("tokenizer.json"))
+                    .map_err(|e| format!("tokenizer.json: {e}"))?,
+            )
+            .map_err(|e| format!("tokenizer.json: {e}"))?;
+            let unknown = tok.model.unk_id.unwrap_or(1);
+            Ok(Self {
+                unigram: Unigram::from_pieces(
+                    tok.model.vocab.iter().map(|(s, p)| (s.as_str(), *p)),
+                    unknown,
+                ),
+                embeddings: None,
+                normalize: fields.normalize,
+            })
+        }
+
+        pub fn load_bytes(bytes: &[u8]) -> std::result::Result<Self, String> {
+            let (tensors, metadata) =
+                read_bytes_with_metadata(bytes).map_err(|e| format!("doc.safetensors: {e}"))?;
+            let config = metadata
+                .get("config")
+                .ok_or_else(|| "doc.safetensors metadata missing config".to_owned())?;
+            let meta: Meta =
+                serde_json::from_str(config).map_err(|e| format!("config JSON: {e}"))?;
+            Self::from_tensors(&tensors, &meta)
+        }
+
+        fn from_tensors(
+            tensors: &HashMap<String, Tensor>,
+            meta: &Meta,
+        ) -> std::result::Result<Self, String> {
+            let unigram = Unigram::from_safetensors(tensors, meta.unknown as u32)?;
+            let embeddings = Embeddings4::from_tensors(tensors, meta.vocab_size, meta.text_dim)?;
+            Ok(Self {
+                unigram,
+                embeddings: Some(embeddings),
+                normalize: meta.normalize,
+            })
+        }
+
+        /// Each text's vector (`parts = 1`: mean; `parts = 3`: `[mean, first, last]`),
         /// L2-normalized independently per `dim` slice when `normalize` is set; a line of no tokens nought.
         pub fn vectors(
             &self,
@@ -1046,7 +1390,7 @@ mod model {
             self.vectors_of(&tokens, &counts, dim, parts)
         }
 
-        /// Each line's vector as `vectors` reads one, from its tokens (`counts` of them a line, end to end).
+        /// Each line's vector from precomputed token IDs (`counts` of them a line, end to end).
         pub fn vectors_of(
             &self,
             tokens: &[u32],
@@ -1054,24 +1398,12 @@ mod model {
             dim: usize,
             parts: usize,
         ) -> std::result::Result<Vec<f32>, String> {
-            let table = self
-                .table
-                .get_or_init(|| {
-                    let bytes = std::fs::read(self.dir.join("embeddings.f32"))
-                        .map_err(|e| format!("embeddings.f32: {e}"))?;
-                    Ok(bytes
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect())
-                })
+            let emb = self
+                .embeddings
                 .as_ref()
-                .map_err(Clone::clone)?;
-            if table.len() != self.vocabulary * dim {
-                return Err(format!(
-                    "embeddings.f32 holds {} values, not {} tokens of {dim}",
-                    table.len(),
-                    self.vocabulary
-                ));
+                .ok_or_else(|| "text model was loaded without embeddings".to_owned())?;
+            if emb.dim != dim {
+                return Err(format!("embedding dim is {}, requested {dim}", emb.dim));
             }
             let parts = parts.max(1);
             let stride = parts * dim;
@@ -1082,85 +1414,38 @@ mod model {
                     s.iter_mut().for_each(|x| *x /= norm);
                 }
             };
-            let mut at = 0;
+            let mut at = 0usize;
             for (line, &count) in counts.iter().enumerate() {
                 let row = &mut out[line * stride..(line + 1) * stride];
                 for &token in &tokens[at..at + count] {
-                    row[..dim]
-                        .iter_mut()
-                        .zip(&table[token as usize * dim..(token as usize + 1) * dim])
-                        .for_each(|(x, &v)| *x += v);
+                    emb.accum_into(token, &mut row[..dim]);
                 }
                 let mean = count.max(1) as f32;
                 row[..dim].iter_mut().for_each(|x| *x /= mean);
                 norm_slice(&mut row[..dim]);
                 if parts >= 3 && count > 0 {
-                    let first = tokens[at] as usize * dim;
-                    if let Some(src) = table.get(first..first + dim) {
-                        row[dim..2 * dim].copy_from_slice(src);
-                        norm_slice(&mut row[dim..2 * dim]);
-                    }
-                    let last = tokens[at + count - 1] as usize * dim;
-                    if let Some(src) = table.get(last..last + dim) {
-                        row[2 * dim..3 * dim].copy_from_slice(src);
-                        norm_slice(&mut row[2 * dim..3 * dim]);
-                    }
+                    emb.write_into(tokens[at], &mut row[dim..2 * dim]);
+                    norm_slice(&mut row[dim..2 * dim]);
+                    emb.write_into(tokens[at + count - 1], &mut row[2 * dim..3 * dim]);
+                    norm_slice(&mut row[2 * dim..3 * dim]);
                 }
                 at += count;
             }
             Ok(out)
         }
 
-        /// Each text's tokens as Model2Vec reads a text (no special tokens; the unknown one and any past the vocabulary
-        /// left out; an empty text read as a space), end to end, and each text's count of them.
+        /// Tokenize each line into Unigram token IDs (omitting `[PAD]` and `[UNK]`) and per-line token counts.
         pub fn tokens(
             &self,
             texts: &[&str],
         ) -> std::result::Result<(Vec<u32>, Vec<usize>), String> {
             let (mut tokens, mut counts) = (Vec::new(), Vec::with_capacity(texts.len()));
-            for text in texts {
-                let text = if text.trim().is_empty() { " " } else { text };
-                let encoding = self
-                    .tokenizer
-                    .encode_fast(text, false)
-                    .map_err(|e| format!("tokenizer: {e}"))?;
+            for &text in texts {
                 let before = tokens.len();
-                tokens.extend(
-                    encoding
-                        .get_ids()
-                        .iter()
-                        .copied()
-                        .filter(|&id| Some(id) != self.unknown && (id as usize) < self.vocabulary),
-                );
+                self.unigram.encode(text, &mut tokens);
                 counts.push(tokens.len() - before);
             }
             Ok((tokens, counts))
-        }
-    }
-
-    /// One set of the stages' sessions: a parse holds one for its document, parses at once each their own (made
-    /// as they are wanted, kept for the next), none waiting on another's.
-    struct Sessions {
-        detect: Session,
-        spatial: Session,
-        order: Session,
-        headings: Session,
-        bodies: Session,
-    }
-
-    impl Sessions {
-        fn load(dir: &Path, threads: usize) -> std::result::Result<Self, String> {
-            let load = |name: &str| {
-                let path = dir.join(format!("{name}.onnx"));
-                session(&path, path.display(), threads)
-            };
-            Ok(Self {
-                detect: load("detect")?,
-                spatial: load("spatial")?,
-                order: load("order")?,
-                headings: load("headings")?,
-                bodies: load("bodies")?,
-            })
         }
     }
 
@@ -1212,26 +1497,14 @@ mod model {
         out
     }
 
-    /// DOC's stages, loaded: tier 1, which a parse reads with (`derive`) where it is given one.
+    /// DOC's stages loaded from a single `doc.safetensors` bundle, completely pure-Rust and runtime-free.
     pub struct Reader {
-        dir: PathBuf,
-        /// Each session's threads: one where documents are read at once each on its own (a grade), every core where a
-        /// document is read alone (an app's parse).
         threads: usize,
-        sessions: Mutex<Vec<Sessions>>,
-        /// Whether each document's stages' times are written, for the reader's speed.
         times: bool,
         text: TextModel,
+        net: Net,
         meta: Meta,
     }
-
-    /// An export's Order window where it names none: every pair within it.
-    fn every_region() -> usize {
-        usize::MAX
-    }
-
-    /// The Order graph's attention block (`docparse.BLOCK`): its regions come padded to whole blocks.
-    const BLOCK: usize = 64;
 
     fn argmax(row: &[f32]) -> usize {
         row.iter()
@@ -1266,7 +1539,7 @@ mod model {
         runs: Vec<(usize, usize)>,
     }
 
-    /// Outputs of fused `detect.onnx` + `spatial.onnx` for one document (`n` real lines).
+    /// Outputs of Detect + line-pair spatial compatibility for one document (`n` real lines).
     struct Detected {
         states: Vec<f32>,
         role: Vec<f32>,
@@ -1287,31 +1560,44 @@ mod model {
     }
 
     impl Reader {
-        /// The stages under `dir`, their ONNX Runtime at `runtime` (else the one LEGALPDF_ONNX_RUNTIME or
-        /// LEGALPDF_ONNXRUNTIME names), and its text model; each session run on `threads` threads.
+        /// Load the pure-Rust DOC bundle from `path` (either `doc.safetensors` directly or its parent directory).
         pub fn load(
-            dir: &Path,
-            runtime: Option<&Path>,
+            path: &Path,
+            _runtime: Option<&Path>,
             times: bool,
             threads: usize,
         ) -> std::result::Result<Self, String> {
-            let read = |name: &str| {
-                std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"))
-            };
-            let meta: Meta = serde_json::from_str(&read("docparse.json")?)
-                .map_err(|e| format!("docparse.json: {e}"))?;
+            let bundle = resolve_bundle_path(path);
+            let bytes = std::fs::read(&bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
+            Self::load_bytes(&bytes, times, threads)
+        }
+
+        /// Load the pure-Rust DOC bundle directly from in-memory `doc.safetensors` bytes (ideal for WASM).
+        pub fn load_bytes(
+            bytes: &[u8],
+            times: bool,
+            threads: usize,
+        ) -> std::result::Result<Self, String> {
+            let (tensors, metadata) =
+                read_bytes_with_metadata(bytes).map_err(|e| format!("doc.safetensors: {e}"))?;
+            let config = metadata
+                .get("config")
+                .ok_or_else(|| "doc.safetensors metadata missing config".to_owned())?;
+            let meta: Meta =
+                serde_json::from_str(config).map_err(|e| format!("doc.safetensors config: {e}"))?;
             if meta.width != WIDTH || meta.classes != CLASSES {
-                return Err(format!("docparse.json reads {} features and {} classes; the parser has {WIDTH} and {CLASSES}", meta.width, meta.classes));
+                return Err(format!(
+                    "doc.safetensors reads {} features and {} classes; the parser has {WIDTH} and {CLASSES}",
+                    meta.width, meta.classes
+                ));
             }
-            init_runtime(runtime, "the DOC reader needs LEGALPDF_ONNX_RUNTIME")?;
-            let text = TextModel::load(&meta.text)?;
-            let first = Sessions::load(dir, threads)?;
+            let text = TextModel::from_tensors(&tensors, &meta)?;
+            let net = Net::from_tensors(&tensors, &meta)?;
             Ok(Self {
-                dir: dir.to_path_buf(),
-                threads,
-                sessions: Mutex::new(vec![first]),
+                threads: threads.max(1),
                 times,
                 text,
+                net,
                 meta,
             })
         }
@@ -1321,9 +1607,7 @@ mod model {
             &self.text
         }
 
-        /// The document's moves, a line each in reading order, read off `inputs` (`texts` each line's): `read_many` of it
-        /// alone. `gold`, where given with LEGALPDF_DOC_ORACLE_PARTS, takes the line heads' answers it names from the gold
-        /// (`partial_oracle`): what each head's misses cost the units, the rest read as the model reads it.
+        /// The document's moves, a line each in reading order.
         pub fn read(
             &self,
             inputs: &super::inputs::Inputs,
@@ -1343,53 +1627,25 @@ mod model {
             .unwrap_or_else(|| Ok(Vec::new()))
         }
 
-        /// Each document's moves: its lines read in a document at a time (the context, the texts, the stylesheet), Detect
-        /// and its heads over every page of all of them at once (`paged`: a page reads only its own lines, so beside
-        /// another document's it reads as alone), Order and the trees a document at a time; read with a set of sessions
-        /// of the reader's own, given back after.
+        /// Each document's moves through pure-Rust Detect, Order, and Construct stages.
         pub fn read_many(
             &self,
             docs: &[Reading],
         ) -> Vec<std::result::Result<Vec<Move>, String>> {
-            let mut sessions = match self
-                .sessions
-                .lock()
-                .ok()
-                .and_then(|mut pool| pool.pop())
-                .map_or_else(|| Sessions::load(&self.dir, self.threads), Ok)
-            {
-                Ok(sessions) => sessions,
-                Err(error) => return docs.iter().map(|_| Err(error.clone())).collect(),
-            };
-            let moves = self.read_many_with(&mut sessions, docs);
-            if let Ok(mut pool) = self.sessions.lock() {
-                pool.push(sessions);
-            }
-            moves
-        }
-
-        fn read_many_with(
-            &self,
-            sessions: &mut Sessions,
-            docs: &[Reading],
-        ) -> Vec<std::result::Result<Vec<Move>, String>> {
-            let (d, m) = (self.meta.d, &self.meta);
+            let (m, mut laps, mut total_lines) = (&self.meta, [0.0f64; 4], 0usize);
             if ROW != m.row_width {
                 return docs
                     .iter()
                     .map(|_| {
                         Err(format!(
-                            "the stylesheet's rows are {ROW} wide; docparse.json says {}",
+                            "the stylesheet's rows are {ROW} wide; doc.safetensors says {}",
                             m.row_width
                         ))
                     })
                     .collect();
             }
             let block = m.line_block.max(1);
-            let link_dim = m.link_dim.max(1);
             let window = m.line_window.clamp(1, 16);
-            let mut laps = [0.0f64; 4];
-            let mut total_lines = 0usize;
             let mut results = Vec::with_capacity(docs.len());
             for doc in docs {
                 let doc_start = std::time::Instant::now();
@@ -1411,7 +1667,6 @@ mod model {
                 total_lines += n;
                 let l_pad = n.div_ceil(block) * block;
                 let features = context_features(doc, n, l_pad);
-                let feat_width = features.len() / l_pad;
                 laps[1] += at.elapsed().as_secs_f64();
                 at = std::time::Instant::now();
 
@@ -1437,91 +1692,53 @@ mod model {
                 };
                 let num_templates = rows.len() / ROW;
 
-                let detected = (|| -> std::result::Result<Detected, String> {
-                    let shrink_detect = (l_pad > 2048)
-                        .then(super::onnx::shrink_arena_options)
-                        .flatten();
-                    let det_inputs = ort::inputs![
-                        "features" => tensor!([l_pad, feat_width], &features[..]),
-                        "text" => tensor!([l_pad, text_width], &text[..]),
-                        "boxes" => tensor!([l_pad, 4], &boxes[..]),
-                        "pages" => tensor!([l_pad], &doc_pages[..]),
-                        "anchors" => tensor!([l_pad], &anchors[..]),
-                        "t0" => tensor!([l_pad, T0], &t0[..]),
-                        "valid" => tensor!([l_pad], &valid[..]),
-                        "templates" => tensor!([l_pad], &templates[..]),
-                        "rows" => tensor!([num_templates, ROW], &rows[..])
-                    ];
-                    let outputs = if let Some(ref opts) = shrink_detect {
-                        sessions
-                            .detect
-                            .run_with_options(det_inputs, opts)
-                            .map_err(|e| format!("detect: {e}"))?
-                    } else {
-                        sessions
-                            .detect
-                            .run(det_inputs)
-                            .map_err(|e| format!("detect: {e}"))?
-                    };
-                    let slice = |name: &str, w: usize| -> std::result::Result<Vec<f32>, String> {
-                        Ok(output!(outputs, name)[..n * w].to_vec())
-                    };
-                    let (states, role, flags, succ_q, succ_k, pred_q, pred_k, table_col, speaker) = (
-                        slice("states", d)?,
-                        slice("role", CLASSES)?,
-                        slice("flags", 2)?,
-                        slice("succ_q", link_dim)?,
-                        slice("succ_k", link_dim)?,
-                        slice("pred_q", link_dim)?,
-                        slice("pred_k", link_dim)?,
-                        slice("table_col", TABLE_COLS)?,
-                        slice("speaker", 1)?,
-                    );
-                    laps[2] += at.elapsed().as_secs_f64();
-                    at = std::time::Instant::now();
+                let det_out = self.net.run_detect(
+                    &features,
+                    &text,
+                    &boxes,
+                    &doc_pages,
+                    &anchors,
+                    &t0,
+                    &valid,
+                    &templates,
+                    &rows,
+                    n,
+                    l_pad,
+                    num_templates,
+                    m,
+                    self.threads,
+                );
+                laps[2] += at.elapsed().as_secs_f64();
+                at = std::time::Instant::now();
 
-                    let (mut pair_i, mut pair_j) = (Vec::new(), Vec::new());
-                    for &(start, end) in &begun.runs {
-                        for i in start..end {
-                            for j in i..=(i + window).min(end - 1) {
-                                pair_i.push(i as i64);
-                                pair_j.push(j as i64);
-                            }
+                let (mut pair_i, mut pair_j) = (Vec::new(), Vec::new());
+                for &(start, end) in &begun.runs {
+                    for i in start..end {
+                        for j in i..=(i + window).min(end - 1) {
+                            pair_i.push(i as i64);
+                            pair_j.push(j as i64);
                         }
                     }
-                    let spatial_out = sessions
-                        .spatial
-                        .run(ort::inputs![
-                            "boxes" => tensor!([n, 4], &doc.inputs.boxes[..n * 4]),
-                            "pair_i" => tensor!([pair_i.len()], &pair_i[..]),
-                            "pair_j" => tensor!([pair_j.len()], &pair_j[..])
-                        ])
-                        .map_err(|e| format!("spatial: {e}"))?;
-                    let (near_succ, near_pred) = (
-                        output!(spatial_out, "successor").to_vec(),
-                        output!(spatial_out, "predecessor").to_vec(),
-                    );
-                    laps[3] += at.elapsed().as_secs_f64();
-                    Ok(Detected {
-                        states,
-                        role,
-                        flags,
-                        succ_q,
-                        succ_k,
-                        pred_q,
-                        pred_k,
-                        table_col,
-                        speaker,
-                        near_succ,
-                        near_pred,
-                        window,
-                    })
-                })();
+                }
+                let (near_succ, near_pred) =
+                    self.net.run_spatial(&doc.inputs.boxes[..n * 4], &pair_i, &pair_j);
+                laps[3] += at.elapsed().as_secs_f64();
+                let detected = Detected {
+                    states: det_out.states,
+                    role: det_out.role,
+                    flags: det_out.flags,
+                    succ_q: det_out.succ_q,
+                    succ_k: det_out.succ_k,
+                    pred_q: det_out.pred_q,
+                    pred_k: det_out.pred_k,
+                    table_col: det_out.table_col,
+                    speaker: det_out.speaker,
+                    near_succ,
+                    near_pred,
+                    window,
+                };
                 let embedded = doc_start.elapsed().as_secs_f64();
-                results.push(match detected {
-                    Ok(det) => self.rest(sessions, doc, &begun, det, embedded),
-                    Err(e) => Err(e),
-                });
+                results.push(self.rest(doc, &begun, detected, embedded));
             }
             if self.times {
                 eprintln!(
@@ -1545,12 +1762,8 @@ mod model {
             let text = if n == 0 {
                 Vec::new()
             } else {
-                match &inputs.tokens {
-                    Some((tokens, counts)) => {
-                        self.text.vectors_of(tokens, counts, self.meta.text_dim, self.meta.text_parts)?
-                    }
-                    None => self.text.vectors(&doc.texts[..n], self.meta.text_dim, self.meta.text_parts)?,
-                }
+                self.text
+                    .vectors(&doc.texts[..n], self.meta.text_dim, self.meta.text_parts)?
             };
             Ok(Begun {
                 n,
@@ -1565,7 +1778,6 @@ mod model {
         /// them and the trees.
         fn rest(
             &self,
-            sessions: &mut Sessions,
             doc: &Reading,
             begun: &Begun,
             det: Detected,
@@ -1636,39 +1848,43 @@ mod model {
                     }
                 }
                 let mut succ_probs = vec![0f32; l * l];
-                let mut row_buf = Vec::with_capacity(l);
+                let mut row_buf = Vec::with_capacity(det.window + 1);
                 for i in 0..l {
                     row_buf.clear();
+                    let j_end = (i + det.window).min(l - 1);
                     let qi = &det.succ_q[(start + i) * link_dim..(start + i + 1) * link_dim];
-                    for j in i..l {
+                    for j in i..=j_end {
                         let kj = &det.succ_k[(start + j) * link_dim..(start + j + 1) * link_dim];
                         row_buf.push(dot_slice(qi, kj) + succ_terms[i * l + j]);
                     }
-                    let sm = softmax_rows(&row_buf, l - i);
-                    succ_probs[i * l + i..i * l + l].copy_from_slice(&sm);
+                    let sm = softmax_rows(&row_buf, j_end - i + 1);
+                    succ_probs[i * l + i..=i * l + j_end].copy_from_slice(&sm);
                 }
                 let mut pred_probs = vec![0f32; l * l];
                 for j in 0..l {
                     row_buf.clear();
+                    let i_start = j.saturating_sub(det.window);
                     let qj = &det.pred_q[(start + j) * link_dim..(start + j + 1) * link_dim];
-                    for i in 0..=j {
+                    for i in i_start..=j {
                         let ki = &det.pred_k[(start + i) * link_dim..(start + i + 1) * link_dim];
                         row_buf.push(dot_slice(qj, ki) + pred_terms[j * l + i]);
                     }
-                    let sm = softmax_rows(&row_buf, j + 1);
-                    pred_probs[j * l..j * l + j + 1].copy_from_slice(&sm);
+                    let sm = softmax_rows(&row_buf, j - i_start + 1);
+                    pred_probs[j * l + i_start..=j * l + j].copy_from_slice(&sm);
                 }
                 if decode.joint {
                     let mut candidates: Vec<(usize, usize)> = Vec::new();
                     for i in 0..l {
-                        if let Some(best_j) = (i + 1..l).max_by(|&a, &b| {
+                        let j_end = (i + det.window).min(l - 1);
+                        if let Some(best_j) = (i + 1..=j_end).max_by(|&a, &b| {
                             succ_probs[i * l + a].total_cmp(&succ_probs[i * l + b])
                         }) {
                             candidates.push((i, best_j));
                         }
                     }
                     for j in 1..l {
-                        if let Some(best_i) = (0..j).max_by(|&a, &b| {
+                        let i_start = j.saturating_sub(det.window);
+                        if let Some(best_i) = (i_start..j).max_by(|&a, &b| {
                             pred_probs[j * l + a].total_cmp(&pred_probs[j * l + b])
                         }) {
                             candidates.push((best_i, j));
@@ -1684,6 +1900,12 @@ mod model {
                             let (a, b) = (start + i, start + j);
                             let (ra, rb) = ((lines.roles[a] / 2) as u8, (lines.roles[b] / 2) as u8);
                             if ra == 0 || rb == 0 || ((strict(ra) || strict(rb)) && ra != rb) {
+                                return None;
+                            }
+                            if (ra == MARGINAL_NOTE || rb == MARGINAL_NOTE) && j > i + 3 {
+                                return None;
+                            }
+                            if rb == TABLE && j > i + 1 && p_opens[b] > 0.30 {
                                 return None;
                             }
                             let link_lo = (clamp_p(succ_probs[i * l + j])
@@ -1801,6 +2023,54 @@ mod model {
                 set.iter()
                     .for_each(|&value| setting.entry(value).or_default().push(j))
             });
+            let mut side_by_side_pages: HashSet<i64> = HashSet::new();
+            if decode.order {
+                for (&page, page_regs) in &by_page {
+                    if page_regs.len() < 2
+                        || page_regs.iter().any(|&i| regions.role(i) == LINE_LABEL)
+                    {
+                        continue;
+                    }
+                    let mut side_by_side = false;
+                    for (idx, &a) in page_regs.iter().enumerate() {
+                        if matches!(regions.role(a), FURNITURE | PAGE_LABEL | LINE_LABEL) {
+                            continue;
+                        }
+                        let (ax0, ay0, ax1, ay1) = (
+                            region_boxes[a * 4],
+                            region_boxes[a * 4 + 1],
+                            region_boxes[a * 4 + 2],
+                            region_boxes[a * 4 + 3],
+                        );
+                        let ah = (ay1 - ay0).max(1e-3);
+                        for &b in &page_regs[idx + 1..] {
+                            if matches!(regions.role(b), FURNITURE | PAGE_LABEL | LINE_LABEL) {
+                                continue;
+                            }
+                            let (bx0, by0, bx1, by1) = (
+                                region_boxes[b * 4],
+                                region_boxes[b * 4 + 1],
+                                region_boxes[b * 4 + 2],
+                                region_boxes[b * 4 + 3],
+                            );
+                            let bh = (by1 - by0).max(1e-3);
+                            let y_ov = (ay1.min(by1) - ay0.max(by0)).max(0.0);
+                            if y_ov > 0.20 * ah.min(bh)
+                                && (ax1 <= bx0 + 0.02 || bx1 <= ax0 + 0.02)
+                            {
+                                side_by_side = true;
+                                break;
+                            }
+                        }
+                        if side_by_side {
+                            break;
+                        }
+                    }
+                    if side_by_side {
+                        side_by_side_pages.insert(page);
+                    }
+                }
+            }
             // Three filtered pair lists: `goes_on`, `note_of`, and `order` ([page - 1, page + 1] pairs).
             let (mut goes_i, mut goes_j) = (Vec::new(), Vec::new());
             let mut goes_rows = vec![(0usize, 0usize); count];
@@ -1827,18 +2097,20 @@ mod model {
                     }
                 }
                 goes_rows[i] = (g0, goes_i.len());
-                let o0 = ord_i.len();
-                ord_i.push(i as i64);
-                ord_j.push(i as i64);
-                for near_page in [page - 1, page, page + 1] {
-                    for &j in by_page.get(&near_page).into_iter().flatten() {
-                        if j != i {
-                            ord_i.push(i as i64);
-                            ord_j.push(j as i64);
+                if side_by_side_pages.contains(&page) {
+                    let o0 = ord_i.len();
+                    ord_i.push(i as i64);
+                    ord_j.push(i as i64);
+                    for near_page in [page - 1, page, page + 1] {
+                        for &j in by_page.get(&near_page).into_iter().flatten() {
+                            if j != i {
+                                ord_i.push(i as i64);
+                                ord_j.push(j as i64);
+                            }
                         }
                     }
+                    ord_rows[i] = (o0, ord_i.len());
                 }
-                ord_rows[i] = (o0, ord_i.len());
                 if is_note(ri) {
                     if let Some(val) = number[i] {
                         let n0 = note_i.len();
@@ -1862,8 +2134,14 @@ mod model {
                 note_j.push(0);
                 note_match.push(false);
             }
-            // The regions padded to whole blocks of the graph's local attention (`docparse.BLOCK`), the padding marked.
-            let padded = count.div_ceil(BLOCK) * BLOCK;
+            let has_ord = !ord_i.is_empty();
+            if ord_i.is_empty() {
+                ord_i.push(0);
+                ord_j.push(0);
+            }
+            // The regions padded to whole blocks of the graph's local attention (`meta.order_block`), the padding marked.
+            let order_block = self.meta.order_block.max(1);
+            let padded = count.div_ceil(order_block) * order_block;
             let mut opener = vec![0f32; padded * d];
             let mut closer = vec![0f32; padded * d];
             for (i, &r_idx) in regions.read.iter().enumerate() {
@@ -1911,91 +2189,87 @@ mod model {
             );
             let total_pairs = near_goes.len() + near_note.len() + near_ord.len();
             let (region_states, goes_on, note_of, order_scores, region_logits, region_start, region_doc_kind) = {
-                let shrink_opts = (padded > 512)
-                    .then(super::onnx::shrink_arena_options)
-                    .flatten();
-                let ord_inputs = ort::inputs![
-                    "line_states" => tensor!([line_region.len(), d], &line_states[..]),
-                    "line_region" => tensor!([line_region.len()], &line_region[..]),
-                    "opener" => tensor!([padded, d], &opener[..]),
-                    "closer" => tensor!([padded, d], &closer[..]),
-                    "region_roles" => tensor!([padded], &kinds[..]),
-                    "region_valid" => tensor!([padded], &region_valid[..]),
-                    "region_boxes" => tensor!([padded, 4], &region_boxes[..]),
-                    "region_pages" => tensor!([padded], &region_pages[..]),
-                    "goes_i" => tensor!([near_goes_i.len()], &near_goes_i[..]),
-                    "goes_j" => tensor!([near_goes_j.len()], &near_goes_j[..]),
-                    "note_i" => tensor!([near_note_i.len()], &near_note_i[..]),
-                    "note_j" => tensor!([near_note_j.len()], &near_note_j[..]),
-                    "note_match" => tensor!([near_note_match.len()], &near_note_match[..]),
-                    "ord_i" => tensor!([near_ord_i.len()], &near_ord_i[..]),
-                    "ord_j" => tensor!([near_ord_j.len()], &near_ord_j[..])
-                ];
-                let outputs = if let Some(ref opts) = shrink_opts {
-                    sessions
-                        .order
-                        .run_with_options(ord_inputs, opts)
-                        .map_err(|e| format!("order: {e}"))?
-                } else {
-                    sessions
-                        .order
-                        .run(ord_inputs)
-                        .map_err(|e| format!("order: {e}"))?
-                };
-                let take = |name: &str| {
-                    outputs[name]
-                        .try_extract_tensor::<f32>()
-                        .map(|(_, v)| v.to_vec())
-                        .map_err(|e| e.to_string())
-                };
+                let ord_out = self.net.run_order(
+                    &line_states,
+                    &line_region,
+                    &opener,
+                    &closer,
+                    &kinds,
+                    &region_valid,
+                    &region_boxes,
+                    &region_pages,
+                    &near_goes_i,
+                    &near_goes_j,
+                    &near_note_i,
+                    &near_note_j,
+                    &near_note_match,
+                    &near_ord_i,
+                    &near_ord_j,
+                    padded,
+                    &self.meta,
+                    self.threads,
+                );
                 let head = |name: &str,
-                            out_name: &str,
+                            q: &[f32],
+                            k: &[f32],
+                            near_r: &[f32],
                             pi: &[i64],
                             pj: &[i64],
                             near: &[usize]|
-                 -> std::result::Result<Vec<f32>, String> {
-                    let (q, k, near_r) = (
-                        take(&format!("{out_name}_q"))?,
-                        take(&format!("{out_name}_k"))?,
-                        take(&format!("{out_name}_r"))?,
-                    );
+                 -> Vec<f32> {
                     let mut r =
                         vec![self.meta.order_far.get(name).copied().unwrap_or(0.0); pi.len()];
-                    near.iter().zip(&near_r).for_each(|(&p, &term)| r[p] = term);
-                    Ok((0..pi.len())
+                    near.iter().zip(near_r).for_each(|(&p, &term)| r[p] = term);
+                    let qd = q.len() / padded.max(1);
+                    (0..pi.len())
                         .map(|p| {
                             let (i, j) = (pi[p] as usize, pj[p] as usize);
-                            q[i * d..(i + 1) * d]
-                                .iter()
-                                .zip(&k[j * d..(j + 1) * d])
-                                .map(|(a, b)| a * b)
-                                .sum::<f32>()
-                                + r[p]
+                            dot_slice(&q[i * qd..(i + 1) * qd], &k[j * qd..(j + 1) * qd]) + r[p]
                         })
-                        .collect())
+                        .collect()
                 };
-                let opt = |name: &str| {
-                    outputs
-                        .get(name)
-                        .and_then(|v| v.try_extract_tensor::<f32>().ok().map(|(_, s)| s.to_vec()))
-                };
-                let ord_scores = if decode.order && outputs.contains_key("order_q") {
-                    head("successor", "order", &ord_i, &ord_j, &near_ord)?
+                let opt = |v: Vec<f32>| (!v.is_empty()).then_some(v);
+                let ord_scores = if has_ord && decode.order && !ord_out.order_q.is_empty() {
+                    head(
+                        "successor",
+                        &ord_out.order_q,
+                        &ord_out.order_k,
+                        &ord_out.order_r,
+                        &ord_i,
+                        &ord_j,
+                        &near_ord,
+                    )
                 } else {
                     Vec::new()
                 };
                 (
-                    take("regions")?,
-                    head("goes_on", "goes_on", &goes_i, &goes_j, &near_goes)?,
+                    ord_out.regions,
+                    head(
+                        "goes_on",
+                        &ord_out.goes_on_q,
+                        &ord_out.goes_on_k,
+                        &ord_out.goes_on_r,
+                        &goes_i,
+                        &goes_j,
+                        &near_goes,
+                    ),
                     if has_notes {
-                        head("note_of", "note_of", &note_i, &note_j, &near_note)?
+                        head(
+                            "note_of",
+                            &ord_out.note_of_q,
+                            &ord_out.note_of_k,
+                            &ord_out.note_of_r,
+                            &note_i,
+                            &note_j,
+                            &near_note,
+                        )
                     } else {
                         Vec::new()
                     },
                     ord_scores,
-                    opt("region_logits"),
-                    opt("region_start"),
-                    opt("region_doc_kind"),
+                    opt(ord_out.region_logits),
+                    opt(ord_out.region_start),
+                    opt(ord_out.region_doc_kind),
                 )
             };
             let oracle_starts = gold.is_some() && oracle_parts().contains("starts");
@@ -2064,7 +2338,7 @@ mod model {
                             let ord_s = reg_start[i];
                             let combined = 0.4 * det_s + 0.6 * ord_s;
                             lines.starts[first] =
-                                combined > decode.start + 1.1 && det_s > -0.5 && ord_s > 0.0;
+                                combined > decode.start + 0.5 && det_s > -1.0 && ord_s > -0.2;
                         }
                     }
                 }
@@ -2113,6 +2387,9 @@ mod model {
                     views[firsts[j]].margin().is_some() || views[firsts[j]].count().is_some();
                 let same_stream = stream_of(role(i)) == stream_of(role(j))
                     && (role(i) == HEADING) == (role(j) == HEADING)
+                    && (role(i) == TABLE) == (role(j) == TABLE)
+                    && (role(i) == MARGINAL_NOTE) == (role(j) == MARGINAL_NOTE)
+                    && !(role(i) == MARGINAL_NOTE && pages[firsts[j]] > pages[firsts[i]])
                     && !(firsts[i] + 1..=firsts[j]).any(|k| lines.starts[k]);
                 if before[j].is_none() && !after[i] && !opens && same_stream {
                     (before[j], after[i]) = (Some(i), true);
@@ -2133,7 +2410,7 @@ mod model {
                 before[i].is_none() && role(i) == HEADING
             });
             let line_family = |k: usize| inputs.markers[k];
-            let tree = |session: &mut Session,
+            let tree = |construct: &super::net::ConstructNet,
                         tables: &super::trees::Tables,
                         nodes: &[usize]|
              -> std::result::Result<Vec<usize>, String> {
@@ -2182,23 +2459,32 @@ mod model {
                     node(&|_, k| pages[k] as i64),
                     node(&|i, _| i64::from(role(i))),
                 );
-                let outputs = session.run(ort::inputs![
-                    "states" => tensor!([h, d], &x[..]),
-                    "opener_states" => tensor!([h, d], &node_openers[..]),
-                    "heading_states" => tensor!([h, d], &h_states[..]),
-                    "family" => tensor!([h], &node_fam[..]), "value" => tensor!([h], &node_val[..]), "prefix" => tensor!([h], &node_pref[..]),
-                    "x0" => tensor!([h], &node_x0[..]), "size" => tensor!([h], &node_size[..]), "roles" => tensor!([h], &node_roles[..])])
-                    .map_err(|e| format!("construct: {e}"))?;
+                let out = self.net.run_construct(
+                    construct,
+                    &x,
+                    &node_openers,
+                    &h_states,
+                    &node_fam,
+                    &node_val,
+                    &node_pref,
+                    &node_x0,
+                    &node_size,
+                    &node_roles,
+                    h,
+                    self.threads,
+                );
                 let vectors = [
-                    output!(outputs, "parent_q"),
-                    output!(outputs, "parent_k"),
-                    output!(outputs, "sibling_q"),
-                    output!(outputs, "sibling_k"),
+                    &out.parent_q[..],
+                    &out.parent_k[..],
+                    &out.sibling_q[..],
+                    &out.sibling_k[..],
                 ];
-                let gaps: Vec<usize> = output!(outputs, "gap")
+                let gaps: Vec<usize> = out
+                    .gap
                     .chunks_exact(GAPS)
                     .map(|row| argmax(row) + 1)
                     .collect();
+                let td = vectors[0].len() / h;
                 let scores = super::trees::Scores::new(
                     super::trees::Nodes {
                         templates: &node_templates,
@@ -2215,7 +2501,7 @@ mod model {
                     },
                     tables,
                     vectors,
-                    d,
+                    td,
                 );
                 let node_firsts: Vec<usize> = nodes.iter().map(|&i| firsts[i]).collect();
                 Ok(insert_scored(
@@ -2233,18 +2519,18 @@ mod model {
                 .filter(|&i| opening(i) && BODY.contains(&role(i)))
                 .collect();
             let mut level = vec![0usize; count];
-            for (nodes, session, name) in [
-                (&headings, &mut sessions.headings, "headings"),
-                (&bodies, &mut sessions.bodies, "bodies"),
+            for (nodes, construct, name) in [
+                (&headings, &self.net.headings, "headings"),
+                (&bodies, &self.net.bodies, "bodies"),
             ] {
                 let tables = self
                     .meta
                     .trees
                     .get(name)
-                    .ok_or_else(|| format!("docparse.json has no {name} tables"))?;
+                    .ok_or_else(|| format!("doc.safetensors has no {name} tables"))?;
                 nodes
                     .iter()
-                    .zip(tree(session, tables, nodes)?)
+                    .zip(tree(construct, tables, nodes)?)
                     .for_each(|(&i, l)| level[i] = l);
             }
             // A note's region: the one holding a mark of its number its link names, where not itself, surest notes first
@@ -2299,52 +2585,12 @@ mod model {
                         continue;
                     }
                     let page = pages[p_start] as i64;
+                    if !side_by_side_pages.contains(&page) {
+                        continue;
+                    }
                     let Some(page_regs) = by_page.get(&page) else {
                         continue;
                     };
-                    if page_regs.len() < 2
-                        || page_regs.iter().any(|&i| regions.role(i) == LINE_LABEL)
-                    {
-                        continue;
-                    }
-                    let mut side_by_side = false;
-                    for (idx, &a) in page_regs.iter().enumerate() {
-                        if matches!(regions.role(a), FURNITURE | PAGE_LABEL | LINE_LABEL) {
-                            continue;
-                        }
-                        let (ax0, ay0, ax1, ay1) = (
-                            region_boxes[a * 4],
-                            region_boxes[a * 4 + 1],
-                            region_boxes[a * 4 + 2],
-                            region_boxes[a * 4 + 3],
-                        );
-                        let ah = (ay1 - ay0).max(1e-3);
-                        for &b in &page_regs[idx + 1..] {
-                            if matches!(regions.role(b), FURNITURE | PAGE_LABEL | LINE_LABEL) {
-                                continue;
-                            }
-                            let (bx0, by0, bx1, by1) = (
-                                region_boxes[b * 4],
-                                region_boxes[b * 4 + 1],
-                                region_boxes[b * 4 + 2],
-                                region_boxes[b * 4 + 3],
-                            );
-                            let bh = (by1 - by0).max(1e-3);
-                            let y_ov = (ay1.min(by1) - ay0.max(by0)).max(0.0);
-                            if y_ov > 0.20 * ah.min(bh)
-                                && (ax1 <= bx0 + 0.02 || bx1 <= ax0 + 0.02)
-                            {
-                                side_by_side = true;
-                                break;
-                            }
-                        }
-                        if side_by_side {
-                            break;
-                        }
-                    }
-                    if !side_by_side {
-                        continue;
-                    }
                     let mut edges: Vec<(usize, usize, f32)> = Vec::new();
                     for &i in page_regs {
                         let (o0, o1) = ord_rows[i];
@@ -2665,5 +2911,318 @@ mod model {
             }
             Ok(moves)
         }
+    }
+}
+
+#[cfg(all(test, feature = "encoder"))]
+mod tests {
+    use super::TextModel;
+    use super::super::net::Meta;
+    use super::super::tensors::{self, Tensor};
+    use std::collections::HashMap;
+
+    fn pack_i4(rows: &[[f32; 4]]) -> (Tensor, Tensor, Tensor) {
+        let mut q = Vec::with_capacity(rows.len() * 2);
+        let mut mins = Vec::with_capacity(rows.len());
+        let mut scales = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mn = row.iter().copied().fold(f32::INFINITY, f32::min);
+            let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sc = if mx > mn { (mx - mn) / 15.0 } else { 0.0 };
+            mins.push(mn);
+            scales.push(sc);
+            let quant = |v: f32| -> u8 {
+                if sc > 0.0 {
+                    ((v - mn) / sc).round().clamp(0.0, 15.0) as u8
+                } else {
+                    0
+                }
+            };
+            q.push((quant(row[0]) & 0x0F) | ((quant(row[1]) & 0x0F) << 4));
+            q.push((quant(row[2]) & 0x0F) | ((quant(row[3]) & 0x0F) << 4));
+        }
+        (
+            Tensor::bytes("text.q", vec![rows.len(), 2], &q),
+            Tensor::f32("text.min", vec![rows.len()], &mins),
+            Tensor::f32("text.scale", vec![rows.len()], &scales),
+        )
+    }
+
+    fn build_vocab_tensors(pieces: &[(&str, f32)]) -> [Tensor; 3] {
+        let mut bytes = Vec::new();
+        let mut lens = Vec::with_capacity(pieces.len());
+        let mut scores = Vec::with_capacity(pieces.len());
+        for &(p, sc) in pieces {
+            bytes.extend_from_slice(p.as_bytes());
+            lens.push(p.len() as u8);
+            scores.push(sc);
+        }
+        [
+            Tensor::bytes("vocab.bytes", vec![bytes.len()], &bytes),
+            Tensor::bytes("vocab.lens", vec![lens.len()], &lens),
+            Tensor::f32("vocab.scores", vec![scores.len()], &scores),
+        ]
+    }
+
+    #[test]
+    fn pure_rust_unigram_and_int4_embeddings_three_parts() {
+        let pieces = [
+            ("[PAD]", 0.0),
+            ("[UNK]", 0.0),
+            ("\u{2581}", -1.0),
+            (",", -2.0),
+            ("\u{2581}Hello", -1.5),
+            ("\u{2581}world", -1.2),
+            ("!", -2.5),
+        ];
+        let rows: [[f32; 4]; 7] = [
+            [0.0; 4],
+            [0.0; 4],
+            [0.10, -0.20, 0.30, -0.40],
+            [0.50, 0.10, -0.30, 0.20],
+            [0.80, -0.40, 0.20, 0.10],
+            [-0.20, 0.60, 0.40, -0.30],
+            [0.15, 0.25, -0.35, 0.45],
+        ];
+        let mut tensors = Vec::new();
+        tensors.extend(build_vocab_tensors(&pieces));
+        let (tq, tmin, tscale) = pack_i4(&rows);
+        tensors.extend([tq, tmin, tscale]);
+
+        let tree_tbl = serde_json::json!({
+            "table": vec![[0.0f32, 0.0f32]; 105],
+            "scale": [[0.0f32, 0.0f32], [0.0f32, 0.0f32]],
+            "offsets": [0, 19, 31, 79, 88, 104],
+        });
+        let config = serde_json::json!({
+            "width": 92,
+            "text_dim": 4,
+            "text_parts": 3,
+            "d": 16,
+            "classes": 34,
+            "row_width": 20,
+            "line_window": 8,
+            "line_far": [0.0, 0.0],
+            "line_block": 4,
+            "order_block": 4,
+            "link_dim": 8,
+            "order_window": 16,
+            "order_link_dim": 8,
+            "order_far": {},
+            "normalize": true,
+            "vocab_size": pieces.len(),
+            "unknown": 1,
+            "trees": { "headings": tree_tbl, "bodies": tree_tbl }
+        });
+        let tmp = std::env::temp_dir().join(format!("doc_text_v10_{}.safetensors", std::process::id()));
+        tensors::write(&tmp, &tensors, &[("config", config.to_string())]).unwrap();
+        let bytes = std::fs::read(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        let tm = TextModel::load_bytes(&bytes).unwrap();
+        let (toks, counts) = tm.tokens(&["  Hello, world!  ", "   "]).unwrap();
+        // "  Hello, world!  " -> "\u{2581}Hello\u{2581},\u{2581}world\u{2581}!" -> [4, 2, 3, 5, 2, 6]; whitespace -> empty
+        assert_eq!(toks, vec![4, 2, 3, 5, 2, 6]);
+        assert_eq!(counts, vec![6, 0]);
+
+        let vecs = tm.vectors(&["  Hello, world!  ", "   "], 4, 3).unwrap();
+        assert_eq!(vecs.len(), 2 * 12);
+        // Second line is whitespace -> all zeros
+        assert!(vecs[12..24].iter().all(|&v| v == 0.0));
+        // Each 4-dim slice of line 0 should be unit normalized (~1.0 L2 norm)
+        for slice in vecs[0..12].chunks_exact(4) {
+            let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-4, "norm={norm}");
+        }
+    }
+
+    #[test]
+    fn net_from_tensors_and_forward_stages_are_finite() {
+        let mut all = HashMap::new();
+        let add_lin = |map: &mut HashMap<String, Tensor>, prefix: &str, out: usize, inp: usize, bias: bool| {
+            map.insert(format!("{prefix}.w_q"), Tensor::i8(&format!("{prefix}.w_q"), vec![out, inp], &vec![1i8; out * inp]));
+            map.insert(format!("{prefix}.w_s"), Tensor::f32(&format!("{prefix}.w_s"), vec![out], &vec![0.01f32; out]));
+            if bias {
+                map.insert(format!("{prefix}.b"), Tensor::f32(&format!("{prefix}.b"), vec![out], &vec![0.0f32; out]));
+            }
+        };
+        let add_ln = |map: &mut HashMap<String, Tensor>, prefix: &str, dim: usize| {
+            map.insert(format!("{prefix}.w"), Tensor::f32(&format!("{prefix}.w"), vec![dim], &vec![1.0f32; dim]));
+            map.insert(format!("{prefix}.b"), Tensor::f32(&format!("{prefix}.b"), vec![dim], &vec![0.0f32; dim]));
+        };
+        let add_emb = |map: &mut HashMap<String, Tensor>, prefix: &str, rows: usize, dim: usize| {
+            map.insert(format!("{prefix}.w"), Tensor::f32(&format!("{prefix}.w"), vec![rows, dim], &vec![0.05f32; rows * dim]));
+        };
+        let add_layer = |map: &mut HashMap<String, Tensor>, prefix: &str, dim: usize, hd: usize, sb: bool| {
+            add_ln(map, &format!("{prefix}.norm1"), dim);
+            add_ln(map, &format!("{prefix}.norm2"), dim);
+            add_lin(map, &format!("{prefix}.qkv"), 3 * dim, dim, true);
+            add_lin(map, &format!("{prefix}.out"), dim, dim, true);
+            add_ln(map, &format!("{prefix}.q_norm"), hd);
+            add_ln(map, &format!("{prefix}.k_norm"), hd);
+            add_lin(map, &format!("{prefix}.feed.0"), 2 * dim, dim, true);
+            add_lin(map, &format!("{prefix}.feed.2"), dim, 2 * dim, true);
+            if sb {
+                add_lin(map, &format!("{prefix}.spatial_bias"), dim / hd, 7, true);
+            }
+        };
+
+        let (d, td) = (16, 16);
+        add_lin(&mut all, "detect.text.0", d, 12, true);
+        add_ln(&mut all, "detect.text.2", d);
+        add_lin(&mut all, "detect.position.0", d, 6, true);
+        add_lin(&mut all, "detect.position.2", d, d, true);
+        add_ln(&mut all, "detect.position.4", d);
+        add_lin(&mut all, "detect.look.0", d, 264, true);
+        add_ln(&mut all, "detect.look.2", d);
+        add_emb(&mut all, "detect.anchor", 10, d);
+        add_lin(&mut all, "detect.decided.0", d, 27, true);
+        add_ln(&mut all, "detect.decided.2", d);
+        add_lin(&mut all, "detect.fuse", d, 5 * d, true);
+        add_layer(&mut all, "detect.pre", d, 16, true);
+        add_layer(&mut all, "detect.post", d, 16, true);
+        add_lin(&mut all, "detect.trans_geom.0", d, 12, true);
+        add_lin(&mut all, "detect.trans_geom.2", d, d, true);
+        add_ln(&mut all, "detect.trans_fuse.0", 3 * d);
+        add_lin(&mut all, "detect.trans_fuse.1", d, 3 * d, true);
+        add_lin(&mut all, "detect.trans_fuse.3", d, d, true);
+        for hname in ["detect.successor", "detect.predecessor"] {
+            add_lin(&mut all, &format!("{hname}.q"), 8, d, true);
+            add_lin(&mut all, &format!("{hname}.k"), 8, d, true);
+            add_lin(&mut all, &format!("{hname}.r.0"), 64, 18, true);
+            add_lin(&mut all, &format!("{hname}.r.2"), 1, 64, true);
+        }
+        add_lin(&mut all, "detect.role", 34, d, true);
+        add_lin(&mut all, "detect.flags", 2, d, true);
+        add_lin(&mut all, "detect.table_col", 16, d, true);
+        add_lin(&mut all, "detect.speaker", 1, d, true);
+
+        add_lin(&mut all, "templates.row.0", d, 20, true);
+        add_ln(&mut all, "templates.row.2", d);
+        add_lin(&mut all, "templates.pool", d, d, true);
+        add_layer(&mut all, "templates.encoder.0", d, 16, false);
+        add_lin(&mut all, "templates.back.0", d, d, true);
+        add_ln(&mut all, "templates.back.1", d);
+
+        add_lin(&mut all, "order.pool.0", d, d, true);
+        add_lin(&mut all, "order.pool.2", 1, d, true);
+        add_emb(&mut all, "order.role.0", 17, d);
+        add_ln(&mut all, "order.role.2", d);
+        add_lin(&mut all, "order.fuse", d, 4 * d, true);
+        add_layer(&mut all, "order.encoder.0", d, 16, false);
+        for hname in ["order.goes_on", "order.note_of", "order.successor"] {
+            add_lin(&mut all, &format!("{hname}.q"), 8, d, true);
+            add_lin(&mut all, &format!("{hname}.k"), 8, d, true);
+            add_lin(&mut all, &format!("{hname}.r.0"), 64, 25, true);
+            add_lin(&mut all, &format!("{hname}.r.2"), 1, 64, true);
+        }
+        add_lin(&mut all, "order.role_head", 17, d, true);
+        add_lin(&mut all, "order.start_head", 1, d, true);
+        add_lin(&mut all, "order.doc_kind_head", 15, d, true);
+
+        for tname in ["headings", "bodies"] {
+            add_emb(&mut all, &format!("{tname}.node_role"), 17, td);
+            add_emb(&mut all, &format!("{tname}.node_fam"), 64, td);
+            add_lin(&mut all, &format!("{tname}.node_geom"), td, 4, true);
+            add_lin(&mut all, &format!("{tname}.enclosing"), td, d, false);
+            add_lin(&mut all, &format!("{tname}.opener_proj"), td, d, false);
+            add_layer(&mut all, &format!("{tname}.layers.0"), td, 16, false);
+            add_lin(&mut all, &format!("{tname}.parent.q"), 8, td, true);
+            add_lin(&mut all, &format!("{tname}.parent.k"), 8, td, true);
+            add_lin(&mut all, &format!("{tname}.sibling.q"), 8, td, true);
+            add_lin(&mut all, &format!("{tname}.sibling.k"), 8, td, true);
+            add_lin(&mut all, &format!("{tname}.gap"), 4, td, true);
+        }
+
+        let tree_tbl: super::super::trees::Tables = serde_json::from_value(serde_json::json!({
+            "table": vec![[0.0f32, 0.0f32]; 105],
+            "scale": [[0.0f32, 0.0f32], [0.0f32, 0.0f32]],
+            "offsets": [0, 19, 31, 79, 88, 104],
+        }))
+        .unwrap();
+        let meta = Meta {
+            width: 92,
+            text_dim: 4,
+            text_parts: 3,
+            d,
+            classes: 34,
+            row_width: 20,
+            line_window: 8,
+            line_far: [0.0, 0.0],
+            line_block: 4,
+            order_block: 4,
+            link_dim: 8,
+            order_window: 16,
+            order_link_dim: 8,
+            order_far: HashMap::new(),
+            normalize: true,
+            vocab_size: 4,
+            unknown: 1,
+            trees: HashMap::from([("headings".to_owned(), tree_tbl)]),
+        };
+        let net = super::super::net::Net::from_tensors(&all, &meta).unwrap();
+        let det = net.run_detect(
+            &vec![0.1f32; 4 * 264],
+            &vec![0.1f32; 4 * 12],
+            &[0.1, 0.1, 0.5, 0.12, 0.1, 0.2, 0.5, 0.22, 0.1, 0.3, 0.5, 0.32, 0.0, 0.0, 0.0, 0.0],
+            &[0, 0, 0, -1],
+            &[0, 1, 2, 0],
+            &vec![0.0f32; 4 * 27],
+            &[true, true, true, false],
+            &[0, 0, 0, 0],
+            &vec![0.0f32; 20],
+            3,
+            4,
+            1,
+            &meta,
+            1,
+        );
+        assert_eq!(det.role.len(), 3 * 34);
+        assert!(det.role.iter().all(|v| v.is_finite()));
+        assert!(det.states.iter().all(|v| v.is_finite()));
+
+        let (ns, np) = net.run_spatial(&[0.1, 0.1, 0.5, 0.12, 0.1, 0.2, 0.5, 0.22], &[0, 0], &[0, 1]);
+        assert_eq!((ns.len(), np.len()), (2, 2));
+        assert!(ns.iter().chain(&np).all(|v| v.is_finite()));
+
+        let ord = net.run_order(
+            &det.states,
+            &[0, 0, 1],
+            &vec![0.1f32; 4 * d],
+            &vec![0.1f32; 4 * d],
+            &[1, 3, 0, 0],
+            &[true, true, false, false],
+            &[0.1, 0.1, 0.5, 0.2, 0.1, 0.2, 0.5, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &[0, 0, -1, -1],
+            &[0, 0],
+            &[0, 1],
+            &[0],
+            &[0],
+            &[false],
+            &[0],
+            &[0],
+            4,
+            &meta,
+            1,
+        );
+        assert_eq!(ord.regions.len(), 4 * d);
+        assert!(ord.regions.iter().all(|v| v.is_finite()));
+
+        let tree = net.run_construct(
+            &net.headings,
+            &ord.regions[..2 * d],
+            &vec![0.1f32; 2 * d],
+            &vec![0.1f32; 2 * d],
+            &[1, 1],
+            &[1, 2],
+            &[1, 1],
+            &[0.1, 0.1],
+            &[0.02, 0.02],
+            &[3, 3],
+            2,
+            1,
+        );
+        assert_eq!(tree.gap.len(), 8);
+        assert!(tree.gap.iter().all(|v| v.is_finite()));
     }
 }

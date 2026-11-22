@@ -319,29 +319,32 @@ fn cache_key(
 }
 
 /// The modes ("born-digital", or "recognized" where recognition read a page) whose census promoted DOC, the structure
-/// stage's tier 1, over tier 0: none yet, so a request naming DOC is read by tier 0 in every mode.
-const DOC_PROMOTED: &[&str] = &[];
+/// stage's tier 1, over tier 0.
+const DOC_PROMOTED: &[&str] = &["born-digital", "recognized"];
 
-/// What a request's DOC is keyed by: its export's settings (`docparse.json`), which each fit writes anew.
+/// What a request's DOC is keyed by: its pure-Rust bundle (`doc.safetensors`), which each fit writes anew.
 fn doc_identity(doc: &crate::contract::DocOptions) -> Result<String> {
-    let path = doc.model_pack.join("docparse.json");
-    fs::read(&path).map(|settings| Sha256::digest(settings).iter().map(|byte| format!("{byte:02x}")).collect::<String>()).map_err(|source| Error::Io { path, source })
+    let path = if doc.model_pack.is_file() {
+        doc.model_pack.clone()
+    } else {
+        doc.model_pack.join("doc.safetensors")
+    };
+    fs::read(&path).map(|bundle| Sha256::digest(bundle).iter().map(|byte| format!("{byte:02x}")).collect::<String>()).map_err(|source| Error::Io { path, source })
 }
 
-/// DOC's stages loaded once for every parse that reads with them, by their export and runtime: an app's parse reads one
+/// DOC's stages loaded once for every parse that reads with them, by their bundle path: an app's parse reads one
 /// document at a time, on every core.
 fn loaded_doc(doc: &crate::contract::DocOptions) -> Result<std::sync::Arc<Doc>> {
-    type Loaded = Vec<((PathBuf, Option<PathBuf>), std::sync::Arc<Doc>)>;
+    type Loaded = Vec<(PathBuf, std::sync::Arc<Doc>)>;
     static LOADED: std::sync::Mutex<Loaded> = std::sync::Mutex::new(Vec::new());
-    let key = (doc.model_pack.clone(), doc.runtime.clone());
     let mut loaded = LOADED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((_, reader)) = loaded.iter().find(|(known, _)| *known == key) {
+    if let Some((_, reader)) = loaded.iter().find(|(known, _)| *known == doc.model_pack) {
         return Ok(std::sync::Arc::clone(reader));
     }
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let reader = std::sync::Arc::new(Doc::load(&doc.model_pack, doc.runtime.as_deref(), false, threads)
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let reader = std::sync::Arc::new(Doc::load(&doc.model_pack, None, false, threads)
         .map_err(|error| Error::Message(error).failure(FailureKind::Parser))?);
-    loaded.push((key, std::sync::Arc::clone(&reader)));
+    loaded.push((doc.model_pack.clone(), std::sync::Arc::clone(&reader)));
     Ok(reader)
 }
 

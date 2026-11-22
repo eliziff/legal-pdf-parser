@@ -12,10 +12,7 @@ legal-pdf-rules = { path = "../legal-pdf-rules" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # A parse kept in the dump (`Entry`'s `parse`), read back whole.
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"], optional = true }
-# The DOC reader's text model (reader.rs): Hugging Face's tokenizer, its regular expressions in Rust.
-tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
 
 [features]
-# DOC's document encoder and its stages.
-encoder = ["dep:ort", "dep:tokenizers", "legal-pdf-core/ort-runtime"]
+# DOC's pure-Rust neural network encoder and its stages (zero external runtime dependencies).
+encoder = []

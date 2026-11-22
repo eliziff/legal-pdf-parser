@@ -157,31 +157,27 @@ pub fn read(path: &Path) -> std::io::Result<std::collections::HashMap<String, Te
     read_with_metadata(path).map(|(arrays, _)| arrays)
 }
 
-/// The arrays of a safetensors file `write` wrote, by name, and the metadata (string pairs) of its header.
+/// The arrays of a safetensors buffer (`bytes`), by name, and the metadata (string pairs) of its header.
 #[allow(clippy::type_complexity)]
-pub fn read_with_metadata(
-    path: &Path,
+pub fn read_bytes_with_metadata(
+    bytes: &[u8],
 ) -> std::io::Result<(
     std::collections::HashMap<String, Tensor>,
     std::collections::HashMap<String, String>,
 )> {
-    let bytes = std::fs::read(path)?;
-    let bad = |what: &str| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{}: {what}", path.display()),
-        )
-    };
+    let bad = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
     let length = bytes
         .get(..8)
-        .map(|b| u64::from_le_bytes(b.try_into().expect("eight bytes")) as usize)
+        .and_then(|b| usize::try_from(u64::from_le_bytes(b.try_into().expect("eight bytes"))).ok())
         .ok_or_else(|| bad("no header"))?;
-    let header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(
-        bytes
-            .get(8..8 + length)
-            .ok_or_else(|| bad("short header"))?,
-    )?;
-    let data = &bytes[8 + length..];
+    let header_end = 8usize
+        .checked_add(length)
+        .ok_or_else(|| bad("short header"))?;
+    let header_slice = bytes
+        .get(8..header_end)
+        .ok_or_else(|| bad("short header"))?;
+    let header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(header_slice)?;
+    let data = &bytes[header_end..];
     let metadata = header
         .get("__metadata__")
         .and_then(serde_json::Value::as_object)
@@ -239,6 +235,20 @@ pub fn read_with_metadata(
         })
         .collect::<std::io::Result<_>>()
         .map(|arrays| (arrays, metadata))
+}
+
+/// The arrays of a safetensors file `write` wrote, by name, and the metadata (string pairs) of its header.
+#[allow(clippy::type_complexity)]
+pub fn read_with_metadata(
+    path: &Path,
+) -> std::io::Result<(
+    std::collections::HashMap<String, Tensor>,
+    std::collections::HashMap<String, String>,
+)> {
+    let bytes = std::fs::read(path)?;
+    read_bytes_with_metadata(&bytes).map_err(|err| {
+        std::io::Error::new(err.kind(), format!("{}: {err}", path.display()))
+    })
 }
 
 /// `tensors` written to `path` as one safetensors file, with `metadata` (string pairs) in its header.

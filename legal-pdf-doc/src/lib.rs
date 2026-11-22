@@ -13,7 +13,6 @@
 // The crates this stage reads, by the names its paths use.
 use legal_pdf_structure_model as model;
 use legal_pdf_rules as rules;
-use crate as doc;
 
 use crate::model::machine::lines::LineTable;
 use crate::model::decide::Decision;
@@ -32,8 +31,7 @@ mod stylesheet;
 pub use stylesheet::*;
 pub use stylesheet::ROW;
 #[cfg(feature = "encoder")]
-#[macro_use]
-mod onnx;
+mod net;
 mod entry;
 pub use entry::Entry;
 mod inputs;
