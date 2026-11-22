@@ -24,7 +24,7 @@ pub fn page_numeral(label: &str) -> Option<u32> {
 /// OF EXHIBITS", "I N D E X", "SOMMAIRE").
 pub fn contents_title(text: &str) -> bool {
     crate::text::text::contents_heading(text)
-        || regex!(r"(?i)^\s*(?:(?:table\s+of\s+)?contents|table\s+des\s+mati[eÃ¨]res|index(?:\s+of\s+\w+)?|sommaire|i\s*n\s*d\s*e\s*x)\b").is_match(text)
+        || regex!(r"(?i)^\s*(?:(?:table\s+of\s+)?contents|table\s+des\s+mati[e\u{00e8}]res|index(?:\s+of\s+\w+)?|sommaire|i\s*n\s*d\s*e\s*x)\b").is_match(text)
 }
 
 /// A word index's letter: "< A >", "- B -"; a heading over its entries, not an entry.
@@ -35,7 +35,7 @@ pub fn index_letter(text: &str) -> bool {
 /// A locator alone, its value and its place as printed ("12", "xiv", a range "18-43"): "12", "xiv",
 /// "p. 3", "[18] - [43]", "1 to 27".
 pub fn locator(text: &str) -> Option<(u32, String)> {
-    regex!(r"(?i)^\s*(?:p(?:age|p?\.|ara\.?)?\s*)?\[?(\d{1,4}|[ivxlc]{1,7})\]?(?:\s*(?:[-â€“]|to)\s*\[?(\d{1,4})\]?)?\s*$")
+    regex!(r"(?i)^\s*(?:p(?:age|p?\.|ara\.?)?\s*)?\[?(\d{1,4}|[ivxlc]{1,7})\]?(?:\s*(?:[-\u{2013}]|to)\s*\[?(\d{1,4})\]?)?\s*$")
         .captures(text)
         .map(|found| (value(&found[1]), place(&found)))
 }
@@ -43,7 +43,7 @@ pub fn locator(text: &str) -> Option<(u32, String)> {
 /// A locator after a leader at a title's end ("Overview ........ 3"), or after a tab or a wide
 /// space the title is typeset with ("Introduction\u{2003}3"): where the title ends, and the locator.
 pub fn leader_locator(text: &str) -> Option<(usize, u32, String)> {
-    regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|[\t\u{2002}\u{2003}\u{2007}])\s*(?:p(?:age|p?\.)?\s*)?\[?(\d{1,4}|[ivxlc]{1,6})\]?(?:\s*(?:[-â€“]|to)\s*\[?(\d{1,4})\]?)?\s*$")
+    regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|[\t\u{2002}\u{2003}\u{2007}])\s*(?:p(?:age|p?\.)?\s*)?\[?(\d{1,4}|[ivxlc]{1,6})\]?(?:\s*(?:[-\u{2013}]|to)\s*\[?(\d{1,4})\]?)?\s*$")
         .captures(text)
         .map(|found| (found.get(0).map_or(text.len(), |all| all.start()), value(&found[1]), place(&found)))
 }
@@ -136,5 +136,23 @@ pub fn row_of(lines: Vec<&Line>) -> Row<'_> {
         },
         text,
         lines,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use legal_citations as _;
+    use legal_citations_data as _;
+
+    #[test]
+    fn contents_titles_and_en_dash_locators_match_utf8_properly() {
+        assert!(contents_title("Table des mati\u{00e8}res"));
+        assert!(contents_title("TABLE OF CONTENTS"));
+        assert_eq!(
+            leader_locator("I. INTRODUCTION ............ 444").map(|(_, value, token)| (value, token)),
+            Some((444, "444".to_owned()))
+        );
+        assert_eq!(locator("18\u{2013}43"), Some((18, "18-43".to_owned())));
     }
 }

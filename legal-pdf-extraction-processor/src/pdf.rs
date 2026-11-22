@@ -99,7 +99,13 @@ pub fn assemble_pdf(
         by_page.entry(line.page).or_default().push(line);
     }
 
-    let (mut pages, diagnostics, mut source_offset, mut weak_pages) = (Vec::with_capacity(geometries.len()), Vec::new(), 0, BTreeSet::<usize>::new());
+    let (mut pages, diagnostics, mut source_offset, mut weak_pages, mut failed_layer_pages) = (
+        Vec::with_capacity(geometries.len()),
+        Vec::new(),
+        0,
+        BTreeSet::<usize>::new(),
+        0usize,
+    );
     for (&number, &(_, geometry)) in geometries {
         let page_index = usize::try_from(number.saturating_sub(1)).unwrap_or(usize::MAX);
         let mut lines = Vec::new();
@@ -111,8 +117,12 @@ pub fn assemble_pdf(
         let reasons = detection.ocr_reasons_by_page.get(&number);
         let garbled = reasons.is_some_and(|reasons| reasons.iter().any(|reason| reason == pdf_inspector::OCR_REASON_SUSPECTED_GARBLED_TEXT));
         let quality = if garbled { 0.0 } else { text_quality(&lines) };
+        let poor_layer = layer_pages.contains(&number) && !layer_reads_well(&lines);
+        if poor_layer {
+            failed_layer_pages += 1;
+        }
         // A scan's invisible text layer that reads poorly is recognized again.
-        if lines.is_empty() || quality < 0.15 || layer_pages.contains(&number) && !layer_reads_well(&lines) {
+        if lines.is_empty() || quality < 0.15 || poor_layer {
             weak_pages.insert(page_index);
         }
         source_offset += lines.len();
@@ -129,6 +139,14 @@ pub fn assemble_pdf(
             text_quality: quality,
             ..Default::default()
         });
+    }
+    let distrust_layer = should_distrust_layer(layer_pages.len(), failed_layer_pages);
+    if distrust_layer {
+        for &number in &layer_pages {
+            if let Ok(index) = usize::try_from(number.saturating_sub(1)) {
+                weak_pages.insert(index);
+            }
+        }
     }
     let mut rules_by_page = HashMap::<u32, Vec<PdfLine>>::new();
     for rule in painted_rules {
@@ -154,7 +172,7 @@ pub fn assemble_pdf(
             // poorly, or a page needing recognition for any other reason, is recognized again.
             let layer_only = layer_pages.contains(page) && detection.ocr_reasons_by_page.get(page).is_some_and(|reasons|
                 reasons.iter().all(|reason| reason == pdf_inspector::OCR_REASON_INVISIBLE_TEXT_LAYER));
-            if layer_only && pages.get(index).is_some_and(|page| !page.lines.is_empty() && layer_reads_well(&page.lines)) {
+            if !distrust_layer && layer_only && pages.get(index).is_some_and(|page| !page.lines.is_empty() && layer_reads_well(&page.lines)) {
                 continue;
             }
             weak_pages.insert(index);
@@ -172,4 +190,23 @@ pub fn assemble_pdf(
     let image_regions = image_regions(&pages, pictures, &weak_pages);
     let metadata = PdfExtractionMetadata { embedded_page_labels: Vec::new(), pages_needing_ocr: weak_pages.into_iter().collect(), ocr_routed_pages: Vec::new(), scanned_pages };
     Ok(ExtractedPdf { pages, separators, diagnostics, outline: Vec::new(), image_regions, metadata })
+}
+
+/// Whether an entire scanned PDF's invisible text layer should be distrusted because at least a
+/// quarter of its layered pages already fail the per-page quality check.
+pub(crate) fn should_distrust_layer(total_layer_pages: usize, failed_layer_pages: usize) -> bool {
+    total_layer_pages > 0 && failed_layer_pages > 0 && failed_layer_pages * 4 >= total_layer_pages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_distrust_layer;
+
+    #[test]
+    fn layer_distrust_requires_quarter_of_layered_pages_to_fail() {
+        assert!(!should_distrust_layer(0, 0));
+        assert!(!should_distrust_layer(20, 1));
+        assert!(should_distrust_layer(6, 2));
+        assert!(should_distrust_layer(2, 1));
+    }
 }

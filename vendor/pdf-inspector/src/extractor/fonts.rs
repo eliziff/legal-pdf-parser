@@ -3593,14 +3593,16 @@ pub fn clean_symbol_pua(text: String, base_font_name: Option<&str>) -> (String, 
                 let replacement = match low {
                     // Common bullets
                     0xA1 | 0xA7 | 0xB7 => '\u{2022}',
+                    // Wingdings solid square bullet (U+F06E)
+                    0x6E if dingbat => '\u{2022}',
                     // Checkmark
                     0xFC => '\u{2713}',
                     _ if dingbat => c,
                     _ if symbol => match char::from_u32(low) {
                         Some(
-                            ascii @ (' ' | '!' | '#' | '%' | '&' | '(' | ')' | '+' | ',' | '-'
-                            | '.' | '/' | '0'..='9' | ':' | ';' | '<' | '=' | '>' | '?' | '['
-                            | ']' | '_' | '{' | '|' | '}'),
+                            ascii @ (' ' | '!' | '#' | '%' | '&' | '(' | ')' | '*' | '+' | ','
+                            | '-' | '.' | '/' | '0'..='9' | ':' | ';' | '<' | '=' | '>' | '?'
+                            | '[' | ']' | '_' | '{' | '|' | '}'),
                         ) => ascii,
                         Some(letter @ 'A'..='Z') => {
                             SYMBOL_UPPER.chars().nth(letter as usize - 'A' as usize).unwrap_or(c)

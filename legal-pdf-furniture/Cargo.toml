@@ -14,3 +14,7 @@ legal-structure-lines = { workspace = true }
 pdf-inspector = { workspace = true }
 regex = "1.11"
 legal-pdf-layout = { path = "../legal-pdf-layout" }
+
+[dev-dependencies]
+legal-citations = { path = "../../common-law-cite/crates/legal-citations" }
+legal-citations-data = { path = "../../common-law-cite/crates/legal-citations-data" }

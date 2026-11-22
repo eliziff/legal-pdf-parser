@@ -169,3 +169,55 @@ pub(crate) fn item_bbox(item: &TextItem, page_height: f64) -> [f64; 4] {
     let [x, y, width, height] = [item.x, item.y, item.width, item.height].map(f64::from);
     [round3(x), round3(page_height - y - height), round3(x + width), round3(page_height - y)]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::unmap_symbol_text;
+    use pdf_inspector::types::{ItemType, TextItem};
+
+    fn text_item(text: &str, font: &str) -> TextItem {
+        TextItem {
+            text: text.to_owned(),
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            rotation: 0.0,
+            advance_known: true,
+            font: font.to_owned(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            fidelity: None,
+            item_type: ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    #[test]
+    fn unmap_symbol_text_maps_symbol_asterisk_and_wingdings_bullet() {
+        let mut sym_star = text_item("Benedict S. Robinson\u{f02a}", "ABCDEF+SymbolMT");
+        unmap_symbol_text(&mut sym_star);
+        assert_eq!(sym_star.text, "Benedict S. Robinson*");
+
+        let mut sym_nu = text_item("\u{f06e}", "ABCDEF+Symbol");
+        unmap_symbol_text(&mut sym_nu);
+        assert_eq!(sym_nu.text, "\u{03bd}");
+
+        let mut wing_bullet = text_item("4 \u{f06e} APPEAL VOLUME 12", "ABCDEF+Wingdings-Regular");
+        unmap_symbol_text(&mut wing_bullet);
+        assert_eq!(wing_bullet.text, "4 \u{2022} APPEAL VOLUME 12");
+    }
+}

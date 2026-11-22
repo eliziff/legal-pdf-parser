@@ -24,12 +24,12 @@ use std::collections::{HashMap, HashSet};
 /// A paragraph range alone on its row ("[18] - [43]"): the locator of the title on the row above,
 /// wherever it is set.
 fn paragraph_range(text: &str) -> bool {
-    regex!(r"^\s*\[\d{1,4}\]\s*(?:[-â€“]|to)\s*\[\d{1,4}\]\s*$").is_match(text)
+    regex!(r"^\s*\[\d{1,4}\]\s*(?:[-\u{2013}]|to)\s*\[\d{1,4}\]\s*$").is_match(text)
 }
 
 /// Mostly a citation, its leader and locator aside: an authority's entry.
 fn citation(text: &str) -> bool {
-    let title = regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})[\s\d,\[\]â€“-]*$")
+    let title = regex!(r"(?:(?:\.\s?){2,}|_{3,}|\u{2026}+|\s{2,})[\s\d,\[\]\u{2013}-]*$")
         .replace(text.trim(), "");
     let citations = legal_structure_lines::analysis::citation_spans(&title);
     let cited: usize = citations.iter().map(|found| found.range.len()).sum();

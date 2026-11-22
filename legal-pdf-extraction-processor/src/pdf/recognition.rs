@@ -89,8 +89,8 @@ pub(crate) fn recognition_noise(lines: &[Line]) -> f64 {
     let mut words = 0usize;
     let mut noise = 0usize;
     let mut rejects = 0usize;
-    for word in lines.iter().flat_map(|line| line.text.split_whitespace()) {
-        let word = word.trim_matches(|character: char| !character.is_alphanumeric() && character != '~');
+    for raw_word in lines.iter().flat_map(|line| line.text.split_whitespace()) {
+        let word = raw_word.trim_matches(|character: char| !character.is_alphanumeric() && character != '~');
         if word.is_empty() {
             continue;
         }
@@ -98,11 +98,33 @@ pub(crate) fn recognition_noise(lines: &[Line]) -> f64 {
         let characters: Vec<char> = word.chars().collect();
         let reject = word.contains('~') && characters.iter().any(|character| character.is_alphanumeric());
         rejects += usize::from(reject);
-        let symbol = reject || characters.iter().any(|character| "{}|^`<>\\".contains(*character));
         let letters = characters.iter().filter(|character| character.is_alphabetic()).count();
         let digits = characters.iter().filter(|character| character.is_ascii_digit()).count();
-        let mixed = letters > 0 && digits > 0 && (characters.windows(3).any(|three|
-            three[0].is_ascii_digit() && three[1].is_alphabetic() && three[2].is_ascii_digit())
+        let symbol = reject
+            || characters.iter().any(|character| "{}|^`<>\\•·;".contains(*character))
+            || letters > 0 && raw_word.chars().any(|character| matches!(character, '•' | '·'));
+        let intra_alpha_digit = letters > 0
+            && digits > 0
+            && !word.contains(['-', '/', '.'])
+            && characters.iter().any(|character| character.is_lowercase())
+            && characters
+                .iter()
+                .position(|character| character.is_alphabetic())
+                .zip(characters.iter().rposition(|character| character.is_alphabetic()))
+                .is_some_and(|(first, last)| {
+                    characters[first..=last].iter().any(|character| character.is_ascii_digit())
+                });
+        let subclause = word.rsplit_once('(').is_some_and(|(head, tail)| {
+            !head.is_empty()
+                && head.chars().any(|c| c.is_ascii_digit())
+                && head.chars().all(|c| c.is_ascii_digit() || c == '(' || c == ')')
+                && (1..=3).contains(&tail.len())
+                && tail.chars().all(|c| c.is_ascii_alphabetic())
+                && raw_word.rfind('(').is_some_and(|open| raw_word[open..].contains(')'))
+        });
+        let mixed = !subclause && letters > 0 && digits > 0 && (intra_alpha_digit
+            || characters.windows(3).any(|three|
+                three[0].is_ascii_digit() && three[1].is_alphabetic() && three[2].is_ascii_digit())
             || characters.first().is_some_and(char::is_ascii_digit)
                 && characters.last().is_some_and(|last| last.is_alphabetic())
                 && !matches!(word.trim_start_matches(|character: char| character.is_ascii_digit()).to_lowercase().as_str(),
@@ -128,9 +150,9 @@ pub(crate) fn reading_score(lines: &[Line], other: &HashSet<String>) -> f64 {
     recognition_noise(lines) + if words.is_empty() { 0.0 } else { foreign as f64 / words.len() as f64 }
 }
 
-/// Whether a page's text reads as recognized prose: at most one word in ten is noise.
+/// Whether a page's text reads as recognized prose: under 2.5% of words are recognition noise.
 pub(crate) fn layer_reads_well(lines: &[Line]) -> bool {
-    recognition_noise(lines) <= 0.1
+    recognition_noise(lines) <= 0.025
 }
 
 /// How much printable text a page holds; decoding garbage is pdf-inspector's verdict, folded in
@@ -388,4 +410,44 @@ pub fn recognize_pdf(
     metadata.pages_needing_ocr = unresolved_pages;
     metadata.ocr_routed_pages = routed_pages;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(text: &str) -> Line {
+        Line {
+            text: text.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn corrupt_legacy_ocr_layer_fails_quality_gate() {
+        let lines = [
+            line("although it i• h11rd to reduce to one common formula the conditions"),
+            line("under which the l11w will imply a promise to repay money received to the plaintiff's u1e."),
+            line("Hamilton·L.J. argued what course wh11t might h11ve been between m11n and Scotl11nd Ac1jna."),
+            line("This illu1uated unju.,;t enrichment in pre• dominant legal writing."),
+        ];
+        assert!(
+            recognition_noise(&lines) > 0.025,
+            "expected > 0.025 noise, got {}",
+            recognition_noise(&lines)
+        );
+        assert!(!layer_reads_well(&lines));
+    }
+
+    #[test]
+    fn clean_legal_prose_with_calls_ordinals_and_codes_passes_quality_gate() {
+        let lines = [
+            line("In Deglman v. Guaranty Trust Co. and Constantineau,1 the Court held14 otherwise."),
+            line("Bill C-36 and form T2P applied under s. 12(a) for the 2nd time since the 1990s."),
+            line("Earlier authorities also settled the same point across multiple decided cases.32"),
+            line("Where a statutory condition is satisfied in ordinary prose, no noise is recorded."),
+        ];
+        assert_eq!(recognition_noise(&lines), 0.0, "clean prose should have zero noise");
+        assert!(layer_reads_well(&lines));
+    }
 }

@@ -37,18 +37,31 @@ pub fn continues_prose_from(
         return false;
     }
     let text = prior.text.trim_end();
-    height > 0.0
-        && line.bbox[1] - prior.bbox[3] < height * 0.5
-        && !sentence_ended(text)
-        && !text.ends_with([':', '\u{201d}', '"'])
-        && !crate::evidence::enumerated(text)
-        && runs_the_column(page, prior, body)
+    if height <= 0.0
+        || line.bbox[1] - prior.bbox[3] >= height * 0.5
+        || sentence_ended(text)
+        || text.ends_with([':', '\u{201d}', '"'])
+        || crate::evidence::enumerated(text)
+    {
+        return false;
+    }
+    let uncalled = text
+        .trim_end_matches(|c: char| c.is_ascii_digit() || matches!(c, '*' | '\u{2020}' | '\u{2021}' | '\u{00a7}'));
+    let ended_before_call = uncalled.len() < text.len()
+        && !uncalled.ends_with(char::is_whitespace)
+        && (sentence_ended(uncalled) || uncalled.ends_with([':', '\u{201d}', '"', '\u{bb}']));
+    if ended_before_call {
+        return false;
+    }
+    let (left, right) = column_bounds(page, prior, body);
+    let indented_start =
+        line.bbox[0] - left >= height * 0.75 && line.bbox[0] - prior.bbox[0] >= height * 0.5;
+    !indented_start && prior.bbox[2] >= right - (right - left) * 0.1
 }
 
-/// Whether a line runs its column: the page's body lines beside it, those `body` names, give the column's measure.
-fn runs_the_column(page: &Page, line: &Line, body: impl Fn(usize) -> bool) -> bool {
-    let (left, right) = page
-        .lines
+/// The horizontal `[left, right]` span of the page's body column overlapping `line`.
+fn column_bounds(page: &Page, line: &Line, body: impl Fn(usize) -> bool) -> (f64, f64) {
+    page.lines
         .iter()
         .enumerate()
         .filter(|(other_slot, other)| {
@@ -56,7 +69,12 @@ fn runs_the_column(page: &Page, line: &Line, body: impl Fn(usize) -> bool) -> bo
         })
         .fold((line.bbox[0], line.bbox[2]), |(left, right), (_, other)| {
             (left.min(other.bbox[0]), right.max(other.bbox[2]))
-        });
+        })
+}
+
+/// Whether a line runs its column: the page's body lines beside it, those `body` names, give the column's measure.
+fn runs_the_column(page: &Page, line: &Line, body: impl Fn(usize) -> bool) -> bool {
+    let (left, right) = column_bounds(page, line, body);
     line.bbox[2] >= right - (right - left) * 0.1
 }
 
@@ -267,4 +285,71 @@ pub fn overused_tags(
         .flat_map(|level| [Some(level), (level == 1).then_some(0)])
         .flatten()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use legal_citations as _;
+    use legal_citations_data as _;
+
+    fn line_at(text: &str, left: f64, top: f64, right: f64, bottom: f64) -> Line {
+        Line {
+            text: text.to_owned(),
+            bbox: [left, top, right, bottom],
+            ..Default::default()
+        }
+    }
+
+    fn page_with(lines: Vec<Line>) -> Page {
+        Page {
+            width: 612.0,
+            height: 792.0,
+            lines,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn continues_prose_from_stops_after_trailing_footnote_call() {
+        let page = page_with(vec![
+            line_at("The court followed earlier cases.32", 72.0, 100.0, 540.0, 112.0),
+            line_at("Later panels took a narrower view.", 72.0, 114.0, 540.0, 126.0),
+        ]);
+        assert!(!continues_prose_from(&page, 0, 1, |_| true));
+
+        let page_quote_call = page_with(vec![
+            line_at("Counsel relied on those conditions.”19", 72.0, 100.0, 540.0, 112.0),
+            line_at("A separate argument followed.", 72.0, 114.0, 540.0, 126.0),
+        ]);
+        assert!(!continues_prose_from(&page_quote_call, 0, 1, |_| true));
+
+        let page_section_ref = page_with(vec![
+            line_at("Parliament set the rule out in s. 32", 72.0, 100.0, 540.0, 112.0),
+            line_at("of the Act without further qualification.", 72.0, 114.0, 540.0, 126.0),
+        ]);
+        assert!(continues_prose_from(&page_section_ref, 0, 1, |_| true));
+    }
+
+    #[test]
+    fn continues_prose_from_stops_on_first_line_indent_but_keeps_block_quotes() {
+        let page_indented_para = page_with(vec![
+            line_at("The tribunal reviewed the statutory scheme and", 72.0, 100.0, 540.0, 112.0),
+            line_at("In the second stage of its analysis, the board", 90.0, 114.0, 540.0, 126.0),
+        ]);
+        assert!(!continues_prose_from(&page_indented_para, 0, 1, |_| true));
+
+        let page_block_quote = page_with(vec![
+            line_at("Body anchor setting the column bounds.", 72.0, 86.0, 540.0, 98.0),
+            line_at("Where an administrative board considers", 108.0, 100.0, 504.0, 112.0),
+            line_at("an application within its statutory mandate,", 108.0, 114.0, 504.0, 126.0),
+        ]);
+        assert!(continues_prose_from(&page_block_quote, 1, 2, |_| true));
+
+        let page_wrapped = page_with(vec![
+            line_at("The tribunal reviewed the statutory scheme and", 72.0, 100.0, 540.0, 112.0),
+            line_at("rejected the preliminary objection below.", 72.0, 114.0, 540.0, 126.0),
+        ]);
+        assert!(continues_prose_from(&page_wrapped, 0, 1, |_| true));
+    }
 }

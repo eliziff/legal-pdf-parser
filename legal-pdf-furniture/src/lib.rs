@@ -325,14 +325,22 @@ pub fn read(
         candidates
             .into_iter()
             .flat_map(|((_, key), hits)| {
-                let kept = aligned_furniture(
-                    &hits,
-                    if figures(&key) {
-                        minimum.max(views.len().div_ceil(2))
+                let has_even = hits.iter().any(|hit| hit.page_number % 2 == 0);
+                let has_odd = hits.iter().any(|hit| hit.page_number % 2 == 1);
+                let single_parity = has_even ^ has_odd;
+                let required = if figures(&key) {
+                    minimum.max(views.len().div_ceil(2))
+                } else if single_parity && views.len() >= 4 {
+                    let parity_total = if has_even {
+                        views.len() / 2
                     } else {
-                        minimum
-                    },
-                );
+                        views.len().div_ceil(2)
+                    };
+                    3_usize.min(2_usize.max(((parity_total as f64) * 0.5).ceil() as usize))
+                } else {
+                    minimum
+                };
+                let kept = aligned_furniture(&hits, required);
                 let pages = kept
                     .iter()
                     .map(|&(page_slot, _)| page_slot)
@@ -481,6 +489,10 @@ pub fn read(
                     ))
                 } else if (at_top || at_bottom) && document_id_line(&line.text) {
                     Some((edge(at_top), Rule::DocumentId))
+                } else if (at_bottom || line.bbox[1] > page.height * 0.85)
+                    && copyright_footer_line(&line.text)
+                {
+                    Some((Edge::Bottom, Rule::PrintMargin))
                 } else {
                     None
                 };
@@ -537,6 +549,9 @@ pub fn read(
                 found[index] = Some((edge, Rule::PrintMargin));
             }
             extend_running_heads(page, &members, found, body_size, |index| {
+                line_label(view.slot(index))
+            });
+            extend_bottom_footers(page, &members, found, body_size, |index| {
                 line_label(view.slot(index))
             });
         }
@@ -630,31 +645,82 @@ fn extend_running_heads(
     line_label: impl Fn(usize) -> bool,
 ) {
     let top_band = page.height * 0.12;
+    extend_stacked_band(
+        page,
+        members,
+        found,
+        body_size,
+        line_label,
+        (Edge::Top, Rule::RunningHead),
+        |read| read.is_some_and(|(edge, _)| edge == Edge::Top),
+        |anchor, candidate, height| {
+            anchor.bbox[3] < top_band
+                && candidate.bbox[3] < top_band
+                && (candidate.bbox[1] - anchor.bbox[3]).max(anchor.bbox[1] - candidate.bbox[3])
+                    <= height * 0.5
+        },
+    );
+}
+
+/// Absorb wrapped continuation lines of a publisher/copyright bottom footer in small type
+/// strictly below the initial footer line inside the bottom band (`y > 0.85 * height`).
+fn extend_bottom_footers(
+    page: &Page,
+    members: &[usize],
+    found: &mut [Option<(Edge, Rule)>],
+    body_size: f64,
+    line_label: impl Fn(usize) -> bool,
+) {
+    let bottom_band = page.height * 0.85;
+    extend_stacked_band(
+        page,
+        members,
+        found,
+        body_size,
+        line_label,
+        (Edge::Bottom, Rule::PrintMargin),
+        |read| read.is_some_and(|(edge, rule)| edge == Edge::Bottom && rule == Rule::PrintMargin),
+        |anchor, candidate, height| {
+            anchor.bbox[1] > bottom_band
+                && candidate.bbox[1] > bottom_band
+                && candidate.bbox[1] >= anchor.bbox[1]
+                && candidate.bbox[1] - anchor.bbox[3] <= height * 0.5
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extend_stacked_band(
+    page: &Page,
+    members: &[usize],
+    found: &mut [Option<(Edge, Rule)>],
+    body_size: f64,
+    line_label: impl Fn(usize) -> bool,
+    tag: (Edge, Rule),
+    is_anchor: impl Fn(Option<(Edge, Rule)>) -> bool,
+    adjacent: impl Fn(&Line, &Line, f64) -> bool,
+) {
     let tolerance = page.width * FURNITURE_X_TOLERANCE_FRAC;
-    let header = |found: &[Option<(Edge, Rule)>], index: usize| {
-        found[index].is_some_and(|(edge, _)| edge == Edge::Top)
-    };
     loop {
         let joined: Vec<usize> = members
             .iter()
             .copied()
             .filter(|&index| {
                 let (line, size) = (&page.lines[index], page.lines[index].size);
-                !header(found, index)
+                !is_anchor(found[index])
+                    && found[index].is_none()
                     && !line_label(index)
-                    && line.bbox[3] < top_band
                     && size > 0.0
                     && size < body_size * 0.90
-                    && members.iter().any(|&head_index| {
-                        let head = &page.lines[head_index];
-                        let height = (head.bbox[3] - head.bbox[1]).max(line.bbox[3] - line.bbox[1]);
-                        header(found, head_index)
-                            && head.bbox[3] < top_band
-                            && (page.lines[head_index].size - size).abs() <= 0.5
-                            && ((head.bbox[0] - line.bbox[0]).abs() <= tolerance
-                                || (line_center_x(head) - line_center_x(line)).abs() <= tolerance)
-                            && (line.bbox[1] - head.bbox[3]).max(head.bbox[1] - line.bbox[3])
-                                <= height * 0.5
+                    && members.iter().any(|&anchor_index| {
+                        let anchor = &page.lines[anchor_index];
+                        let height =
+                            (anchor.bbox[3] - anchor.bbox[1]).max(line.bbox[3] - line.bbox[1]);
+                        is_anchor(found[anchor_index])
+                            && (anchor.size - size).abs() <= 0.5
+                            && ((anchor.bbox[0] - line.bbox[0]).abs() <= tolerance
+                                || (line_center_x(anchor) - line_center_x(line)).abs() <= tolerance)
+                            && adjacent(anchor, line, height)
                     })
             })
             .collect();
@@ -662,9 +728,49 @@ fn extend_running_heads(
             return;
         }
         for index in joined {
-            found[index] = Some((Edge::Top, Rule::RunningHead));
+            found[index] = Some(tag);
         }
     }
+}
+
+/// Whether a line at the bottom of a page is publisher/copyright boilerplate rather than prose or a note.
+fn copyright_footer_line(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    const BOILERPLATE_CUES: [&str; 9] = [
+        "author",
+        "press",
+        "journal",
+        "association",
+        "society",
+        "university",
+        "all rights reserved",
+        "creative commons",
+        "doi.org",
+    ];
+    if lower.starts_with('©')
+        || lower.starts_with("copyright ©")
+        || lower.starts_with("copyright (c)")
+        || lower.starts_with("published online by ")
+        || lower.starts_with("downloaded from ")
+        || lower.starts_with("this is an open access article")
+    {
+        return true;
+    }
+    if lower.starts_with("published by ")
+        && [
+            "university press",
+            "on behalf of",
+            "©",
+            "all rights reserved",
+            "creative commons",
+        ]
+        .iter()
+        .any(|cue| lower.contains(cue))
+    {
+        return true;
+    }
+    (lower.contains('©') || lower.starts_with("copyright "))
+        && BOILERPLATE_CUES.iter().any(|cue| lower.contains(cue))
 }
 
 /// A browser or print driver sets the page's address and the time it was printed in the
@@ -730,4 +836,89 @@ fn structure_marker(text: &str) -> bool {
         || crate::text::paragraphs::marker_only_re().is_match(text)
         || regex!(r"^\s*\d{1,4}[A-Za-z]?(?:\.\d{1,3})*(?:\([0-9A-Za-z]{1,4}\))*\.?\s*$")
             .is_match(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use legal_citations as _;
+    use legal_citations_data as _;
+
+    fn line_box(text: &str, size: f64, bbox: [f64; 4]) -> Line {
+        Line {
+            text: text.to_owned(),
+            size,
+            bbox,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn copyright_footer_line_matches_boilerplate_and_ignores_legal_prose() {
+        assert!(copyright_footer_line(
+            "© The Author(s), 2024. Published by Cambridge University Press"
+        ));
+        assert!(copyright_footer_line(
+            "Downloaded from https://www.cambridge.org/core/terms"
+        ));
+        assert!(copyright_footer_line(
+            "Published online by Cambridge University Press"
+        ));
+        assert!(!copyright_footer_line(
+            "12 See Copyright Act, RSC 1985, c C-42, s 3."
+        ));
+        assert!(!copyright_footer_line(
+            "Published by Carswell in 1998 as part of the treatise."
+        ));
+    }
+
+    #[test]
+    fn single_parity_running_headers_are_detected_on_three_even_pages() {
+        let mut pages = Vec::new();
+        for n in 1..=10u32 {
+            let mut lines = vec![
+                line_box("First line of ordinary journal prose.", 11.0, [72.0, 150.0, 520.0, 162.0]),
+                line_box("Second line of ordinary journal prose.", 11.0, [72.0, 166.0, 520.0, 178.0]),
+            ];
+            if matches!(n, 4 | 6 | 8) {
+                lines.insert(
+                    0,
+                    line_box(
+                        &format!("{n} \u{f06e} APPEAL VOLUME 12"),
+                        9.0,
+                        [72.0, 42.0, 260.0, 52.0],
+                    ),
+                );
+            }
+            pages.push(Page {
+                index: (n - 1) as usize,
+                number: n,
+                width: 612.0,
+                height: 792.0,
+                lines,
+                ..Default::default()
+            });
+        }
+        let rows_vec: Vec<Rows> = pages
+            .iter()
+            .map(|page| Rows {
+                of: (0..page.lines.len() as u32).collect(),
+                count: page.lines.len() as u32,
+                frame: [0, 0],
+            })
+            .collect();
+        let row_refs: Vec<&Rows> = rows_vec.iter().collect();
+        let views = PageView::whole(&pages);
+        let hits = read(&views, &row_refs, |_| false, |_| false);
+        let top_hits: Vec<usize> = hits
+            .iter()
+            .filter_map(|&(slot, edge, rule)| {
+                let page_index = pages
+                    .iter()
+                    .position(|p| p.lines.iter().any(|l| std::ptr::eq(l, views.iter().flat_map(|v| v.lines.iter().map(move |&s| (v, s))).find(|(_, s)| *s == slot).unwrap().0.line(slot))))?;
+                (edge == Edge::Top && rule == Rule::RunningHead).then_some(page_index + 1)
+            })
+            .collect();
+        assert_eq!(top_hits, vec![4, 6, 8]);
+    }
 }
