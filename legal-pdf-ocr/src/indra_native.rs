@@ -1482,3 +1482,80 @@ fn f16_to_f32(bits: u16) -> f32 {
     };
     f32::from_bits(out)
 }
+
+#[cfg(target_arch = "wasm32")]
+mod wasm_abi {
+    use super::{IndraNative, IndraScratch};
+    use std::alloc::{alloc as heap_alloc, dealloc as heap_dealloc, Layout};
+
+    struct WasmIndra {
+        model: IndraNative,
+        scratch: IndraScratch,
+    }
+
+    #[no_mangle]
+    pub extern "C" fn alloc(len: usize) -> *mut u8 {
+        let layout = Layout::from_size_align(len.max(1), 16).unwrap();
+        // SAFETY: layout size is >= 1 and 16-byte aligned.
+        unsafe { heap_alloc(layout) }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn dealloc(ptr: *mut u8, len: usize) {
+        if !ptr.is_null() {
+            // SAFETY: matches Layout passed to alloc(len).
+            let layout = unsafe { Layout::from_size_align_unchecked(len.max(1), 16) };
+            unsafe { heap_dealloc(ptr, layout) };
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn indra_load(ptr: *const u8, len: usize) -> usize {
+        if ptr.is_null() || len == 0 {
+            return 0;
+        }
+        // SAFETY: caller provides `len` readable bytes allocated in linear memory.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        match IndraNative::from_onnx_bytes(bytes) {
+            Ok(model) => Box::into_raw(Box::new(WasmIndra {
+                model,
+                scratch: IndraScratch::default(),
+            })) as usize,
+            Err(_) => 0,
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn indra_free(handle: usize) {
+        if handle != 0 {
+            // SAFETY: handle was created by Box::into_raw in indra_load.
+            unsafe { drop(Box::from_raw(handle as *mut WasmIndra)) };
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn indra_recognize_u8(
+        handle: usize,
+        gray_ptr: *const u8,
+        width: usize,
+        out_ids_ptr: *mut u32,
+        out_cap: usize,
+    ) -> usize {
+        if handle == 0 || gray_ptr.is_null() || width == 0 {
+            return 0;
+        }
+        // SAFETY: handle stays live until indra_free; caller slices live in WASM memory.
+        let state = unsafe { &mut *(handle as *mut WasmIndra) };
+        let gray = unsafe { std::slice::from_raw_parts(gray_ptr, width.saturating_mul(32)) };
+        let (steps, step_labels, _) =
+            state.model.recognize_u8(gray, width, false, &mut state.scratch);
+        if !out_ids_ptr.is_null() && out_cap > 0 {
+            let count = steps.min(out_cap);
+            let out = unsafe { std::slice::from_raw_parts_mut(out_ids_ptr, count) };
+            for (dst, lbl) in out.iter_mut().zip(&step_labels[..count]) {
+                *dst = lbl.unwrap_or(0) as u32;
+            }
+        }
+        steps
+    }
+}
