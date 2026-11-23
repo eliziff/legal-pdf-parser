@@ -590,6 +590,7 @@ pub(crate) fn estimated_string_advance_ts(
 /// Superscripts, signs, joining punctuation and right-to-left runs keep the
 /// items other stages already handle. The state belongs to one content
 /// stream: a run at a Form XObject boundary is dropped, as before.
+#[derive(Clone)]
 pub(crate) struct PendingSpace {
     /// Index of the item the run follows.
     after: usize,
@@ -985,6 +986,135 @@ pub(crate) fn extract_page_text_items_with_options(
     )
 }
 
+#[derive(Default, Clone)]
+struct ItemStream {
+    items: Vec<TextItem>,
+    clips: Vec<Option<super::clip_boundaries::ClipRect>>,
+    pending_space: Option<PendingSpace>,
+    pending_word_gaps: Option<PendingWordGaps>,
+    rtl_visual_candidates: Vec<usize>,
+    rtl_logical_runs: Vec<usize>,
+    rtl_visual_runs: Vec<usize>,
+    logical_text_items: Vec<usize>,
+}
+
+impl ItemStream {
+    fn resolve_word_gaps(&mut self, tm: &[f32; 6], ctm: &[f32; 6]) {
+        if let Some(pending) = self.pending_word_gaps.take() {
+            pending.resolve(&mut self.items, tm, ctm);
+        }
+    }
+
+    fn finalize_clipped_and_rtl(
+        &mut self,
+        coverage: &mut ItemCoverage,
+        page_num: u32,
+    ) -> (bool, Vec<bool>) {
+        // Decide the storage order of the page's RTL runs while candidate
+        // indexes are still valid; merge_text_items below reads visual-order
+        // lines back into logical order as it merges them. Runs painted
+        // wholly outside their clip do not decide storage order.
+        let (rtl_visual_candidates, rtl_logical_ops, rtl_visual_ops) = {
+            let on_page = |index: usize| {
+                !super::clip_boundaries::excluded_by_clip(&self.items[index], self.clips[index])
+            };
+            (
+                self.rtl_visual_candidates
+                    .iter()
+                    .copied()
+                    .filter(|&index| on_page(index))
+                    .collect::<Vec<usize>>(),
+                self.rtl_logical_runs
+                    .iter()
+                    .filter(|&&index| on_page(index))
+                    .count() as u32,
+                self.rtl_visual_runs
+                    .iter()
+                    .filter(|&&index| on_page(index))
+                    .count() as u32,
+            )
+        };
+        let visual_rtl = crate::text_utils::fix_visual_order_rtl(
+            &mut self.items,
+            &rtl_visual_candidates,
+            rtl_logical_ops,
+            rtl_visual_ops,
+            &self.logical_text_items,
+        );
+        let mut replaced_text = vec![false; self.items.len()];
+        for &index in &self.logical_text_items {
+            if let Some(flag) = replaced_text.get_mut(index) {
+                *flag = true;
+            }
+        }
+        let dropped = super::clip_boundaries::drop_clipped_away_runs(
+            &mut self.items,
+            &mut self.clips,
+            &mut replaced_text,
+            coverage,
+        );
+        if dropped > 0 {
+            log::debug!("page {page_num}: {dropped} text run(s) painted outside their clip left out");
+        }
+        (visual_rtl, replaced_text)
+    }
+}
+
+fn sync_visible_push(
+    visible: &ItemStream,
+    inv: &mut Option<(ItemStream, CMapDecisionCache)>,
+    has_confirmed_visible_text: &mut bool,
+    shown_clip: Option<super::clip_boundaries::ClipRect>,
+    from_len: usize,
+    is_logical_text: bool,
+) {
+    let added = &visible.items[from_len..];
+    if added.iter().any(|item| {
+        !matches!(item.item_type, ItemType::Image)
+            && !item.text.trim().is_empty()
+            && !super::clip_boundaries::excluded_by_clip(item, shown_clip)
+    }) {
+        *has_confirmed_visible_text = true;
+        *inv = None;
+        return;
+    }
+    if let Some((inv_stream, _)) = inv {
+        for item in added {
+            if is_logical_text {
+                inv_stream.logical_text_items.push(inv_stream.items.len());
+            }
+            inv_stream.items.push(item.clone());
+        }
+    }
+}
+
+fn apply_post_merges(
+    items: Vec<TextItem>,
+    clips: &[Option<super::clip_boundaries::ClipRect>],
+    visual_rtl: bool,
+    replaced_text: &[bool],
+    merge_text: bool,
+    merge_scripts: bool,
+    page_rotation: PageRotation,
+) -> Vec<TextItem> {
+    let items = if merge_text {
+        if page_rotation == PageRotation::Upright {
+            super::merge_text_items_with_clips(items, clips, visual_rtl, replaced_text)
+        } else {
+            // Clips use the original page frame; rotated-page correction is an
+            // intentionally unsupported provenance case.
+            super::merge_text_items_with_clips(items, &[], visual_rtl, replaced_text)
+        }
+    } else {
+        items
+    };
+    if merge_scripts {
+        super::merge_subscript_items(items)
+    } else {
+        items
+    }
+}
+
 /// [`extract_page_text_items_with_options`] with the page's run coverage
 /// and, for `fidelity`, its detection evidence from the same decoded
 /// content. `merge_text` and `merge_scripts` select the layout merges; the
@@ -1012,6 +1142,7 @@ pub(crate) fn extract_page_text_items_impl(
     PdfError,
 > {
     let mut lopdf_encodings = HashMap::new();
+    let shared_encodings = HashMap::new();
     extract_page_text_items_with_caches(
         doc,
         page_id,
@@ -1019,6 +1150,7 @@ pub(crate) fn extract_page_text_items_impl(
         font_cmaps,
         options,
         font_cache,
+        &shared_encodings,
         &mut lopdf_encodings,
         form_budget,
         merge_text,
@@ -1036,6 +1168,7 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
     font_cmaps: &FontCMaps,
     options: TextExtractionOptions,
     font_cache: &mut FontProductCache,
+    shared_encodings: &HashMap<usize, Option<Encoding<'a>>>,
     lopdf_encodings: &mut HashMap<usize, Option<Encoding<'a>>>,
     form_budget: &mut FormWalkBudget,
     merge_text: bool,
@@ -1054,22 +1187,14 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
     PdfError,
 > {
     let include_invisible = options.include_invisible;
-    let mut items = Vec::new();
+    let mut visible = ItemStream::default();
+    let mut inv: Option<(ItemStream, CMapDecisionCache)> = None;
+    let mut has_confirmed_visible_text = false;
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
     let mut lines: Vec<PdfLine> = Vec::new();
     let mut painted_rules: Vec<PdfLine> = Vec::new();
     let mut underline_lines: Vec<UnderlineLine> = Vec::new();
-    // Indexes of items whose raw decoded text is a multi-character RTL run
-    // that may be stored in visual order (see fix_visual_order_rtl), plus a
-    // count of show ops whose glyph progression walked right-to-left —
-    // evidence of logical-order storage.
-    let mut rtl_visual_candidates: Vec<usize> = Vec::new();
-    let mut rtl_logical_runs: Vec<usize> = Vec::new();
-    let mut rtl_visual_runs: Vec<usize> = Vec::new();
-    // Items whose text is logical whatever the page's storage order:
-    // ActualText replacements.
-    let mut logical_text_items: Vec<usize> = Vec::new();
 
     // Path construction state for m/l/h → S/s line extraction
     let mut path_subpath_start: Option<(f32, f32)> = None;
@@ -1193,21 +1318,25 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
     let font_styles = &products.style_flags;
     let font_fidelity = &products.fidelity;
 
-    // Reuse parsed lopdf font encodings across pages in the same worker by
-    // font dictionary identity, avoiding repeated encoding resolution on every
-    // page while mapping each page's local resource names to the cached value.
+    // Reuse document-level pre-resolved encodings first, falling back to the
+    // worker-local map for any Form XObject fonts not in page resources.
     for font_dict in fonts.values() {
         let ptr = std::ptr::from_ref(*font_dict) as usize;
-        lopdf_encodings
-            .entry(ptr)
-            .or_insert_with(|| font_dict.get_font_encoding(doc).ok());
+        if !shared_encodings.contains_key(&ptr) {
+            lopdf_encodings
+                .entry(ptr)
+                .or_insert_with(|| font_dict.get_font_encoding(doc).ok());
+        }
     }
     let encoding_cache = super::fonts::BorrowedEncodings(
         fonts
             .iter()
             .filter_map(|(font_name, font_dict)| {
                 let ptr = std::ptr::from_ref(*font_dict) as usize;
-                let enc = lopdf_encodings.get(&ptr)?.as_ref()?;
+                let enc = shared_encodings
+                    .get(&ptr)
+                    .or_else(|| lopdf_encodings.get(&ptr))?
+                    .as_ref()?;
                 Some((String::from_utf8_lossy(font_name).into_owned(), enc))
             })
             .collect(),
@@ -1252,8 +1381,6 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
     let mut char_spacing: f32 = 0.0; // Tc parameter (extra spacing per character, unscaled)
     let mut word_spacing: f32 = 0.0; // Tw parameter (extra spacing per space char, unscaled)
     let mut horizontal_scale: f32 = 1.0; // Tz, stored as a ratio
-    let mut pending_space: Option<PendingSpace> = None; // squeezed space run awaiting its next run
-    let mut pending_word_gaps: Option<PendingWordGaps> = None; // wide-spaced boundary string awaiting its next run
     let mut text_rise: f32 = 0.0; // Ts parameter (baseline shift for super/subscripts, unscaled)
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
@@ -1297,13 +1424,15 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
     }
 
     let mut clips = super::clip_boundaries::ClipTracker::default();
-    let mut item_clips = Vec::new();
-    // The CMap coverage of each item, parallel to `items` like its clip.
+    // The CMap coverage of each item, parallel to `visible.items` like its clip.
     let mut item_coverage: ItemCoverage = Vec::new();
     let mut shown_clip = None;
     for op in &operations {
-        item_clips.resize(items.len(), shown_clip);
-        attach_run_coverage(&mut item_coverage, items.len(), || {
+        visible.clips.resize(visible.items.len(), shown_clip);
+        if let Some((inv_stream, _)) = &mut inv {
+            inv_stream.clips.resize(inv_stream.items.len(), shown_clip);
+        }
+        attach_run_coverage(&mut item_coverage, visible.items.len(), || {
             cmap_decisions.take_run_coverage()
         });
         clips.observe(&op.operator, &op.operands, ctm);
@@ -1329,7 +1458,10 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
         match operator {
             "_FormBoundary" => {
                 // Inlined forms have their own word-gap provenance, including empty forms.
-                pending_word_gaps = None;
+                visible.pending_word_gaps = None;
+                if let Some((inv_stream, _)) = &mut inv {
+                    inv_stream.pending_word_gaps = None;
+                }
             }
             "q" => {
                 // Save graphics state
@@ -1435,7 +1567,10 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                 // within its text object; a later object's geometry is
                 // unrelated to it.
                 in_text_block = false;
-                pending_word_gaps = None;
+                visible.pending_word_gaps = None;
+                if let Some((inv_stream, _)) = &mut inv {
+                    inv_stream.pending_word_gaps = None;
+                }
             }
             "Tf" => {
                 // Set font and size
@@ -1540,8 +1675,9 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                     // wide-spaced boundary string, had its spacing taken back.
                     // An empty show paints nothing and decides nothing.
                     if get_operand_bytes(&op.operands[0]).is_some_and(|raw| !raw.is_empty()) {
-                        if let Some(pending) = pending_word_gaps.take() {
-                            pending.resolve(&mut items, &text_matrix, &ctm);
+                        visible.resolve_word_gaps(&text_matrix, &ctm);
+                        if let Some((inv_stream, _)) = &mut inv {
+                            inv_stream.resolve_word_gaps(&text_matrix, &ctm);
                         }
                     }
                     // Advance text matrix regardless of visibility
@@ -1615,10 +1751,10 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                         text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
                         continue;
                     }
-                    // Skip invisible (Tr=3) text but still advance text matrix.
-                    // For Mixed/template PDFs, include_invisible=true extracts
-                    // the OCR text layer that sits behind scanned images.
-                    if text_rendering_mode == 3 && !include_invisible {
+                    // Skip invisible (Tr=3) text unless fidelity mode is lazily
+                    // capturing the fallback layer in a single pass.
+                    let tr3_hidden = text_rendering_mode == 3 && !include_invisible;
+                    if tr3_hidden {
                         if op
                             .operands
                             .first()
@@ -1627,11 +1763,25 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                         {
                             skipped_invisible = true;
                         }
-                        let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
-                        text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
-                        text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
-                        continue;
+                        if !(fidelity && !include_invisible && !has_confirmed_visible_text) {
+                            let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
+                            text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
+                            text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
+                            continue;
+                        }
                     }
+                    let capture_inv = tr3_hidden;
+                    let from_len = visible.items.len();
+                    let (stream, decisions) = if capture_inv {
+                        let (inv_s, inv_d) = inv.get_or_insert_with(|| {
+                            let mut d = cmap_decisions.clone();
+                            d.take_run_coverage();
+                            (visible.clone(), d)
+                        });
+                        (inv_s, inv_d)
+                    } else {
+                        (&mut visible, &mut cmap_decisions)
+                    };
                     let (decoded_text, fidelity_glyphs): (Option<String>, Vec<_>) = if fidelity {
                         let (text, glyphs) = extract_fidelity_glyphs(
                             &op.operands[0],
@@ -1642,7 +1792,7 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                             &inline_cmaps,
                             &font_encodings,
                             &encoding_cache,
-                            &mut cmap_decisions,
+                            decisions,
                             &font_widths,
                             &font_kinds,
                             current_font_size,
@@ -1670,7 +1820,7 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                 &inline_cmaps,
                                 &font_encodings,
                                 &encoding_cache,
-                                &mut cmap_decisions,
+                                decisions,
                                 &font_widths,
                                 &font_kinds,
                             )
@@ -1700,15 +1850,15 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                         // works, and a space run hands its word space to the
                         // item it follows.
                         if !fidelity && text.trim().is_empty() {
-                            pending_space = PendingSpace::note(
-                                pending_space.take(),
-                                &items,
+                            stream.pending_space = PendingSpace::note(
+                                stream.pending_space.take(),
+                                &stream.items,
                                 &geometry,
                                 page_num,
                             );
                         } else {
-                            if let Some(pending) = pending_space.take() {
-                                pending.resolve(&mut items, &geometry, &text, rendered_size);
+                            if let Some(pending) = stream.pending_space.take() {
+                                pending.resolve(&mut stream.items, &geometry, &text, rendered_size);
                             }
                             rotation_votes.cast_direction(reading_direction(
                                 &combined,
@@ -1729,7 +1879,7 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                 // dominance test as the rotation votes above.
                                 if combined[0].abs() > combined[1].abs() {
                                     if combined[0] * horizontal_scale > 0.0 {
-                                        rtl_visual_candidates.push(items.len());
+                                        stream.rtl_visual_candidates.push(stream.items.len());
                                         if !crate::text_utils::white_fill_hides(
                                             text_rendering_mode,
                                             fill_is_white,
@@ -1737,17 +1887,17 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                             text_rendering_mode,
                                         ) && crate::text_utils::is_visual_rtl_run(&text)
                                         {
-                                            rtl_visual_runs.push(items.len());
+                                            stream.rtl_visual_runs.push(stream.items.len());
                                         }
                                     } else {
-                                        rtl_logical_runs.push(items.len());
+                                        stream.rtl_logical_runs.push(stream.items.len());
                                     }
                                 }
                             }
                             let painted_bold = paintable_fonts.contains(&current_font)
                                 && text_paint.adds_bold(&text, rendered_size, base_font, &ctm);
                             let paint = text_paint.run_paint();
-                            items.push(TextItem {
+                            stream.items.push(TextItem {
                                 text: expand_ligatures(&text),
                                 x: geometry.x,
                                 y: geometry.y,
@@ -1799,13 +1949,13 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                             // A short string with word-gap character spacing
                             // shows its spaces once the next run proves the
                             // spacing after it was taken back (see `word_gaps`).
-                            pending_word_gaps = op
+                            stream.pending_word_gaps = op
                                 .operands
                                 .last()
                                 .and_then(get_operand_bytes)
                                 .and_then(|raw| {
                                     PendingWordGaps::for_shown_string(
-                                        items.len() - 1,
+                                        stream.items.len() - 1,
                                         raw,
                                         &text,
                                         font_widths.get(&current_font),
@@ -1816,7 +1966,7 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                         &ctm,
                                         horizontal_scale,
                                         |code| {
-                                            cmap_decisions.without_coverage(|decisions| {
+                                            decisions.without_coverage(|decisions| {
                                                 extract_text_from_operand(
                                                     code,
                                                     &current_font,
@@ -1837,6 +1987,24 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                     )
                                 });
                         }
+                        if !capture_inv
+                            && fidelity
+                            && !include_invisible
+                            && !has_confirmed_visible_text
+                        {
+                            sync_visible_push(
+                                &visible,
+                                &mut inv,
+                                &mut has_confirmed_visible_text,
+                                shown_clip,
+                                from_len,
+                                false,
+                            );
+                        }
+                    } else if tr3_hidden {
+                        let cursor_ts = w_ts_opt.unwrap_or(estimate_ts);
+                        text_matrix[4] += cursor_ts * horizontal_scale * text_matrix[0];
+                        text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
                     }
                 }
             }
@@ -1856,8 +2024,28 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                         {
                             skipped_invisible = true;
                         }
-                        let is_invisible = (text_rendering_mode == 3 && !include_invisible)
-                            || suppress_glyph_extraction;
+                        let tr3_hidden = text_rendering_mode == 3 && !include_invisible;
+                        let capture_inv = tr3_hidden
+                            && fidelity
+                            && !include_invisible
+                            && !has_confirmed_visible_text
+                            && !suppress_glyph_extraction;
+                        let is_invisible = (tr3_hidden && !capture_inv) || suppress_glyph_extraction;
+                        let from_len = visible.items.len();
+                        let (stream, decisions, mut inv_other): (
+                            &mut ItemStream,
+                            &mut CMapDecisionCache,
+                            Option<&mut ItemStream>,
+                        ) = if !is_invisible && capture_inv {
+                            let (inv_s, inv_d) = inv.get_or_insert_with(|| {
+                                let mut d = cmap_decisions.clone();
+                                d.take_run_coverage();
+                                (visible.clone(), d)
+                            });
+                            (inv_s, inv_d, Some(&mut visible))
+                        } else {
+                            (&mut visible, &mut cmap_decisions, inv.as_mut().map(|(s, _)| s))
+                        };
                         // Word-space threshold for `TJ` offsets and character
                         // spacing alike, from the font metrics when available.
                         let space_threshold = word_gap_threshold(font_info);
@@ -1885,7 +2073,7 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                     &inline_cmaps,
                                     &font_encodings,
                                     &encoding_cache,
-                                    probe_decisions.get_or_insert_with(|| cmap_decisions.clone()),
+                                    probe_decisions.get_or_insert_with(|| decisions.clone()),
                                     &font_widths,
                                     &font_kinds,
                                 )
@@ -2052,16 +2240,14 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                             {
                                 sub_start_width_ts = total_width_ts;
                                 sub_run_painted = true;
-                                if let Some(pending) = pending_word_gaps.take() {
-                                    pending.resolve(
-                                        &mut items,
-                                        &advanced_tm(
-                                            &text_matrix,
-                                            total_width_ts,
-                                            horizontal_scale,
-                                        ),
-                                        &ctm,
-                                    );
+                                let gap_tm = advanced_tm(
+                                    &text_matrix,
+                                    total_width_ts,
+                                    horizontal_scale,
+                                );
+                                stream.resolve_word_gaps(&gap_tm, &ctm);
+                                if let Some(other) = inv_other.as_deref_mut() {
+                                    other.resolve_word_gaps(&gap_tm, &ctm);
                                 }
                                 // An ActualText span starts at its first
                                 // painted glyph too.
@@ -2161,7 +2347,7 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                         &inline_cmaps,
                                         &font_encodings,
                                         &encoding_cache,
-                                        &mut cmap_decisions,
+                                        decisions,
                                         &font_widths,
                                         &font_kinds,
                                         current_font_size,
@@ -2208,7 +2394,7 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                         &inline_cmaps,
                                         &font_encodings,
                                         &encoding_cache,
-                                        &mut cmap_decisions,
+                                        decisions,
                                         &font_widths,
                                         &font_kinds,
                                     ) {
@@ -2226,7 +2412,7 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                             &inline_cmaps,
                                             &font_encodings,
                                             &encoding_cache,
-                                            &mut cmap_decisions,
+                                            decisions,
                                             &font_widths,
                                             &font_kinds,
                                         )
@@ -2248,7 +2434,7 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                             word_spacing,
                                             space_threshold,
                                             |code| {
-                                                cmap_decisions.without_coverage(|decisions| {
+                                                decisions.without_coverage(|decisions| {
                                                     extract_text_from_operand(
                                                         code,
                                                         &current_font,
@@ -2322,9 +2508,9 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                 type3_y_flips.contains(&current_font),
                                 horizontal_scale,
                             );
-                            pending_space = PendingSpace::note(
-                                pending_space.take(),
-                                &items,
+                            stream.pending_space = PendingSpace::note(
+                                stream.pending_space.take(),
+                                &stream.items,
                                 &geometry,
                                 page_num,
                             );
@@ -2403,14 +2589,14 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                     && crate::text_utils::is_visual_rtl_candidate(&text)
                                 {
                                     if scale_x < 0.0 {
-                                        rtl_logical_runs.push(items.len());
+                                        stream.rtl_logical_runs.push(stream.items.len());
                                     } else if backward_jump {
                                         if !op_backtrack_voted {
-                                            rtl_logical_runs.push(items.len());
+                                            stream.rtl_logical_runs.push(stream.items.len());
                                             op_backtrack_voted = true;
                                         }
                                     } else {
-                                        rtl_visual_candidates.push(items.len());
+                                        stream.rtl_visual_candidates.push(stream.items.len());
                                         if !crate::text_utils::white_fill_hides(
                                             text_rendering_mode,
                                             fill_is_white,
@@ -2418,17 +2604,22 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                             text_rendering_mode,
                                         ) && crate::text_utils::is_visual_rtl_run(text)
                                         {
-                                            rtl_visual_runs.push(items.len());
+                                            stream.rtl_visual_runs.push(stream.items.len());
                                         }
                                     }
                                 }
-                                if let Some(pending) = pending_space.take() {
-                                    pending.resolve(&mut items, &geometry, text, rendered_size);
+                                if let Some(pending) = stream.pending_space.take() {
+                                    pending.resolve(
+                                        &mut stream.items,
+                                        &geometry,
+                                        text,
+                                        rendered_size,
+                                    );
                                 }
                                 let painted_bold = paintable_fonts.contains(&current_font)
                                     && text_paint.adds_bold(text, rendered_size, base_font, &ctm);
                                 let paint = text_paint.run_paint();
-                                items.push(TextItem {
+                                stream.items.push(TextItem {
                                     text: expand_ligatures(text),
                                     x: geometry.x,
                                     y: geometry.y,
@@ -2491,8 +2682,8 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                         // run decides, against the pen it left.
                         if let Some((prefix, candidate)) = deferred_word_gaps {
                             if !sub_items.is_empty() {
-                                pending_word_gaps = Some(PendingWordGaps::new(
-                                    items.len() - 1,
+                                stream.pending_word_gaps = Some(PendingWordGaps::new(
+                                    stream.items.len() - 1,
                                     expand_ligatures(&format!("{prefix}{}", candidate.spaced_text)),
                                     &text_matrix,
                                     &ctm,
@@ -2501,6 +2692,20 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                     current_font_size,
                                 ));
                             }
+                        }
+                        if !capture_inv
+                            && fidelity
+                            && !include_invisible
+                            && !has_confirmed_visible_text
+                        {
+                            sync_visible_push(
+                                &visible,
+                                &mut inv,
+                                &mut has_confirmed_visible_text,
+                                shown_clip,
+                                from_len,
+                                false,
+                            );
                         }
                     }
                 }
@@ -2522,8 +2727,9 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                     .and_then(get_operand_bytes)
                     .is_some_and(|raw| !raw.is_empty())
                 {
-                    if let Some(pending) = pending_word_gaps.take() {
-                        pending.resolve(&mut items, &text_matrix, &ctm);
+                    visible.resolve_word_gaps(&text_matrix, &ctm);
+                    if let Some((inv_stream, _)) = &mut inv {
+                        inv_stream.resolve_word_gaps(&text_matrix, &ctm);
                     }
                 }
                 // Capture first-glyph position for ActualText AFTER the
@@ -2600,41 +2806,38 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                         text_rendering_mode,
                     );
                 }
-                if text_rendering_mode == 3
-                    && !include_invisible
+                let tr3_hidden = text_rendering_mode == 3 && !include_invisible;
+                if tr3_hidden
                     && show_operand
                         .and_then(get_operand_bytes)
                         .is_some_and(|raw| !raw.is_empty())
                 {
                     skipped_invisible = true;
                 }
+                let capture_inv = tr3_hidden
+                    && fidelity
+                    && !include_invisible
+                    && !has_confirmed_visible_text
+                    && !suppress_glyph_extraction;
                 if let Some(show_operand) = show_operand.filter(|_| {
-                    !((text_rendering_mode == 3 && !include_invisible) || suppress_glyph_extraction)
+                    !((tr3_hidden && !capture_inv) || suppress_glyph_extraction)
                 }) {
-                    let (decoded_text, fidelity_glyphs): (Option<String>, Vec<_>) = if fidelity {
-                        let (text, glyphs) = extract_fidelity_glyphs(
-                            show_operand,
-                            &current_font,
-                            font_base_names.get(&current_font).map(String::as_str),
-                            font_cmaps,
-                            &font_tounicode_refs,
-                            &inline_cmaps,
-                            &font_encodings,
-                            &encoding_cache,
-                            &mut cmap_decisions,
-                            &font_widths,
-                            &font_kinds,
-                            current_font_size,
-                            char_spacing,
-                            word_spacing,
-                        );
-                        (text, positioned_fidelity_glyphs(glyphs, horizontal_scale))
-                    } else {
-                        (None, Vec::new())
-                    };
-                    let fidelity_text = fidelity.then(|| {
-                        if fidelity_glyphs.is_empty() {
-                            extract_text_from_operand_fidelity(
+                    let from_len = visible.items.len();
+                    let mut note_pending_geom = None;
+                    {
+                        let (stream, decisions) = if capture_inv {
+                            let (inv_s, inv_d) = inv.get_or_insert_with(|| {
+                                let mut d = cmap_decisions.clone();
+                                d.take_run_coverage();
+                                (visible.clone(), d)
+                            });
+                            (inv_s, inv_d)
+                        } else {
+                            (&mut visible, &mut cmap_decisions)
+                        };
+                        let (decoded_text, fidelity_glyphs): (Option<String>, Vec<_>) = if fidelity
+                        {
+                            let (text, glyphs) = extract_fidelity_glyphs(
                                 show_operand,
                                 &current_font,
                                 font_base_names.get(&current_font).map(String::as_str),
@@ -2643,182 +2846,240 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                 &inline_cmaps,
                                 &font_encodings,
                                 &encoding_cache,
-                                &mut cmap_decisions,
+                                decisions,
                                 &font_widths,
                                 &font_kinds,
-                            )
-                        } else {
-                            Some(
-                                fidelity_glyphs
-                                    .iter()
-                                    .map(|glyph| glyph.text.as_str())
-                                    .collect(),
-                            )
-                        }
-                    });
-                    if let Some((text, legacy_symbol_rewrite)) =
-                        decoded_text.map(|text| (text, false)).or_else(|| {
-                            extract_text_from_operand(
-                                show_operand,
-                                &current_font,
-                                font_base_names.get(&current_font).map(|s| s.as_str()),
-                                font_cmaps,
-                                &font_tounicode_refs,
-                                &inline_cmaps,
-                                &font_encodings,
-                                &encoding_cache,
-                                &mut cmap_decisions,
-                                &font_widths,
-                                &font_kinds,
-                            )
-                        })
-                    {
-                        let combined =
-                            multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
-                        let rendered_size = effective_font_size(current_font_size, &combined)
-                            * type3_scales.get(&current_font).copied().unwrap_or(1.0);
-                        let geometry = scaled_run_geometry(
-                            &combined,
-                            w_ts_opt,
-                            if glyph_count > 0 {
-                                estimate_ts
-                            } else {
-                                estimated_advance_ts(&text, em_ts)
-                            },
-                            rendered_size.copysign(current_font_size),
-                            type3_y_flips.contains(&current_font),
-                            horizontal_scale,
-                        );
-                        if text.trim().is_empty() {
-                            pending_space = PendingSpace::note(
-                                pending_space.take(),
-                                &items,
-                                &geometry,
-                                page_num,
+                                current_font_size,
+                                char_spacing,
+                                word_spacing,
                             );
+                            (text, positioned_fidelity_glyphs(glyphs, horizontal_scale))
                         } else {
-                            if let Some(pending) = pending_space.take() {
-                                pending.resolve(&mut items, &geometry, &text, rendered_size);
+                            (None, Vec::new())
+                        };
+                        let fidelity_text = fidelity.then(|| {
+                            if fidelity_glyphs.is_empty() {
+                                extract_text_from_operand_fidelity(
+                                    show_operand,
+                                    &current_font,
+                                    font_base_names.get(&current_font).map(String::as_str),
+                                    font_cmaps,
+                                    &font_tounicode_refs,
+                                    &inline_cmaps,
+                                    &font_encodings,
+                                    &encoding_cache,
+                                    decisions,
+                                    &font_widths,
+                                    &font_kinds,
+                                )
+                            } else {
+                                Some(
+                                    fidelity_glyphs
+                                        .iter()
+                                        .map(|glyph| glyph.text.as_str())
+                                        .collect(),
+                                )
                             }
-                            rotation_votes.cast_direction(reading_direction(
+                        });
+                        if let Some((text, legacy_symbol_rewrite)) =
+                            decoded_text.map(|text| (text, false)).or_else(|| {
+                                extract_text_from_operand(
+                                    show_operand,
+                                    &current_font,
+                                    font_base_names.get(&current_font).map(|s| s.as_str()),
+                                    font_cmaps,
+                                    &font_tounicode_refs,
+                                    &inline_cmaps,
+                                    &font_encodings,
+                                    &encoding_cache,
+                                    decisions,
+                                    &font_widths,
+                                    &font_kinds,
+                                )
+                            })
+                        {
+                            let combined =
+                                multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
+                            let rendered_size = effective_font_size(current_font_size, &combined)
+                                * type3_scales.get(&current_font).copied().unwrap_or(1.0);
+                            let geometry = scaled_run_geometry(
                                 &combined,
-                                current_font_size * horizontal_scale,
-                            ));
-                            let base_font = font_base_names
-                                .get(&current_font)
-                                .map(|s| s.as_str())
-                                .unwrap_or(&current_font);
-                            let style = font_styles.get(&current_font).copied().unwrap_or_default();
-                            if crate::text_utils::is_visual_rtl_candidate(&text)
-                                && combined[0].abs() > combined[1].abs()
-                            {
-                                if combined[0] * horizontal_scale > 0.0 {
-                                    rtl_visual_candidates.push(items.len());
-                                    if !crate::text_utils::white_fill_hides(
-                                        text_rendering_mode,
-                                        fill_is_white,
-                                    ) && crate::text_utils::render_mode_paints(
-                                        text_rendering_mode,
-                                    ) && crate::text_utils::is_visual_rtl_run(&text)
-                                    {
-                                        rtl_visual_runs.push(items.len());
-                                    }
+                                w_ts_opt,
+                                if glyph_count > 0 {
+                                    estimate_ts
                                 } else {
-                                    rtl_logical_runs.push(items.len());
+                                    estimated_advance_ts(&text, em_ts)
+                                },
+                                rendered_size.copysign(current_font_size),
+                                type3_y_flips.contains(&current_font),
+                                horizontal_scale,
+                            );
+                            if text.trim().is_empty() {
+                                stream.pending_space = PendingSpace::note(
+                                    stream.pending_space.take(),
+                                    &stream.items,
+                                    &geometry,
+                                    page_num,
+                                );
+                                if !capture_inv
+                                    && fidelity
+                                    && !include_invisible
+                                    && !has_confirmed_visible_text
+                                {
+                                    note_pending_geom = Some(geometry);
                                 }
-                            }
-                            let painted_bold = paintable_fonts.contains(&current_font)
-                                && text_paint.adds_bold(&text, rendered_size, base_font, &ctm);
-                            let paint = text_paint.run_paint();
-                            items.push(TextItem {
-                                text: expand_ligatures(&text),
-                                x: geometry.x,
-                                y: geometry.y,
-                                width: geometry.width,
-                                height: geometry.height,
-                                font: crate::extractor::fonts::item_font_name(
-                                    &current_font,
-                                    base_font,
-                                )
-                                .to_string(),
-                                font_tag: font_names
+                            } else {
+                                if let Some(pending) = stream.pending_space.take() {
+                                    pending.resolve(
+                                        &mut stream.items,
+                                        &geometry,
+                                        &text,
+                                        rendered_size,
+                                    );
+                                }
+                                rotation_votes.cast_direction(reading_direction(
+                                    &combined,
+                                    current_font_size * horizontal_scale,
+                                ));
+                                let base_font = font_base_names
                                     .get(&current_font)
-                                    .cloned()
-                                    .unwrap_or_else(|| current_font.clone()),
-                                legacy_symbol_rewrite,
-                                font_size: rendered_size,
-                                page: page_num,
-                                is_bold: style.bold || painted_bold,
-                                is_italic: style.italic,
-                                font_weight: style.weight,
-                                bold_source: style
-                                    .bold_source
-                                    .or(painted_bold.then_some(BoldSource::Painted)),
-                                fixed_pitch: style.fixed_pitch,
-                                fill_color: paint.fill_color,
-                                stroke_color: paint.stroke_color,
-                                render_mode: Some(paint.render_mode),
-                                is_underline: false,
-                                is_strikeout: false,
-                                fidelity: fidelity_info(
-                                    font_fidelity.as_ref(),
-                                    &current_font,
-                                    fidelity_text.flatten().unwrap_or_else(|| text.clone()),
-                                    text_object_index,
-                                    source_line_index,
-                                    text_rise,
-                                    fidelity_glyphs,
-                                    combined,
-                                    current_font_size,
-                                    type3_scales.get(&current_font).copied().unwrap_or(1.0),
-                                    w_ts_opt.unwrap_or(0.0) * horizontal_scale,
-                                ),
-                                rotation: geometry.rotation,
-                                advance_known: geometry.advance_known,
-                                item_type: ItemType::Text,
-                                mcid: current_mcid(&marked_content_stack),
-                                baseline_shift: 0.0,
-                            });
-                            // A short string with word-gap character spacing
-                            // shows its spaces once the next run proves the
-                            // spacing after it was taken back (see `word_gaps`).
-                            pending_word_gaps = get_operand_bytes(show_operand).and_then(|raw| {
-                                PendingWordGaps::for_shown_string(
-                                    items.len() - 1,
-                                    raw,
-                                    &text,
-                                    font_widths.get(&current_font),
-                                    current_font_size,
-                                    char_spacing,
-                                    word_spacing,
-                                    &advanced_tm(
-                                        &text_matrix,
-                                        w_ts_opt.unwrap_or(estimate_ts),
-                                        horizontal_scale,
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(&current_font);
+                                let style =
+                                    font_styles.get(&current_font).copied().unwrap_or_default();
+                                if crate::text_utils::is_visual_rtl_candidate(&text)
+                                    && combined[0].abs() > combined[1].abs()
+                                {
+                                    if combined[0] * horizontal_scale > 0.0 {
+                                        stream.rtl_visual_candidates.push(stream.items.len());
+                                        if !crate::text_utils::white_fill_hides(
+                                            text_rendering_mode,
+                                            fill_is_white,
+                                        ) && crate::text_utils::render_mode_paints(
+                                            text_rendering_mode,
+                                        ) && crate::text_utils::is_visual_rtl_run(&text)
+                                        {
+                                            stream.rtl_visual_runs.push(stream.items.len());
+                                        }
+                                    } else {
+                                        stream.rtl_logical_runs.push(stream.items.len());
+                                    }
+                                }
+                                let painted_bold = paintable_fonts.contains(&current_font)
+                                    && text_paint.adds_bold(&text, rendered_size, base_font, &ctm);
+                                let paint = text_paint.run_paint();
+                                stream.items.push(TextItem {
+                                    text: expand_ligatures(&text),
+                                    x: geometry.x,
+                                    y: geometry.y,
+                                    width: geometry.width,
+                                    height: geometry.height,
+                                    font: crate::extractor::fonts::item_font_name(
+                                        &current_font,
+                                        base_font,
+                                    )
+                                    .to_string(),
+                                    font_tag: font_names
+                                        .get(&current_font)
+                                        .cloned()
+                                        .unwrap_or_else(|| current_font.clone()),
+                                    legacy_symbol_rewrite,
+                                    font_size: rendered_size,
+                                    page: page_num,
+                                    is_bold: style.bold || painted_bold,
+                                    is_italic: style.italic,
+                                    font_weight: style.weight,
+                                    bold_source: style
+                                        .bold_source
+                                        .or(painted_bold.then_some(BoldSource::Painted)),
+                                    fixed_pitch: style.fixed_pitch,
+                                    fill_color: paint.fill_color,
+                                    stroke_color: paint.stroke_color,
+                                    render_mode: Some(paint.render_mode),
+                                    is_underline: false,
+                                    is_strikeout: false,
+                                    fidelity: fidelity_info(
+                                        font_fidelity.as_ref(),
+                                        &current_font,
+                                        fidelity_text.flatten().unwrap_or_else(|| text.clone()),
+                                        text_object_index,
+                                        source_line_index,
+                                        text_rise,
+                                        fidelity_glyphs,
+                                        combined,
+                                        current_font_size,
+                                        type3_scales.get(&current_font).copied().unwrap_or(1.0),
+                                        w_ts_opt.unwrap_or(0.0) * horizontal_scale,
                                     ),
-                                    &ctm,
-                                    horizontal_scale,
-                                    |code| {
-                                        cmap_decisions.without_coverage(|decisions| {
-                                            extract_text_from_operand(
-                                                code,
-                                                &current_font,
-                                                font_base_names
-                                                    .get(&current_font)
-                                                    .map(|s| s.as_str()),
-                                                font_cmaps,
-                                                &font_tounicode_refs,
-                                                &inline_cmaps,
-                                                &font_encodings,
-                                                &encoding_cache,
-                                                decisions,
-                                                &font_widths,
-                                                &font_kinds,
-                                            )
-                                        })
-                                    },
-                                )
-                            });
+                                    rotation: geometry.rotation,
+                                    advance_known: geometry.advance_known,
+                                    item_type: ItemType::Text,
+                                    mcid: current_mcid(&marked_content_stack),
+                                    baseline_shift: 0.0,
+                                });
+                                // A short string with word-gap character spacing
+                                // shows its spaces once the next run proves the
+                                // spacing after it was taken back (see `word_gaps`).
+                                stream.pending_word_gaps =
+                                    get_operand_bytes(show_operand).and_then(|raw| {
+                                        PendingWordGaps::for_shown_string(
+                                            stream.items.len() - 1,
+                                            raw,
+                                            &text,
+                                            font_widths.get(&current_font),
+                                            current_font_size,
+                                            char_spacing,
+                                            word_spacing,
+                                            &advanced_tm(
+                                                &text_matrix,
+                                                w_ts_opt.unwrap_or(estimate_ts),
+                                                horizontal_scale,
+                                            ),
+                                            &ctm,
+                                            horizontal_scale,
+                                            |code| {
+                                                decisions.without_coverage(|decisions| {
+                                                    extract_text_from_operand(
+                                                        code,
+                                                        &current_font,
+                                                        font_base_names
+                                                            .get(&current_font)
+                                                            .map(|s| s.as_str()),
+                                                        font_cmaps,
+                                                        &font_tounicode_refs,
+                                                        &inline_cmaps,
+                                                        &font_encodings,
+                                                        &encoding_cache,
+                                                        decisions,
+                                                        &font_widths,
+                                                        &font_kinds,
+                                                    )
+                                                })
+                                            },
+                                        )
+                                    });
+                            }
+                        }
+                    }
+                    if !capture_inv && fidelity && !include_invisible && !has_confirmed_visible_text
+                    {
+                        sync_visible_push(
+                            &visible,
+                            &mut inv,
+                            &mut has_confirmed_visible_text,
+                            shown_clip,
+                            from_len,
+                            false,
+                        );
+                        if let Some(geom) = note_pending_geom {
+                            if let Some((inv_stream, _)) = &mut inv {
+                                inv_stream.pending_space = PendingSpace::note(
+                                    inv_stream.pending_space.take(),
+                                    &inv_stream.items,
+                                    &geom,
+                                    page_num,
+                                );
+                            }
                         }
                     }
                 }
@@ -2829,7 +3090,10 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                 text_matrix[5] += cursor_ts * horizontal_scale * text_matrix[1];
             }
             "Do" => {
-                pending_word_gaps = None;
+                visible.pending_word_gaps = None;
+                if let Some((inv_stream, _)) = &mut inv {
+                    inv_stream.pending_word_gaps = None;
+                }
                 // Forms were expanded before interpretation, so any remaining
                 // XObject invocation is an image in the resolved resource scope.
                 if !suppress_glyph_extraction {
@@ -2837,7 +3101,8 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                         let resource_name = String::from_utf8_lossy(name);
                         if let Some(display_name) = xobjects.get(resource_name.as_ref()) {
                             let (x, y, width, height) = image_bbox_from_ctm(&ctm);
-                            items.push(TextItem {
+                            let from_len = visible.items.len();
+                            visible.items.push(TextItem {
                                 text: format!("[Image: {}]", display_name),
                                 x,
                                 y,
@@ -2865,6 +3130,16 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                 item_type: ItemType::Image,
                                 mcid: current_mcid(&marked_content_stack),
                             });
+                            if fidelity && !include_invisible && !has_confirmed_visible_text {
+                                sync_visible_push(
+                                    &visible,
+                                    &mut inv,
+                                    &mut has_confirmed_visible_text,
+                                    shown_clip,
+                                    from_len,
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
@@ -3020,21 +3295,12 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                     .unwrap_or(&paint_font);
                                 let style =
                                     font_styles.get(&paint_font).copied().unwrap_or_default();
-                                logical_text_items.push(items.len());
-                                // The span's own glyphs were left out as they
-                                // were painted; the paint that made them
-                                // heavier is read now, from the paint state
-                                // its first glyph was shown with, for the font
-                                // that painted them and only when some glyph
-                                // was painted. The replacement is the text the
-                                // item carries, so it stands in for the glyphs
-                                // in the check for alphanumeric content; a
-                                // symbol face is ruled out by the painting
-                                // font's name.
                                 let painted_bold = actual_text_glyph_count > 0
                                     && paintable_fonts.contains(&paint_font)
                                     && glyph_paint.adds_bold(&at, rendered_size, base_font, &ctm);
-                                items.push(TextItem {
+                                let from_len = visible.items.len();
+                                visible.logical_text_items.push(visible.items.len());
+                                visible.items.push(TextItem {
                                     text: expand_ligatures(&at),
                                     x: geometry.x,
                                     y: geometry.y,
@@ -3085,6 +3351,16 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
                                         .or_else(|| current_mcid(&marked_content_stack)),
                                     baseline_shift: 0.0,
                                 });
+                                if fidelity && !include_invisible && !has_confirmed_visible_text {
+                                    sync_visible_push(
+                                        &visible,
+                                        &mut inv,
+                                        &mut has_confirmed_visible_text,
+                                        shown_clip,
+                                        from_len,
+                                        true,
+                                    );
+                                }
                             }
                         }
                         suppress_glyph_extraction =
@@ -3429,8 +3705,8 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
         }
     }
 
-    item_clips.resize(items.len(), shown_clip);
-    attach_run_coverage(&mut item_coverage, items.len(), || {
+    visible.clips.resize(visible.items.len(), shown_clip);
+    attach_run_coverage(&mut item_coverage, visible.items.len(), || {
         cmap_decisions.take_run_coverage()
     });
     // The coverage of show operators no item followed — a trailing run of
@@ -3438,69 +3714,9 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
     // with; it is kept as a run without a position (see `RunCoverage`).
     let unplaced_coverage = cmap_decisions.take_run_coverage();
 
-    // Decide the storage order of the page's RTL runs while candidate
-    // indexes are still valid; merge_text_items below reads visual-order
-    // lines back into logical order as it merges them.
-    // Runs painted wholly outside their clip are left out below; they are
-    // not on the page, so they do not say how its right-to-left runs are
-    // stored either — neither as walk candidates nor as logical- or
-    // visual-storage votes.
-    let (rtl_visual_candidates, rtl_logical_ops, rtl_visual_ops) = {
-        let on_page = |index: usize| {
-            !super::clip_boundaries::excluded_by_clip(&items[index], item_clips[index])
-        };
-        (
-            rtl_visual_candidates
-                .iter()
-                .copied()
-                .filter(|&index| on_page(index))
-                .collect::<Vec<usize>>(),
-            rtl_logical_runs
-                .iter()
-                .filter(|&&index| on_page(index))
-                .count() as u32,
-            rtl_visual_runs
-                .iter()
-                .filter(|&&index| on_page(index))
-                .count() as u32,
-        )
-    };
-    let visual_rtl = crate::text_utils::fix_visual_order_rtl(
-        &mut items,
-        &rtl_visual_candidates,
-        rtl_logical_ops,
-        rtl_visual_ops,
-        &logical_text_items,
-    );
-
-    // Runs painted wholly outside the rectangular clip in force when they
-    // were shown are invisible on the rendered page: labels a charting
-    // library parks off its plot area, content the producer cropped away.
-    // Leave them out so they cannot leak into the surrounding text. Unlike
-    // render-mode-3 text they transcribe nothing that is visible, so
-    // `include_invisible` does not bring them back and they do not count
-    // towards `skipped_invisible`: a page whose every run is clipped away
-    // reports no text, like an image-only page. After the RTL fix, which
-    // indexes items; before the rotation correction, which moves them out
-    // of the clip's frame.
-    // Which runs carry a producer's ActualText replacement rather than their
-    // glyphs' decoding, parallel to the items like their clips: the merge
-    // must not read such a run's characters as its glyphs.
-    let mut replaced_text = vec![false; items.len()];
-    for &index in &logical_text_items {
-        if let Some(flag) = replaced_text.get_mut(index) {
-            *flag = true;
-        }
-    }
-    let dropped = super::clip_boundaries::drop_clipped_away_runs(
-        &mut items,
-        &mut item_clips,
-        &mut replaced_text,
-        &mut item_coverage,
-    );
-    if dropped > 0 {
-        log::debug!("page {page_num}: {dropped} text run(s) painted outside their clip left out");
-    }
+    let (visual_rtl, replaced_text) =
+        visible.finalize_clipped_and_rtl(&mut item_coverage, page_num);
+    let item_clips = visible.clips;
 
     // Detect dominant text rotation and transform coordinates if needed.
     // Some PDFs embed landscape content in portrait pages using a rotated text
@@ -3510,9 +3726,9 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
         // Fidelity coordinates stay in PDF user space; the consumer owns the
         // CropBox and /Rotate display transform. Reading orientation is not
         // a change to the source coordinate frame.
-        (items, rects, lines, PageRotation::Upright)
+        (visible.items, rects, lines, PageRotation::Upright)
     } else {
-        correct_rotated_page(items, rects, lines, &rotation_votes)
+        correct_rotated_page(visible.items, rects, lines, &rotation_votes)
     };
     if page_rotation != PageRotation::Upright {
         rotate_underline_graphics(&mut underline_rects, &mut underline_lines, page_rotation);
@@ -3558,22 +3774,59 @@ pub(super) fn extract_page_text_items_with_caches<'a>(
     } else {
         Vec::new()
     };
-    let items = if merge_text {
-        if page_rotation == PageRotation::Upright {
-            super::merge_text_items_with_clips(items, &item_clips, visual_rtl, &replaced_text)
-        } else {
-            // Clips use the original page frame; rotated-page correction is an
-            // intentionally unsupported provenance case.
-            super::merge_text_items_with_clips(items, &[], visual_rtl, &replaced_text)
+    let mut items = apply_post_merges(
+        items,
+        &item_clips,
+        visual_rtl,
+        &replaced_text,
+        merge_text,
+        merge_scripts,
+        page_rotation,
+    );
+    // In fidelity mode, recover coherent Tr 3 OCR-layer text in the same pass
+    // when the page carries no visible text (rather than a blank-page stamp).
+    if fidelity
+        && skipped_invisible
+        && !include_invisible
+        && !items.iter().any(|item| {
+            !matches!(item.item_type, ItemType::Image) && !item.text.trim().is_empty()
+        })
+    {
+        if let Some((mut inv_stream, _)) = inv {
+            inv_stream.clips.resize(inv_stream.items.len(), shown_clip);
+            let mut no_coverage = vec![Vec::new(); inv_stream.items.len()];
+            let (inv_visual_rtl, inv_replaced) =
+                inv_stream.finalize_clipped_and_rtl(&mut no_coverage, page_num);
+            super::underline::mark_underlined_items(
+                &mut inv_stream.items,
+                &underline_rects,
+                &underline_lines,
+                page_num,
+            );
+            if options.bold_from_weight {
+                read_bold_from_weight(&mut inv_stream.items, options.bold_weight_threshold);
+            }
+            let inv_items = apply_post_merges(
+                inv_stream.items,
+                &inv_stream.clips,
+                inv_visual_rtl,
+                &inv_replaced,
+                merge_text,
+                merge_scripts,
+                page_rotation,
+            );
+            let text: String = inv_items
+                .iter()
+                .filter(|item| !matches!(item.item_type, ItemType::Image))
+                .map(|item| item.text.as_str())
+                .collect();
+            if text.chars().filter(|character| character.is_alphanumeric()).count() >= 40
+                && !crate::text_quality::is_garbage_text(&text)
+            {
+                items = inv_items;
+            }
         }
-    } else {
-        items
-    };
-    let items = if merge_scripts {
-        super::merge_subscript_items(items)
-    } else {
-        items
-    };
+    }
     Ok((
         (items, rects, lines, painted_rules),
         has_gid_fonts,

@@ -845,6 +845,43 @@ fn extract_positioned_text_impl<'a>(
         })
         .collect();
     target_pages.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+    // Pre-resolve unique page font encodings once per document instead of
+    // repeating ToUnicode/Encoding parsing independently in every worker.
+    let mut unique_fonts: HashMap<usize, &'a lopdf::Dictionary> = HashMap::new();
+    for &(_, page_id, _) in &target_pages {
+        if let Ok(page_fonts) = doc.get_page_fonts(page_id) {
+            for font_dict in page_fonts.into_values() {
+                unique_fonts
+                    .entry(std::ptr::from_ref(font_dict) as usize)
+                    .or_insert(font_dict);
+            }
+        }
+    }
+    let shared_lopdf_encodings: HashMap<usize, Option<lopdf::Encoding<'a>>> = {
+        let entries: Vec<(usize, &'a lopdf::Dictionary)> = unique_fonts.into_iter().collect();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if entries.len() > 1 {
+                use rayon::prelude::*;
+                entries
+                    .into_par_iter()
+                    .map(|(ptr, font_dict)| (ptr, font_dict.get_font_encoding(doc).ok()))
+                    .collect()
+            } else {
+                entries
+                    .into_iter()
+                    .map(|(ptr, font_dict)| (ptr, font_dict.get_font_encoding(doc).ok()))
+                    .collect()
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            entries
+                .into_iter()
+                .map(|(ptr, font_dict)| (ptr, font_dict.get_font_encoding(doc).ok()))
+                .collect()
+        }
+    };
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
     // Per font, the codes shown through its CMap over every extracted page.
@@ -882,6 +919,7 @@ fn extract_positioned_text_impl<'a>(
             font_cmaps,
             options,
             font_cache,
+            &shared_lopdf_encodings,
             lopdf_encodings,
             &mut FormWalkBudget::new(),
             merge_text,
@@ -893,7 +931,7 @@ fn extract_positioned_text_impl<'a>(
             (mut items, mut rects, mut lines, mut rules),
             has_gid_fonts,
             coords_rotated,
-            skipped_invisible,
+            _skipped_invisible,
             mut run_coverage,
             page_detection,
         ) = match page_result {
@@ -907,47 +945,6 @@ fn extract_positioned_text_impl<'a>(
             }
             Err(error) => return Err(error),
         };
-        // The fidelity reader's OCR-layer fallback, when the page carries no
-        // visible text and the skipped Tr 3 text is coherent (not the
-        // boilerplate placeholder an OCR generator stamps behind a blank side).
-        if fidelity
-            && skipped_invisible
-            && !options.include_invisible
-            && !items.iter().any(|item| {
-                !matches!(item.item_type, crate::types::ItemType::Image) && !item.text.trim().is_empty()
-            })
-        {
-            if let Ok(((layer, _, _, _), _, _, _, _, _)) =
-                content_stream::extract_page_text_items_with_caches(
-                    doc,
-                    page_id,
-                    page_num,
-                    font_cmaps,
-                    TextExtractionOptions {
-                        include_invisible: true,
-                        ..options
-                    },
-                    font_cache,
-                    lopdf_encodings,
-                    &mut FormWalkBudget::new(),
-                    merge_text,
-                    merge_scripts,
-                    fidelity,
-                    false,
-                )
-            {
-                let text: String = layer
-                    .iter()
-                    .filter(|item| !matches!(item.item_type, crate::types::ItemType::Image))
-                    .map(|item| item.text.as_str())
-                    .collect();
-                if text.chars().filter(|character| character.is_alphanumeric()).count() >= 40
-                    && !crate::text_quality::is_garbage_text(&text)
-                {
-                    items = layer;
-                }
-            }
-        }
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
