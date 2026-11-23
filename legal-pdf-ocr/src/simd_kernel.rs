@@ -429,8 +429,10 @@ pub(crate) fn text_quality_score(lines: &[OcrLine]) -> f64 {
 #[derive(Default)]
 pub(crate) struct DownsampleScratch {
     horiz: Vec<f32>,
+    acc_row: Vec<f32>,
     x_ranges: Vec<(usize, usize)>,
     x_weights: Vec<f32>,
+    x_active: Vec<(usize, usize, usize, f32)>,
     y_ranges: Vec<(usize, usize)>,
     y_weights: Vec<f32>,
 }
@@ -503,6 +505,137 @@ unsafe fn norm_f32_inplace_avx2(row: &mut [f32]) {
         *p = 1.0 - *p * INV255;
         i += 1;
     }
+}
+
+#[inline]
+fn fmadd_row(acc: &mut [f32], src: &[f32], w: f32) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        unsafe { fmadd_row_avx2(acc, src, w) };
+        return;
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        fmadd_row_wasm(acc, src, w);
+        return;
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    for (a, &s) in acc.iter_mut().zip(src) {
+        *a += s * w;
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn fmadd_row_wasm(acc: &mut [f32], src: &[f32], w: f32) {
+    use core::arch::wasm32::*;
+    let len = acc.len().min(src.len());
+    let vw = f32x4_splat(w);
+    let mut i = 0usize;
+    while i + 4 <= len {
+        unsafe {
+            let va = v128_load(acc.as_ptr().add(i) as *const v128);
+            let vs = v128_load(src.as_ptr().add(i) as *const v128);
+            v128_store(acc.as_mut_ptr().add(i) as *mut v128, f32x4_add(va, f32x4_mul(vs, vw)));
+        }
+        i += 4;
+    }
+    while i < len {
+        acc[i] += src[i] * w;
+        i += 1;
+    }
+}
+
+/// Zero-allocation separable Triangle (tent) downscaler directly from page `(raw, stride)` with
+/// virtual 255-white padding `(px, py)` into `dst_w * dst_h` `u8` pixels.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resize_cropped_padded_triangle_u8(
+    raw: &[u8],
+    stride: usize,
+    src_x0: usize,
+    src_y0: usize,
+    cw: usize,
+    ch: usize,
+    px: usize,
+    py: usize,
+    dst_w: usize,
+    dst_h: usize,
+    scratch: &mut DownsampleScratch,
+) -> Vec<u8> {
+    let pw = cw + 2 * px;
+    let ph = ch + 2 * py;
+    let mut out = vec![255u8; dst_w * dst_h];
+    if cw == 0 || ch == 0 || dst_w == 0 || dst_h == 0 {
+        return out;
+    }
+
+    fill_triangle_taps(pw, dst_w, &mut scratch.x_ranges, &mut scratch.x_weights);
+    fill_triangle_taps(ph, dst_h, &mut scratch.y_ranges, &mut scratch.y_weights);
+
+    scratch.x_active.clear();
+    scratch.x_active.reserve(dst_w);
+    for dx in 0..dst_w {
+        let (x0, w_start) = scratch.x_ranges[dx];
+        let w_end = scratch.x_ranges[dx + 1].1;
+        let x_len = w_end - w_start;
+        let act_start = x0.max(px);
+        let act_end = (x0 + x_len).min(px + cw);
+        let mut white_w = 0.0_f32;
+        for k in 0..x_len {
+            let sx = x0 + k;
+            if sx < act_start || sx >= act_end {
+                white_w += scratch.x_weights[w_start + k];
+            }
+        }
+        let act_len = act_end.saturating_sub(act_start);
+        let src_off = act_start.saturating_sub(px);
+        let w_off = w_start + act_start.saturating_sub(x0);
+        scratch.x_active.push((src_off, w_off, act_len, white_w * 255.0));
+    }
+
+    scratch.horiz.resize(ch * dst_w, 0.0);
+    for ry in 0..ch {
+        let src_row = &raw[(src_y0 + ry) * stride + src_x0..(src_y0 + ry) * stride + src_x0 + cw];
+        let h_row = &mut scratch.horiz[ry * dst_w..(ry + 1) * dst_w];
+        for (dx, &(src_off, w_off, act_len, white_bias)) in scratch.x_active.iter().enumerate() {
+            let mut acc = white_bias;
+            if act_len > 0 {
+                let src_slice = &src_row[src_off..src_off + act_len];
+                let w_slice = &scratch.x_weights[w_off..w_off + act_len];
+                for (&s, &w) in src_slice.iter().zip(w_slice) {
+                    acc += f32::from(s) * w;
+                }
+            }
+            h_row[dx] = acc;
+        }
+    }
+
+    scratch.acc_row.resize(dst_w, 0.0);
+    for dy in 0..dst_h {
+        let (y0, w_start) = scratch.y_ranges[dy];
+        let w_end = scratch.y_ranges[dy + 1].1;
+        let y_len = w_end - w_start;
+        let act_start = y0.max(py);
+        let act_end = (y0 + y_len).min(py + ch);
+        let mut white_w = 0.0_f32;
+        for k in 0..y_len {
+            let sy = y0 + k;
+            if sy < act_start || sy >= act_end {
+                white_w += scratch.y_weights[w_start + k];
+            }
+        }
+        scratch.acc_row[..dst_w].fill(white_w * 255.0);
+        for sy in act_start..act_end {
+            let ry = sy - py;
+            let wy = scratch.y_weights[w_start + (sy - y0)];
+            let h_row = &scratch.horiz[ry * dst_w..(ry + 1) * dst_w];
+            fmadd_row(&mut scratch.acc_row[..dst_w], h_row, wy);
+        }
+        let out_row = &mut out[dy * dst_w..(dy + 1) * dst_w];
+        for (dst_byte, &val) in out_row.iter_mut().zip(&scratch.acc_row[..dst_w]) {
+            *dst_byte = val.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
 }
 
 /// Zero-alloc separable Triangle (tent) downsample directly from `image` into `f32` `dst` with `1.0 - px/255.0` normalization and 0.0 right/bottom padding.

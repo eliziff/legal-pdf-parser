@@ -94,17 +94,42 @@ fn gray_render(pixmap: &Pixmap) -> GrayRender {
     (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(pixmap))
 }
 
-/// A render's pixels in the recognizer's grey, the mean of red, green and blue, as its lines were
-/// read in training.
-pub(crate) fn ink_of(pixmap: &Pixmap) -> Vec<u8> {
-    pixmap.data_as_u8_slice().chunks_exact(4).map(|pixel| ((u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2]) + 1) / 3) as u8).collect()
+pub(crate) fn gray_and_ink_of_rgba(data: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let len = data.len() / 4;
+    let mut gray = Vec::with_capacity(len);
+    for (idx, pixel) in data.chunks_exact(4).enumerate() {
+        let (r, g, b) = (pixel[0], pixel[1], pixel[2]);
+        if r != g || g != b {
+            let mut ink = Vec::with_capacity(len);
+            ink.extend_from_slice(&gray);
+            for rest in data[idx * 4..].chunks_exact(4) {
+                let (rr, gg, bb) = (u32::from(rest[0]), u32::from(rest[1]), u32::from(rest[2]));
+                gray.push(((rr * 77 + gg * 150 + bb * 29) >> 8) as u8);
+                ink.push(((rr + gg + bb + 1) / 3) as u8);
+            }
+            return (gray, Some(ink));
+        }
+        gray.push(r);
+    }
+    (gray, None)
+}
+
+pub(crate) fn gray_of_rgba(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() / 4);
+    for pixel in data.chunks_exact(4) {
+        out.push(((u32::from(pixel[0]) * 77 + u32::from(pixel[1]) * 150 + u32::from(pixel[2]) * 29) >> 8) as u8);
+    }
+    out
+}
+
+/// Single-pass RGBA conversion into luma `gray` (`(77R + 150G + 29B) >> 8`) and optional mean
+/// `ink` (`(R + G + B + 1) / 3`). When every pixel satisfies `R == G == B`, both values are identical
+/// for every `0..=255`, so `ink` is omitted (`None`) and only one buffer is allocated.
+pub(crate) fn gray_and_ink_of(pixmap: &Pixmap) -> (Vec<u8>, Option<Vec<u8>>) {
+    gray_and_ink_of_rgba(pixmap.data_as_u8_slice())
 }
 
 /// A render's pixels in 8-bit grey: what the line detector, the separator and the raster measures read.
 pub(crate) fn gray_of(pixmap: &Pixmap) -> Vec<u8> {
-    pixmap
-        .data_as_u8_slice()
-        .chunks_exact(4)
-        .map(|pixel| ((u32::from(pixel[0]) * 77 + u32::from(pixel[1]) * 150 + u32::from(pixel[2]) * 29) / 256) as u8)
-        .collect()
+    gray_of_rgba(pixmap.data_as_u8_slice())
 }

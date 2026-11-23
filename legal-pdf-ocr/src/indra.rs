@@ -1,6 +1,7 @@
 //! Indra, the recognizer: a PDF's pages or grey images read into lines and words. Pages are drawn
 //! once and stood upright; the line detector, the separator and the region checks read the page in
-//! luma grey, and lines are cut for reading from it in the recognizer's own grey (`ink_of`).
+//! luma grey, and lines are cut for reading from it in the recognizer's own grey (`gray_and_ink_of`).
+use crate::indra_native::{IndraNative, IndraScratch};
 use crate::line_detector::LineDetector;
 use crate::model_pack::ModelPack;
 use crate::orientation::{place_back, turn, Orientation};
@@ -15,7 +16,7 @@ use ort::{
     session::{
         builder::GraphOptimizationLevel,
         builder::PrepackedWeights,
-        run_options::{OutputSelector, RunOptions},
+        run_options::{HasSelectedOutputs, OutputSelector, RunOptions},
         Session,
     },
     value::TensorRef,
@@ -27,7 +28,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// The recognizer reads lines this many pixels high.
 const INPUT_HEIGHT: usize = 32;
@@ -226,8 +227,36 @@ impl Codec {
     }
 }
 
+enum RecognizerEngine {
+    Native {
+        model: Arc<IndraNative>,
+        workers: usize,
+    },
+    Ort(Vec<Session>),
+}
+
+fn open_recognizer(
+    model: &Path,
+    plan: &RuntimePlan,
+    cpu_arena: bool,
+    independent_pool: bool,
+) -> Result<RecognizerEngine> {
+    if plan.backend == OrtBackend::Cpu {
+        let native = IndraNative::from_onnx_path(model).map_err(Error::Message)?;
+        return Ok(RecognizerEngine::Native {
+            model: Arc::new(native),
+            workers: plan.workers.max(1),
+        });
+    }
+    let weights = PrepackedWeights::new();
+    let sessions = (0..plan.workers)
+        .map(|_| open_session(model, plan.threads, plan.backend, &plan.device, cpu_arena, &weights, independent_pool))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecognizerEngine::Ort(sessions))
+}
+
 pub struct OcrProvider {
-    sessions: Vec<Session>,
+    engine: RecognizerEngine,
     codec: Codec,
     dpi: u16,
     layouts: Vec<LineDetector>,
@@ -235,7 +264,7 @@ pub struct OcrProvider {
     orientation: Option<Orientation>,
     identity: String,
     fallback: Option<(PathBuf, PathBuf)>,
-    fallback_session: Option<(Vec<Session>, Codec)>,
+    fallback_engine: Option<(RecognizerEngine, Codec)>,
     cpu_arena: bool,
     independent_pool: bool,
 }
@@ -297,22 +326,19 @@ impl OcrProvider {
     pub(crate) fn open_prepared(options: &OcrOptions, prepared: &PreparedOcrProvider) -> Result<Self> {
         let independent_pool = legal_pdf_core::init_ort_runtime(&prepared.runtime, None)?.is_some();
         let (plan, pack) = (&prepared.plan, &prepared.pack);
-        let (layouts, sessions) = std::thread::scope(|scope| -> Result<_> {
-            // Independent model pools can initialize together; recognition weights stay shared.
+        let (layouts, engine) = std::thread::scope(|scope| -> Result<_> {
+            // Independent model pools can initialize together; CPU recognition loads weights directly.
             let layouts = scope.spawn(|| {
                 (0..plan.layout_workers)
                     .map(|_| LineDetector::open(&pack.detector, pack.detector_side, plan.backend, &plan.device, independent_pool))
                     .collect::<Result<Vec<_>>>()
             });
-            let weights = PrepackedWeights::new();
-            let sessions = (0..plan.workers)
-                .map(|_| open_session(&pack.model, plan.threads, plan.backend, &plan.device, options.cpu_arena, &weights, independent_pool))
-                .collect::<Result<Vec<_>>>();
+            let engine = open_recognizer(&pack.model, plan, options.cpu_arena, independent_pool);
             let layouts = layouts.join().map_err(|_| Error::Message("layout initialization worker panicked".into()))??;
-            Ok((layouts, sessions?))
+            Ok((layouts, engine?))
         })?;
         Ok(Self {
-            sessions,
+            engine,
             codec: Codec::load(&pack.codec)?,
             dpi: options.dpi,
             layouts,
@@ -320,7 +346,7 @@ impl OcrProvider {
             plan: plan.clone(),
             identity: prepared.identity.clone(),
             fallback: pack.fallback.clone(),
-            fallback_session: None,
+            fallback_engine: None,
             cpu_arena: options.cpu_arena,
             independent_pool,
         })
@@ -373,26 +399,23 @@ impl OcrProvider {
         let primary_indices: Vec<usize> = (0..images.len()).filter(|&i| !use_fallback[i]).collect();
         if !primary_indices.is_empty() {
             let primary_prep: Vec<Vec<PreparedLine>> = primary_indices.iter().map(|&i| std::mem::take(&mut prep_all[i])).collect();
-            let recognized = recognize_pages(&mut self.sessions, &self.codec, &self.plan, primary_prep)?;
+            let recognized = recognize_pages(&mut self.engine, &self.codec, &self.plan, primary_prep)?;
             for (idx, lines) in primary_indices.into_iter().zip(recognized) {
                 pages[idx] = lines;
             }
         }
         let fallback_indices: Vec<usize> = (0..images.len()).filter(|&i| use_fallback[i]).collect();
         if !fallback_indices.is_empty() {
-            if self.fallback_session.is_none() {
+            if self.fallback_engine.is_none() {
                 if let Some((ref model_path, ref codec_path)) = self.fallback {
-                    let weights = PrepackedWeights::new();
-                    let fb_sessions = (0..self.plan.workers)
-                        .map(|_| open_session(model_path, self.plan.threads, self.plan.backend, &self.plan.device, self.cpu_arena, &weights, self.independent_pool))
-                        .collect::<Result<Vec<_>>>()?;
+                    let fb_engine = open_recognizer(model_path, &self.plan, self.cpu_arena, self.independent_pool)?;
                     let fb_codec = Codec::load(codec_path)?;
-                    self.fallback_session = Some((fb_sessions, fb_codec));
+                    self.fallback_engine = Some((fb_engine, fb_codec));
                 }
             }
-            if let Some((ref mut fb_sessions, ref fb_codec)) = self.fallback_session {
+            if let Some((ref mut fb_engine, ref fb_codec)) = self.fallback_engine {
                 let fb_prep: Vec<Vec<PreparedLine>> = fallback_indices.iter().map(|&i| std::mem::take(&mut prep_all[i])).collect();
-                let recognized = recognize_pages(fb_sessions, fb_codec, &self.plan, fb_prep)?;
+                let recognized = recognize_pages(fb_engine, fb_codec, &self.plan, fb_prep)?;
                 for (idx, lines) in fallback_indices.into_iter().zip(recognized) {
                     pages[idx] = lines;
                 }
@@ -405,13 +428,13 @@ impl OcrProvider {
                 let flip_ref = [&flipped];
                 let prep = prepare_window_refs(&mut self.layouts, &flip_ref, &flip_ref)?;
                 let re = if use_fallback[i] {
-                    if let Some((ref mut fb_sessions, ref fb_codec)) = self.fallback_session {
-                        recognize_pages(fb_sessions, fb_codec, &self.plan, prep)?
+                    if let Some((ref mut fb_engine, ref fb_codec)) = self.fallback_engine {
+                        recognize_pages(fb_engine, fb_codec, &self.plan, prep)?
                     } else {
                         Vec::new()
                     }
                 } else {
-                    recognize_pages(&mut self.sessions, &self.codec, &self.plan, prep)?
+                    recognize_pages(&mut self.engine, &self.codec, &self.plan, prep)?
                 };
                 if let Some(re_lines) = re.into_iter().next() {
                     if crate::simd_kernel::text_quality_score(&re_lines) > crate::simd_kernel::text_quality_score(page_lines) {
@@ -438,7 +461,7 @@ impl OcrProvider {
         let confidence_pages =
             requests.iter().filter(|request| !request.regions.is_empty()).map(|request| request.page_index).collect::<BTreeSet<_>>();
         let pdf = open_pdf(bytes)?;
-        let Self { sessions, codec, layouts, plan, orientation, .. } = self;
+        let Self { engine, codec, layouts, plan, orientation, .. } = self;
         let orientation = orientation.as_mut().map(Mutex::new);
         let mut results: Vec<OcrPageResult> = requests
             .iter()
@@ -484,7 +507,7 @@ impl OcrProvider {
             });
             scope.spawn(move || {
                 for window in render_receiver {
-                    let value = window.and_then(|pages: Vec<(Placement, GrayImage, GrayImage)>| {
+                    let value = window.and_then(|pages: Vec<(Placement, GrayImage, Option<GrayImage>)>| {
                         let (mut placements, mut seen, mut ink) = (Vec::new(), Vec::new(), Vec::new());
                         for (placement, page, read) in pages {
                             placements.push(placement);
@@ -505,7 +528,7 @@ impl OcrProvider {
                     }
                 }
             });
-            place_pages(&mut results, prepared_receiver, sessions, codec, plan)
+            place_pages(&mut results, prepared_receiver, engine, codec, plan)
         })?;
         Ok(results)
     }
@@ -517,14 +540,14 @@ impl OcrProvider {
 fn place_pages(
     results: &mut [OcrPageResult],
     windows: Receiver<Result<(Vec<Placement>, Vec<Vec<PreparedLine>>)>>,
-    sessions: &mut [Session],
+    engine: &mut RecognizerEngine,
     codec: &Codec,
     plan: &RuntimePlan,
 ) -> Result<()> {
     let mut at = 0;
     for window in windows {
         let (placements, prepared) = window?;
-        for (placement, mut lines) in placements.into_iter().zip(recognize_pages(sessions, codec, plan, prepared)?) {
+        for (placement, mut lines) in placements.into_iter().zip(recognize_pages(engine, codec, plan, prepared)?) {
             place_back(&mut lines, placement.turns, placement.drawn[0], placement.drawn[1]);
             scale_lines(&mut lines, placement.scale);
             translate_lines(&mut lines, placement.origin);
@@ -538,11 +561,11 @@ fn place_pages(
     Ok(())
 }
 
-/// A window's images' lines found on `seen` and cut for reading from `ink`, the same page in the
-/// recognizer's own grey.
-fn prepare_window(layouts: &mut [LineDetector], seen: &[GrayImage], ink: &[GrayImage]) -> Result<Vec<Vec<PreparedLine>>> {
+/// A window's images' lines found on `seen` and cut for reading from `ink`, falling back to `seen`
+/// on monochrome pages where `gray == ink`.
+fn prepare_window(layouts: &mut [LineDetector], seen: &[GrayImage], ink: &[Option<GrayImage>]) -> Result<Vec<Vec<PreparedLine>>> {
     let seen_refs: Vec<&GrayImage> = seen.iter().collect();
-    let ink_refs: Vec<&GrayImage> = ink.iter().collect();
+    let ink_refs: Vec<&GrayImage> = seen.iter().zip(ink).map(|(gray, separate)| separate.as_ref().unwrap_or(gray)).collect();
     prepare_window_refs(layouts, &seen_refs, &ink_refs)
 }
 
@@ -553,8 +576,8 @@ fn prepare_window_refs(layouts: &mut [LineDetector], seen: &[&GrayImage], ink: &
 
 /// Pages' prepared lines read, each kept where it reads as text: a line the page analysis left
 /// out only when the recognizer is sure of it.
-fn recognize_pages(sessions: &mut [Session], codec: &Codec, plan: &RuntimePlan, pages: Vec<Vec<PreparedLine>>) -> Result<Vec<Vec<OcrLine>>> {
-    let recognized = measure("ocr.recognize", || recognize_prepared_pages(sessions, codec, plan, &pages))?;
+fn recognize_pages(engine: &mut RecognizerEngine, codec: &Codec, plan: &RuntimePlan, pages: Vec<Vec<PreparedLine>>) -> Result<Vec<Vec<OcrLine>>> {
+    let recognized = measure("ocr.recognize", || recognize_prepared_pages(engine, codec, plan, &pages))?;
     Ok(pages
         .into_iter()
         .zip(recognized)
@@ -629,20 +652,95 @@ fn layout_boxes_refs(layouts: &mut [LineDetector], images: &[&GrayImage]) -> Res
     })
 }
 
-/// Pages' prepared lines read by the recognizer's sessions, batched by width.
+/// Pages' prepared lines read by the active recognizer (pure-Rust SIMD on CPU, ORT on GPU).
 fn recognize_prepared_pages(
-    sessions: &mut [Session],
+    engine: &mut RecognizerEngine,
     codec: &Codec,
     plan: &RuntimePlan,
     pages: &[Vec<PreparedLine>],
 ) -> Result<Vec<Vec<Recognition>>> {
     let counts = pages.iter().map(Vec::len).collect::<Vec<_>>();
     let lines = pages.iter().flatten().collect::<Vec<_>>();
-    let jobs = recognition_jobs(&lines, plan.batch_size, plan.width_bucket);
-    if jobs.is_empty() {
+    if lines.is_empty() {
         return Ok(counts.into_iter().map(|_| Vec::new()).collect());
     }
-    let workers = jobs.len().min(sessions.len());
+    match engine {
+        RecognizerEngine::Native { model, workers } => {
+            Ok(recognize_prepared_native(model, codec, *workers, &lines, &counts))
+        }
+        RecognizerEngine::Ort(sessions) => {
+            recognize_prepared_ort(sessions, codec, plan, &lines, &counts)
+        }
+    }
+}
+
+fn recognize_single_native(model: &IndraNative, codec: &Codec, line: &PreparedLine, scratch: &mut IndraScratch) -> Recognition {
+    let need_confidence = line.bbox.recovered || line.confidence_required;
+    let (timesteps, step_labels, ctc_spans) = model.recognize_u8(&line.pixels, line.width, need_confidence, scratch);
+    let (text, confidence) = codec.decode(&ctc_spans);
+    let words = line_words(codec, line, &emissions(step_labels.into_iter()), timesteps);
+    Recognition { text, confidence, words }
+}
+
+fn recognize_prepared_native(
+    model: &IndraNative,
+    codec: &Codec,
+    workers: usize,
+    lines: &[&PreparedLine],
+    counts: &[usize],
+) -> Vec<Vec<Recognition>> {
+    let total = lines.len();
+    let worker_count = workers.min(total).max(1);
+    let mut output: Vec<Option<Recognition>> = (0..total).map(|_| None).collect();
+    if worker_count == 1 {
+        let mut scratch = IndraScratch::default();
+        for (slot, line) in output.iter_mut().zip(lines.iter()) {
+            *slot = Some(recognize_single_native(model, codec, line, &mut scratch));
+        }
+    } else {
+        let next = AtomicUsize::new(0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let sender = sender.clone();
+                let next = &next;
+                scope.spawn(move || {
+                    let mut scratch = IndraScratch::default();
+                    let mut local = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= total {
+                            break;
+                        }
+                        local.push((index, recognize_single_native(model, codec, lines[index], &mut scratch)));
+                    }
+                    let _ = sender.send(local);
+                });
+            }
+            drop(sender);
+            for chunk in receiver {
+                for (index, rec) in chunk {
+                    output[index] = Some(rec);
+                }
+            }
+        });
+    }
+    let mut flat = output.into_iter().map(|v| v.expect("every line recognized"));
+    counts.iter().map(|&count| flat.by_ref().take(count).collect()).collect()
+}
+
+fn recognize_prepared_ort(
+    sessions: &mut [Session],
+    codec: &Codec,
+    plan: &RuntimePlan,
+    lines: &[&PreparedLine],
+    counts: &[usize],
+) -> Result<Vec<Vec<Recognition>>> {
+    let jobs = recognition_jobs(lines, plan.batch_size.max(1), plan.width_bucket);
+    if jobs.is_empty() {
+        return Ok(counts.iter().map(|_| Vec::new()).collect());
+    }
+    let workers = jobs.len().min(sessions.len()).max(1);
     let next = AtomicUsize::new(0);
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
@@ -651,16 +749,39 @@ fn recognize_prepared_pages(
             .take(workers)
             .map(|session| {
                 let sender = sender.clone();
-                let (next, jobs, lines) = (&next, &jobs, &lines);
+                let (next, jobs) = (&next, &jobs);
+                let has_class_ids = session.outputs.iter().any(|output| output.name == "class_ids");
                 scope.spawn(move || {
                     let mut pixels = Vec::new();
                     let mut lengths = Vec::new();
+                    let run_opts_ids = has_class_ids
+                        .then(|| {
+                            RunOptions::new()
+                                .map(|opt| opt.with_outputs(OutputSelector::no_default().with("class_ids").with("lengths")))
+                        })
+                        .transpose();
+                    let run_opts_logits = RunOptions::new()
+                        .map(|opt| opt.with_outputs(OutputSelector::no_default().with("logits").with("lengths")));
+                    let (Ok(run_opts_ids), Ok(run_opts_logits)) = (run_opts_ids, run_opts_logits) else {
+                        let _ = sender.send(Err(Error::Message("Indra ONNX RunOptions setup failed".to_owned())));
+                        return;
+                    };
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         if index >= jobs.len() {
                             break;
                         }
-                        let value = recognize_batch(session, codec, lines, &jobs[index], &mut pixels, &mut lengths);
+                        let (need_logits, ref batch) = jobs[index];
+                        let opts = if !need_logits {
+                            if let Some(ref ids_opt) = run_opts_ids {
+                                ids_opt
+                            } else {
+                                &run_opts_logits
+                            }
+                        } else {
+                            &run_opts_logits
+                        };
+                        let value = recognize_batch(session, opts, codec, lines, batch, &mut pixels, &mut lengths);
                         let failed = value.is_err();
                         if sender.send(value).is_err() || failed {
                             break;
@@ -695,20 +816,25 @@ fn recognize_prepared_pages(
             .map(|value| value.ok_or_else(|| Error::Message("Indra worker returned no line".to_owned())))
             .collect::<Result<Vec<_>>>()?
             .into_iter();
-        Ok(counts.into_iter().map(|count| output.by_ref().take(count).collect()).collect())
+        Ok(counts.iter().map(|&count| output.by_ref().take(count).collect()).collect())
     })
 }
 
-fn recognition_jobs(lines: &[&PreparedLine], batch_size: usize, _width_bucket: usize) -> Vec<Vec<usize>> {
-    let mut order = (0..lines.len()).collect::<Vec<_>>();
+fn push_width_batches(
+    lines: &[&PreparedLine],
+    mut order: Vec<usize>,
+    batch_size: usize,
+    width_slack: usize,
+    need_logits: bool,
+    jobs: &mut Vec<(bool, Vec<usize>)>,
+) {
     order.sort_unstable_by_key(|&i| lines[i].width);
-    let mut jobs = Vec::new();
     let mut cur = Vec::with_capacity(batch_size);
     let mut min_w = 0usize;
     for idx in order {
         let w = lines[idx].width;
-        if !cur.is_empty() && (cur.len() >= batch_size || cur.len() * w.saturating_sub(min_w) > 128) {
-            jobs.push(std::mem::take(&mut cur));
+        if !cur.is_empty() && (cur.len() >= batch_size || cur.len() * w.saturating_sub(min_w) > width_slack) {
+            jobs.push((need_logits, std::mem::take(&mut cur)));
         }
         if cur.is_empty() {
             min_w = w;
@@ -716,15 +842,32 @@ fn recognition_jobs(lines: &[&PreparedLine], batch_size: usize, _width_bucket: u
         cur.push(idx);
     }
     if !cur.is_empty() {
-        jobs.push(cur);
+        jobs.push((need_logits, cur));
     }
-    jobs.sort_unstable_by_key(|job| std::cmp::Reverse(job.len() * lines[*job.last().unwrap()].width));
+}
+
+fn recognition_jobs(lines: &[&PreparedLine], batch_size: usize, width_bucket: usize) -> Vec<(bool, Vec<usize>)> {
+    let width_slack = if width_bucket > 0 { width_bucket } else { 128 };
+    let mut fast = Vec::new();
+    let mut conf = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.bbox.recovered || line.confidence_required {
+            conf.push(i);
+        } else {
+            fast.push(i);
+        }
+    }
+    let mut jobs = Vec::new();
+    push_width_batches(lines, fast, batch_size, width_slack, false, &mut jobs);
+    push_width_batches(lines, conf, batch_size, width_slack, true, &mut jobs);
+    jobs.sort_unstable_by_key(|(_, job)| std::cmp::Reverse(job.len() * lines[*job.last().unwrap()].width));
     jobs
 }
 
 /// One batch of lines read: each with its text, confidence and words.
 fn recognize_batch(
     session: &mut Session,
+    run_options: &RunOptions<HasSelectedOutputs>,
     codec: &Codec,
     lines: &[&PreparedLine],
     batch: &[usize],
@@ -733,7 +876,6 @@ fn recognize_batch(
 ) -> Result<Vec<(usize, Recognition)>> {
     let maximum = batch.iter().map(|&index| lines[index].width).max().unwrap_or(1).div_ceil(8) * 8;
     pixels.resize(batch.len() * INPUT_HEIGHT * maximum, 0.0);
-    pixels.fill(0.0);
     lengths.clear();
     for (local, &index) in batch.iter().enumerate() {
         let line = lines[index];
@@ -745,17 +887,15 @@ fn recognize_batch(
                 &line.pixels[source..source + line.width],
                 &mut pixels[target..target + line.width],
             );
+            if line.width < maximum {
+                pixels[target + line.width..target + maximum].fill(0.0);
+            }
         }
     }
     let image = TensorRef::from_array_view(([batch.len(), 1, INPUT_HEIGHT, maximum], pixels.as_slice())).map_err(ort_error)?;
     let sequence_lengths = TensorRef::from_array_view(([batch.len()], lengths.as_slice())).map_err(ort_error)?;
-    let has_class_ids = session.outputs.iter().any(|output| output.name == "class_ids");
-    let use_ids = has_class_ids && !batch.iter().any(|&index| lines[index].bbox.recovered || lines[index].confidence_required);
-    let run_options = RunOptions::new()
-        .map_err(ort_error)?
-        .with_outputs(OutputSelector::no_default().with(if use_ids { "class_ids" } else { "logits" }).with("lengths"));
     let outputs = session
-        .run_with_options(ort::inputs!["image" => image, "widths" => sequence_lengths], &run_options)
+        .run_with_options(ort::inputs!["image" => image, "widths" => sequence_lengths], run_options)
         .map_err(ort_error)?;
     let (length_shape, output_lengths) = if let Ok((shape, values)) = outputs["lengths"].try_extract_tensor::<i64>() {
         (shape.iter().copied().collect::<Vec<_>>(), values.iter().map(|&value| usize::try_from(value).unwrap_or(0)).collect::<Vec<_>>())
@@ -796,10 +936,9 @@ fn recognize_batch(
         .enumerate()
         .map(|(local, &index)| {
             let length = output_lengths[local].clamp(1, timesteps);
-            let (text, confidence) = codec.decode(&greedy_ctc(logits, local, classes, timesteps, length));
-            let steps =
-                best_labels(logits, local, classes, timesteps, length).into_iter().map(|label| (label != BLANK_LABEL).then_some(label));
-            let words = line_words(codec, lines[index], &emissions(steps), length);
+            let (spans, steps) = greedy_ctc_and_steps(logits, local, classes, timesteps, length);
+            let (text, confidence) = codec.decode(&spans);
+            let words = line_words(codec, lines[index], &emissions(steps.into_iter()), length);
             (index, Recognition { text, confidence, words })
         })
         .collect())
@@ -811,7 +950,7 @@ fn render_pdf_pages(
     pages: &PageRenderer,
     requests: &[OcrPageRequest],
     orientation: Option<&Mutex<&mut Orientation>>,
-) -> Result<Vec<(Placement, GrayImage, GrayImage)>> {
+) -> Result<Vec<(Placement, GrayImage, Option<GrayImage>)>> {
     // White margin around a part of a page, so the layout reads its first and last lines whole.
     const MARGIN: usize = 16;
     let mut rendered = Vec::new();
@@ -821,10 +960,12 @@ fn render_pdf_pages(
             .ok_or_else(|| Error::Message(format!("OCR renderer could not draw page {}", request.page_index + 1)))?;
         let (width, height) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
         let scale = [request.width / width as f64, request.height / height as f64];
-        let gray = GrayImage::from_raw(width as u32, height as u32, crate::ocr::gray_of(&pixmap))
+        let (gray_raw, ink_raw) = crate::ocr::gray_and_ink_of(&pixmap);
+        let gray = GrayImage::from_raw(width as u32, height as u32, gray_raw)
             .expect("renderer dimensions match its pixel buffer");
-        let ink = GrayImage::from_raw(width as u32, height as u32, crate::ocr::ink_of(&pixmap))
-            .expect("renderer dimensions match its pixel buffer");
+        let ink = ink_raw.map(|buf| {
+            GrayImage::from_raw(width as u32, height as u32, buf).expect("renderer dimensions match its pixel buffer")
+        });
         if request.regions.is_empty() {
             let turns = match orientation {
                 Some(orientation) => {
@@ -836,7 +977,7 @@ fn render_pdf_pages(
             };
             // A turned page's rule runs across its print, not across the page as drawn.
             let separator = (turns == 0).then(|| crate::separator::separator_y(gray.as_raw(), width, height, request.height)).flatten();
-            let (image, ink) = if turns == 0 { (gray, ink) } else { (turn(&gray, turns), turn(&ink, turns)) };
+            let (image, ink) = if turns == 0 { (gray, ink) } else { (turn(&gray, turns), ink.map(|img| turn(&img, turns))) };
             let drawn = [width as f64, height as f64];
             rendered.push((Placement { page_index: request.page_index, separator, scale, origin: [0.0, 0.0], turns, drawn }, image, ink));
             continue;
@@ -857,7 +998,11 @@ fn render_pdf_pages(
                 crop
             };
             let origin = [(x0 as f64 - MARGIN as f64) * scale[0], (y0 as f64 - MARGIN as f64) * scale[1]];
-            rendered.push((Placement { page_index: request.page_index, separator: None, scale, origin, turns: 0, drawn: [0.0, 0.0] }, framed(&gray), framed(&ink)));
+            rendered.push((
+                Placement { page_index: request.page_index, separator: None, scale, origin, turns: 0, drawn: [0.0, 0.0] },
+                framed(&gray),
+                ink.as_ref().map(|img| framed(img)),
+            ));
         }
     }
     Ok(rendered)
@@ -1030,7 +1175,7 @@ pub(crate) fn ort_error(error: ort::Error) -> Error {
 /// A line of a grey page cut out and prepared for reading: its ink's bounds padded with white (a
 /// third of its height at each side, `VERTICAL_MARGIN` of it above and below) and scaled to the
 /// recognizer's height.
-fn prepare_line(image: &GrayImage, bbox: LineBox) -> Option<PreparedLine> {
+fn prepare_line(image: &GrayImage, bbox: LineBox, scratch: &mut crate::simd_kernel::DownsampleScratch) -> Option<PreparedLine> {
     let bw = bbox.width();
     let bh = bbox.height();
     if bw == 0 || bh == 0 {
@@ -1058,14 +1203,19 @@ fn prepare_line(image: &GrayImage, bbox: LineBox) -> Option<PreparedLine> {
     let padded_height = ch + 2 * py;
     let width = (padded_width as f32 * INPUT_HEIGHT as f32 / padded_height as f32).round().clamp(8.0, 4096.0) as usize;
     let pixels = if padded_height > 48 {
-        let mut padded = GrayImage::from_pixel(padded_width as u32, padded_height as u32, image::Luma([255]));
-        let dst_raw = padded.as_mut();
-        for row in 0..ch {
-            let s = (bbox.top + y0 + row) * stride + bbox.left + x0;
-            let d = (py + row) * padded_width + px;
-            dst_raw[d..d + cw].copy_from_slice(&raw[s..s + cw]);
-        }
-        imageops::resize(&padded, width as u32, INPUT_HEIGHT as u32, imageops::FilterType::Triangle).into_raw()
+        crate::simd_kernel::resize_cropped_padded_triangle_u8(
+            raw,
+            stride,
+            bbox.left + x0,
+            bbox.top + y0,
+            cw,
+            ch,
+            px,
+            py,
+            width,
+            INPUT_HEIGHT,
+            scratch,
+        )
     } else {
         crate::simd_kernel::resize_cropped_padded_bilinear(
             raw,
@@ -1100,14 +1250,17 @@ fn prepare_pages_refs(images: &[&GrayImage], boxes: &[Vec<LineBox>]) -> Result<V
             .map(|_| {
                 let sender = sender.clone();
                 let next = &next;
-                scope.spawn(move || loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= images.len() {
-                        break;
-                    }
-                    let lines = boxes[index].iter().filter_map(|&bbox| prepare_line(images[index], bbox)).collect();
-                    if sender.send((index, lines)).is_err() {
-                        break;
+                scope.spawn(move || {
+                    let mut scratch = crate::simd_kernel::DownsampleScratch::default();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= images.len() {
+                            break;
+                        }
+                        let lines = boxes[index].iter().filter_map(|&bbox| prepare_line(images[index], bbox, &mut scratch)).collect();
+                        if sender.send((index, lines)).is_err() {
+                            break;
+                        }
                     }
                 })
             })
@@ -1122,19 +1275,6 @@ fn prepare_pages_refs(images: &[&GrayImage], boxes: &[Vec<LineBox>]) -> Result<V
         }
         output.into_iter().map(|lines| lines.ok_or_else(|| Error::Message("line preparation returned no page".to_owned()))).collect()
     })
-}
-
-/// Each timestep's most likely label, as `greedy_ctc` reads it.
-fn best_labels(logits: &[f32], batch: usize, classes: usize, timesteps: usize, length: usize) -> Vec<usize> {
-    logits[batch * timesteps * classes..][..length * classes]
-        .chunks_exact(classes)
-        .map(|step| {
-            step.iter()
-                .enumerate()
-                .fold((0, f32::NEG_INFINITY), |best, (label, &value)| if value > best.1 { (label, value) } else { best })
-                .0
-        })
-        .collect()
 }
 
 /// The labels a greedy CTC reading emits, each with the first and last timestep of its run:
@@ -1293,26 +1433,276 @@ fn greedy_ids(ids: &[i64], batch: usize, timesteps: usize, length: usize) -> Vec
     output
 }
 
-fn greedy_ctc(logits: &[f32], batch: usize, classes: usize, timesteps: usize, length: usize) -> Vec<(usize, f32)> {
-    let labels = best_labels(logits, batch, classes, timesteps, length);
-    let denominators = logits[batch * timesteps * classes..][..length * classes]
-        .chunks_exact(classes)
-        .zip(&labels)
-        .map(|(step, &label)| step.iter().map(|&value| (value - step[label]).exp()).sum::<f32>())
-        .collect::<Vec<_>>();
-    let mut output = Vec::new();
+/// Single-pass argmax + softmax confidence over a `[length, classes]` logit slice.
+fn greedy_ctc_and_steps(
+    logits: &[f32],
+    batch: usize,
+    classes: usize,
+    timesteps: usize,
+    length: usize,
+) -> (Vec<(usize, f32)>, Vec<Option<usize>>) {
+    let mut output: Vec<(usize, f32)> = Vec::new();
+    let mut steps = Vec::with_capacity(length);
     let mut previous = usize::MAX;
-    for (timestep, &label) in labels.iter().enumerate() {
-        if label != previous && label != BLANK_LABEL {
-            let confidence = 1.0 / denominators[timestep].max(f32::MIN_POSITIVE);
-            output.push((label, confidence));
-        } else if label == previous && label != BLANK_LABEL {
-            if let Some((_, score)) = output.last_mut() {
-                let confidence = 1.0 / denominators[timestep].max(f32::MIN_POSITIVE);
+    for step in logits[batch * timesteps * classes..][..length * classes].chunks_exact(classes) {
+        let (label, best_val) = step
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |best, (idx, &val)| if val > best.1 { (idx, val) } else { best });
+        steps.push((label != BLANK_LABEL).then_some(label));
+        if label != BLANK_LABEL {
+            let denom: f32 = step.iter().map(|&val| (val - best_val).exp()).sum();
+            let confidence = 1.0 / denom.max(f32::MIN_POSITIVE);
+            if label != previous {
+                output.push((label, confidence));
+            } else if let Some((_, score)) = output.last_mut() {
                 *score = score.max(confidence);
             }
         }
         previous = label;
     }
-    output
+    (output, steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn synthetic_text_line(width: usize) -> Vec<u8> {
+        let mut buf = vec![255u8; INPUT_HEIGHT * width];
+        let mut x = 8usize;
+        let mut step = 0usize;
+        while x + 10 < width {
+            let h0 = 6 + (step % 4);
+            let h1 = 24 - (step % 3);
+            for y in h0..h1 {
+                for dx in 0..2 {
+                    buf[y * width + x + dx] = 16;
+                }
+                if step % 2 == 0 && (y == h0 || y == (h0 + h1) / 2 || y == h1 - 1) {
+                    for dx in 2..7 {
+                        buf[y * width + x + dx] = 24;
+                    }
+                }
+                if step % 3 == 0 {
+                    for dx in 6..8 {
+                        buf[y * width + x + dx] = 28;
+                    }
+                }
+            }
+            x += if step % 5 == 4 { 18 } else { 11 };
+            step += 1;
+        }
+        buf
+    }
+
+    #[test]
+    fn indra_native_matches_ort_and_benchmarks() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let runtime_dir = manifest_dir.parent().unwrap().join("runtime");
+        let ort_dll = runtime_dir.join("onnx/onnxruntime.dll");
+        if !ort_dll.is_file() {
+            eprintln!("skipping ORT parity test: {} not found", ort_dll.display());
+            return;
+        }
+        legal_pdf_core::init_ort_runtime(&ort_dll, None).expect("init ort runtime");
+
+        let weights = PrepackedWeights::new();
+        let codec_path = runtime_dir.join("indra/assets/indra-followup/student8cropids/codec.json");
+        let codec = Codec::load(&codec_path).expect("load codec");
+
+        let models = [
+            ("student8cropids", runtime_dir.join("indra/assets/indra-followup/student8cropids/model.onnx")),
+            ("student10c64cropids", runtime_dir.join("indra/assets/indra-followup/student10c64cropids/model.onnx")),
+        ];
+
+        for (label, model_path) in &models {
+            if !model_path.is_file() {
+                continue;
+            }
+            let native = IndraNative::from_onnx_path(model_path).expect("load IndraNative");
+            let mut session = open_session(model_path, 1, OrtBackend::Cpu, "cpu", true, &weights, false)
+                .expect("open ORT session");
+            let mut scratch = IndraScratch::default();
+
+            for &width in &[128usize, 133, 320, 640] {
+                let u8_line = synthetic_text_line(width);
+                let maximum = width.div_ceil(8) * 8;
+                let mut f32_input = vec![0.0_f32; INPUT_HEIGHT * maximum];
+                for r in 0..INPUT_HEIGHT {
+                    crate::simd_kernel::u8_to_norm_f32_row(
+                        &u8_line[r * width..(r + 1) * width],
+                        &mut f32_input[r * maximum..r * maximum + width],
+                    );
+                }
+
+                let width_arr = [width as i64];
+                let image = TensorRef::from_array_view(([1usize, 1, INPUT_HEIGHT, maximum], f32_input.as_slice())).unwrap();
+                let widths = TensorRef::from_array_view(([1usize], width_arr.as_slice())).unwrap();
+                let outputs = session.run(ort::inputs!["image" => image, "widths" => widths]).unwrap();
+                let (l_shape, l_data) = outputs["logits"].try_extract_tensor::<f32>().unwrap();
+                let (_, ids_data) = outputs["class_ids"].try_extract_tensor::<i64>().unwrap();
+                let (_, len_data) = outputs["lengths"].try_extract_tensor::<i64>().unwrap();
+
+                let ort_len = len_data[0] as usize;
+                let ort_t = l_shape[1] as usize;
+                let vocab = l_shape[2] as usize;
+
+                let (nat_t_f32, nat_logits) = native.forward_logits_f32(&f32_input, maximum, width, &mut scratch);
+                assert_eq!(nat_t_f32, ort_len, "{label} width={width}: timesteps mismatch");
+                assert_eq!(vocab, native.vocab_size());
+
+                let mut max_diff = 0.0_f32;
+                for t in 0..ort_len {
+                    for c in 0..vocab {
+                        let d = (nat_logits[t * vocab + c] - l_data[t * vocab + c]).abs();
+                        if d > max_diff {
+                            max_diff = d;
+                        }
+                    }
+                }
+                assert!(
+                    max_diff < 1e-4,
+                    "{label} width={width}: max logit diff {max_diff} >= 1e-4 (ort_t={ort_t})"
+                );
+
+                let (nat_t_u8, step_labels, ctc_spans) = native.recognize_u8(&u8_line, width, true, &mut scratch);
+                assert_eq!(nat_t_u8, ort_len);
+                for t in 0..ort_len {
+                    let ort_id = usize::try_from(ids_data[t]).unwrap();
+                    let nat_id = step_labels[t].unwrap_or(0);
+                    assert_eq!(nat_id, ort_id, "{label} width={width} t={t}: class_id mismatch");
+                }
+                let ort_text = codec.decode(&greedy_ids(ids_data, 0, ort_t, ort_len)).0;
+                let (nat_text, nat_conf) = codec.decode(&ctc_spans);
+                assert_eq!(nat_text, ort_text, "{label} width={width}: decoded text mismatch");
+                let ort_conf = codec.decode(&greedy_ctc_and_steps(l_data, 0, vocab, ort_t, ort_len).0).1;
+                assert!(
+                    (nat_conf - ort_conf).abs() < 1e-4,
+                    "{label} width={width}: confidence diff {} vs {}",
+                    nat_conf,
+                    ort_conf
+                );
+                eprintln!("[parity] {label} width={width}: max_logit_diff={max_diff:.2e} text={nat_text:?}");
+            }
+
+            if *label == "student8cropids" {
+                let width = 320usize;
+                let u8_line = synthetic_text_line(width);
+                let mut f32_input = vec![0.0_f32; INPUT_HEIGHT * width];
+                for r in 0..INPUT_HEIGHT {
+                    crate::simd_kernel::u8_to_norm_f32_row(
+                        &u8_line[r * width..(r + 1) * width],
+                        &mut f32_input[r * width..(r + 1) * width],
+                    );
+                }
+                let run_opts = RunOptions::new()
+                    .unwrap()
+                    .with_outputs(OutputSelector::no_default().with("class_ids").with("lengths"));
+                let width_arr = [width as i64];
+                for _ in 0..10 {
+                    let image = TensorRef::from_array_view(([1usize, 1, INPUT_HEIGHT, width], f32_input.as_slice())).unwrap();
+                    let widths = TensorRef::from_array_view(([1usize], width_arr.as_slice())).unwrap();
+                    let _ = session.run_with_options(ort::inputs!["image" => image, "widths" => widths], &run_opts).unwrap();
+                    let _ = native.recognize_u8(&u8_line, width, false, &mut scratch);
+                }
+                let iters = 150usize;
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    for r in 0..INPUT_HEIGHT {
+                        crate::simd_kernel::u8_to_norm_f32_row(
+                            &u8_line[r * width..(r + 1) * width],
+                            &mut f32_input[r * width..(r + 1) * width],
+                        );
+                    }
+                    let image = TensorRef::from_array_view(([1usize, 1, INPUT_HEIGHT, width], f32_input.as_slice())).unwrap();
+                    let widths = TensorRef::from_array_view(([1usize], width_arr.as_slice())).unwrap();
+                    let outputs = session.run_with_options(ort::inputs!["image" => image, "widths" => widths], &run_opts).unwrap();
+                    let _ = outputs["class_ids"].try_extract_tensor::<i64>().unwrap();
+                }
+                let ort_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+                let t1 = Instant::now();
+                for _ in 0..iters {
+                    let _ = native.recognize_u8(&u8_line, width, false, &mut scratch);
+                }
+                let native_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+                eprintln!(
+                    "[bench] {label} single-line width={width}: ORT={ort_ms:.3}ms/line, IndraNative={native_ms:.3}ms/line, speedup={:.2}x",
+                    ort_ms / native_ms.max(1e-9)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn triangle_downscaler_matches_imageops_resize() {
+        let mut page = GrayImage::from_pixel(900, 120, Luma([255]));
+        for y in 20..88usize {
+            for x in 30..820usize {
+                if (x / 7 + y / 5) % 2 == 0 {
+                    page.put_pixel(x as u32, y as u32, Luma([((x * 13 + y * 7) % 180) as u8]));
+                }
+            }
+        }
+        let bbox = LineBox { left: 20, top: 15, right: 830, bottom: 95, recovered: false };
+        let stride = page.width() as usize;
+        let raw = page.as_raw();
+        let (ix0, iy0, ix1, iy1) = crate::simd_kernel::find_ink_bbox(raw, stride, bbox.left, bbox.top, bbox.width(), bbox.height(), 220).unwrap();
+        let px = ((iy1 - iy0) as f64 * 0.3).ceil() as usize;
+        let py = ((iy1 - iy0) as f64 * VERTICAL_MARGIN).ceil() as usize;
+        let cw = ix1 - ix0;
+        let ch = iy1 - iy0;
+        let pw = cw + 2 * px;
+        let ph = ch + 2 * py;
+        assert!(ph > 48);
+        let dst_w = (pw as f32 * INPUT_HEIGHT as f32 / ph as f32).round().clamp(8.0, 4096.0) as usize;
+
+        let mut padded = GrayImage::from_pixel(pw as u32, ph as u32, Luma([255]));
+        for row in 0..ch {
+            let s = (bbox.top + iy0 + row) * stride + bbox.left + ix0;
+            let d = (py + row) * pw + px;
+            padded.as_mut()[d..d + cw].copy_from_slice(&raw[s..s + cw]);
+        }
+        let expected = imageops::resize(&padded, dst_w as u32, INPUT_HEIGHT as u32, imageops::FilterType::Triangle).into_raw();
+
+        let mut scratch = crate::simd_kernel::DownsampleScratch::default();
+        let actual = crate::simd_kernel::resize_cropped_padded_triangle_u8(
+            raw,
+            stride,
+            bbox.left + ix0,
+            bbox.top + iy0,
+            cw,
+            ch,
+            px,
+            py,
+            dst_w,
+            INPUT_HEIGHT,
+            &mut scratch,
+        );
+        assert_eq!(actual.len(), expected.len());
+        let max_px_diff = actual.iter().zip(&expected).map(|(&a, &b)| a.abs_diff(b)).max().unwrap_or(0);
+        assert!(max_px_diff <= 1, "max triangle resize pixel diff {max_px_diff} > 1");
+    }
+
+    #[test]
+    fn gray_and_ink_of_monochrome_and_color() {
+        let mut mono = Vec::with_capacity(8 * 4);
+        for idx in 0..8usize {
+            let v = (idx * 31) as u8;
+            mono.extend_from_slice(&[v, v, v, 255]);
+        }
+        let (gray, ink) = crate::ocr::gray_and_ink_of_rgba(&mono);
+        assert!(ink.is_none(), "monochrome rgba should skip duplicate ink buffer");
+        assert_eq!(gray, crate::ocr::gray_of_rgba(&mono));
+
+        let colored: Vec<u8> = [255u8, 255, 255, 255, 200, 100, 40, 255, 50, 50, 50, 255].into();
+        let (gray_c, ink_c) = crate::ocr::gray_and_ink_of_rgba(&colored);
+        let ink_c = ink_c.expect("colored rgba should compute separate ink buffer");
+        assert_eq!(gray_c, crate::ocr::gray_of_rgba(&colored));
+        assert_eq!(ink_c[0], 255);
+        assert_eq!(ink_c[1], ((200 + 100 + 40 + 1) / 3) as u8);
+        assert_eq!(ink_c[2], 50);
+    }
 }
