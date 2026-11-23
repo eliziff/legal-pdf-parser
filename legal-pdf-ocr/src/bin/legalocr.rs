@@ -201,6 +201,7 @@ fn run() -> Result<()> {
     let first = Instant::now();
     let mut pages = recognize()?;
     let first_document_seconds = first.elapsed().as_secs_f64();
+    legal_pdf_core::profile::tallied();
     let mut runs = vec![first_document_seconds];
     if repeat > 1 {
         runs.clear();
@@ -208,6 +209,7 @@ fn run() -> Result<()> {
             let begin = Instant::now();
             pages = recognize()?;
             runs.push(begin.elapsed().as_secs_f64());
+            legal_pdf_core::profile::tallied();
         }
     }
     let mut sorted = runs.clone();

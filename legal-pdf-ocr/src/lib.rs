@@ -1,3 +1,4 @@
+pub mod detector_native;
 mod gutter;
 mod indra;
 pub mod indra_native;

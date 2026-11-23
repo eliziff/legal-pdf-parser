@@ -1,3 +1,4 @@
+use crate::detector_native::{DetectorNative, DetectorScratch};
 use crate::indra::{open_session, ort_error, LineBox};
 use image::GrayImage;
 use legal_pdf_core::{Error, OrtBackend, Result};
@@ -6,10 +7,22 @@ use ort::{
     value::TensorRef,
 };
 use std::path::Path;
+use std::sync::Arc;
+
+enum DetectorEngine {
+    Native {
+        model: Arc<DetectorNative>,
+        scratch: DetectorScratch,
+    },
+    Ort {
+        session: Session,
+        input_name: String,
+    },
+}
 
 /// Indra's line detector: a page's lines, in reading order.
 pub(crate) struct LineDetector {
-    session: Session,
+    engine: DetectorEngine,
     side: usize,
     input: Vec<f32>,
     scratch: crate::simd_kernel::DownsampleScratch,
@@ -18,15 +31,45 @@ pub(crate) struct LineDetector {
 }
 
 impl LineDetector {
-    pub fn open(path: &Path, side: usize, backend: OrtBackend, device: &str, independent_pool: bool) -> Result<Self> {
-        Ok(Self {
-            session: open_session(path, 1, backend, device, true, &PrepackedWeights::new(), independent_pool)?,
-            side,
-            input: Vec::new(),
-            scratch: crate::simd_kernel::DownsampleScratch::default(),
-            mask: Vec::new(),
-            queue: Vec::new(),
-        })
+    pub fn open_group(
+        path: &Path,
+        count: usize,
+        side: usize,
+        backend: OrtBackend,
+        device: &str,
+        independent_pool: bool,
+    ) -> Result<Vec<Self>> {
+        let count = count.max(1);
+        if backend == OrtBackend::Cpu {
+            let model = Arc::new(DetectorNative::from_onnx_path(path).map_err(Error::Message)?);
+            return Ok((0..count)
+                .map(|_| Self {
+                    engine: DetectorEngine::Native {
+                        model: Arc::clone(&model),
+                        scratch: DetectorScratch::default(),
+                    },
+                    side,
+                    input: Vec::new(),
+                    scratch: crate::simd_kernel::DownsampleScratch::default(),
+                    mask: Vec::new(),
+                    queue: Vec::new(),
+                })
+                .collect());
+        }
+        (0..count)
+            .map(|_| {
+                let session = open_session(path, 1, backend, device, true, &PrepackedWeights::new(), independent_pool)?;
+                let input_name = session.inputs[0].name.clone();
+                Ok(Self {
+                    engine: DetectorEngine::Ort { session, input_name },
+                    side,
+                    input: Vec::new(),
+                    scratch: crate::simd_kernel::DownsampleScratch::default(),
+                    mask: Vec::new(),
+                    queue: Vec::new(),
+                })
+            })
+            .collect()
     }
 
     pub fn lines(&mut self, image: &GrayImage) -> Result<Vec<LineBox>> {
@@ -45,34 +88,43 @@ impl LineDetector {
             &mut self.input,
             &mut self.scratch,
         );
-        let tensor =
-            TensorRef::from_array_view(([1, 1, input_height, input_width], self.input.as_slice()))
-                .map_err(ort_error)?;
-        let name = self.session.inputs[0].name.clone();
-        let outputs = self
-            .session
-            .run(ort::inputs![name => tensor])
-            .map_err(ort_error)?;
-        let (shape, values) = outputs[0].try_extract_tensor::<f32>().map_err(ort_error)?;
-        if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 || shape[2] <= 0 || shape[3] <= 0 {
-            return Err(Error::Message(format!(
-                "Indra detector returned unexpected dimensions {shape:?}"
-            )));
-        }
-        let mut boxes = crate::gutter::split_across_gutters(
-            image.as_raw(),
-            width as usize,
-            decode(
-                values,
-                shape[3] as usize,
-                shape[2] as usize,
-                scale,
-                width as usize,
-                height as usize,
-                &mut self.mask,
-                &mut self.queue,
-            ),
-        );
+        let raw_boxes = match &mut self.engine {
+            DetectorEngine::Native { model, scratch } => {
+                let out = model.run(&self.input, input_height, input_width, scratch);
+                decode(
+                    out,
+                    input_width / 2,
+                    input_height / 2,
+                    scale,
+                    width as usize,
+                    height as usize,
+                    &mut self.mask,
+                    &mut self.queue,
+                )
+            }
+            DetectorEngine::Ort { session, input_name } => {
+                let tensor = TensorRef::from_array_view(([1, 1, input_height, input_width], self.input.as_slice()))
+                    .map_err(ort_error)?;
+                let outputs = session.run(ort::inputs![input_name.as_str() => tensor]).map_err(ort_error)?;
+                let (shape, values) = outputs[0].try_extract_tensor::<f32>().map_err(ort_error)?;
+                if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 || shape[2] <= 0 || shape[3] <= 0 {
+                    return Err(Error::Message(format!(
+                        "Indra detector returned unexpected dimensions {shape:?}"
+                    )));
+                }
+                decode(
+                    values,
+                    shape[3] as usize,
+                    shape[2] as usize,
+                    scale,
+                    width as usize,
+                    height as usize,
+                    &mut self.mask,
+                    &mut self.queue,
+                )
+            }
+        };
+        let mut boxes = crate::gutter::split_across_gutters(image.as_raw(), width as usize, raw_boxes);
         xycut(&mut boxes);
         let boxes = crate::uncovered::recover_uncovered_lines(image.as_raw(), width as usize, height as usize, boxes);
         Ok(

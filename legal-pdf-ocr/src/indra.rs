@@ -329,9 +329,7 @@ impl OcrProvider {
         let (layouts, engine) = std::thread::scope(|scope| -> Result<_> {
             // Independent model pools can initialize together; CPU recognition loads weights directly.
             let layouts = scope.spawn(|| {
-                (0..plan.layout_workers)
-                    .map(|_| LineDetector::open(&pack.detector, pack.detector_side, plan.backend, &plan.device, independent_pool))
-                    .collect::<Result<Vec<_>>>()
+                LineDetector::open_group(&pack.detector, plan.layout_workers, pack.detector_side, plan.backend, &plan.device, independent_pool)
             });
             let engine = open_recognizer(&pack.model, plan, options.cpu_arena, independent_pool);
             let layouts = layouts.join().map_err(|_| Error::Message("layout initialization worker panicked".into()))??;
@@ -454,8 +452,7 @@ impl OcrProvider {
         }
         let window_size = preparation_window_size(requests.len());
         let available = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let occupied = self.plan.workers * self.plan.threads + self.plan.layout_workers;
-        let render_workers = available.saturating_sub(occupied + 1).clamp(1, 4).min(window_size);
+        let render_workers = available.div_ceil(4).clamp(1, 3).min(window_size);
         let dpi = f64::from(self.dpi);
         // Picture regions use real confidence to distinguish print from seals and chart lettering.
         let confidence_pages =
@@ -467,68 +464,70 @@ impl OcrProvider {
             .iter()
             .map(|request| OcrPageResult { page_index: request.page_index, lines: Vec::new(), separator_y: None })
             .collect();
-        std::thread::scope(|scope| -> Result<()> {
-            let (render_sender, render_receiver) = sync_channel(1);
-            let (prepared_sender, prepared_receiver) = sync_channel(1);
-            let (pdf, orientation) = (&pdf, orientation.as_ref());
-            scope.spawn(move || {
-                std::thread::scope(|render_scope| {
-                    let mut queues = Vec::new();
-                    for worker in 0..render_workers {
-                        let (sender, receiver) = sync_channel(0);
-                        queues.push(receiver);
-                        render_scope.spawn(move || {
-                            // Share the parsed PDF; each worker draws with its own render cache.
-                            let pages = PageRenderer::new(pdf, dpi);
-                            for window in requests.chunks(window_size) {
-                                let start = worker * window.len() / render_workers;
-                                let end = (worker + 1) * window.len() / render_workers;
-                                let rendered = measure("ocr.render", || render_pdf_pages(&pages, &window[start..end], orientation));
-                                let failed = rendered.is_err();
-                                if sender.send(rendered).is_err() || failed {
-                                    break;
+        measure("ocr.total", || {
+            std::thread::scope(|scope| -> Result<()> {
+                let (render_sender, render_receiver) = sync_channel(1);
+                let (prepared_sender, prepared_receiver) = sync_channel(1);
+                let (pdf, orientation) = (&pdf, orientation.as_ref());
+                scope.spawn(move || {
+                    std::thread::scope(|render_scope| {
+                        let mut queues = Vec::new();
+                        for worker in 0..render_workers {
+                            let (sender, receiver) = sync_channel(0);
+                            queues.push(receiver);
+                            render_scope.spawn(move || {
+                                // Share the parsed PDF; each worker draws with its own render cache.
+                                let pages = PageRenderer::new(pdf, dpi);
+                                for window in requests.chunks(window_size) {
+                                    let start = worker * window.len() / render_workers;
+                                    let end = (worker + 1) * window.len() / render_workers;
+                                    let rendered = measure("ocr.render", || render_pdf_pages(&pages, &window[start..end], orientation));
+                                    let failed = rendered.is_err();
+                                    if sender.send(rendered).is_err() || failed {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                        for _ in requests.chunks(window_size) {
+                            let value = queues.iter().try_fold(Vec::new(), |mut pages, queue| {
+                                pages.extend(queue.recv().map_err(|_| Error::Message("PDF render worker stopped before returning its pages".into()))??);
+                                Ok(pages)
+                            });
+                            let failed = value.is_err();
+                            if render_sender.send(value).is_err() || failed {
+                                break;
+                            }
+                        }
+                        // Closing every rendezvous queue also unblocks workers if a downstream stage fails.
+                        drop(queues);
+                    });
+                });
+                scope.spawn(move || {
+                    for window in render_receiver {
+                        let value = window.and_then(|pages: Vec<(Placement, GrayImage, Option<GrayImage>)>| {
+                            let (mut placements, mut seen, mut ink) = (Vec::new(), Vec::new(), Vec::new());
+                            for (placement, page, read) in pages {
+                                placements.push(placement);
+                                seen.push(page);
+                                ink.push(read);
+                            }
+                            let mut prepared = prepare_window(layouts, &seen, &ink)?;
+                            for (placement, lines) in placements.iter().zip(&mut prepared) {
+                                if confidence_pages.contains(&placement.page_index) {
+                                    lines.iter_mut().for_each(|line| line.confidence_required = true);
                                 }
                             }
-                        });
-                    }
-                    for _ in requests.chunks(window_size) {
-                        let value = queues.iter().try_fold(Vec::new(), |mut pages, queue| {
-                            pages.extend(queue.recv().map_err(|_| Error::Message("PDF render worker stopped before returning its pages".into()))??);
-                            Ok(pages)
+                            Ok((placements, prepared))
                         });
                         let failed = value.is_err();
-                        if render_sender.send(value).is_err() || failed {
+                        if prepared_sender.send(value).is_err() || failed {
                             break;
                         }
                     }
-                    // Closing every rendezvous queue also unblocks workers if a downstream stage fails.
-                    drop(queues);
                 });
-            });
-            scope.spawn(move || {
-                for window in render_receiver {
-                    let value = window.and_then(|pages: Vec<(Placement, GrayImage, Option<GrayImage>)>| {
-                        let (mut placements, mut seen, mut ink) = (Vec::new(), Vec::new(), Vec::new());
-                        for (placement, page, read) in pages {
-                            placements.push(placement);
-                            seen.push(page);
-                            ink.push(read);
-                        }
-                        let mut prepared = prepare_window(layouts, &seen, &ink)?;
-                        for (placement, lines) in placements.iter().zip(&mut prepared) {
-                            if confidence_pages.contains(&placement.page_index) {
-                                lines.iter_mut().for_each(|line| line.confidence_required = true);
-                            }
-                        }
-                        Ok((placements, prepared))
-                    });
-                    let failed = value.is_err();
-                    if prepared_sender.send(value).is_err() || failed {
-                        break;
-                    }
-                }
-            });
-            place_pages(&mut results, prepared_receiver, engine, codec, plan)
+                place_pages(&mut results, prepared_receiver, engine, codec, plan)
+            })
         })?;
         Ok(results)
     }
@@ -1724,5 +1723,83 @@ mod tests {
         assert_eq!(ink_c[0], 255);
         assert_eq!(ink_c[1], ((200 + 100 + 40 + 1) / 3) as u8);
         assert_eq!(ink_c[2], 50);
+    }
+
+    #[test]
+    fn detector_native_matches_ort_and_benchmarks() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let runtime_dir = manifest_dir.parent().unwrap().join("runtime");
+        let ort_dll = runtime_dir.join("onnx/onnxruntime.dll");
+        let det_path = runtime_dir.join("indra/assets/detectors/indra/model.onnx");
+        if !ort_dll.is_file() || !det_path.is_file() {
+            eprintln!("skipping detector ORT parity test: assets not found");
+            return;
+        }
+        legal_pdf_core::init_ort_runtime(&ort_dll, None).expect("init ort runtime");
+
+        let weights = PrepackedWeights::new();
+        let native = crate::detector_native::DetectorNative::from_onnx_path(&det_path).expect("load DetectorNative");
+        let mut session = open_session(&det_path, 1, OrtBackend::Cpu, "cpu", true, &weights, false).expect("open detector ORT session");
+        let input_name = session.inputs[0].name.clone();
+        let mut scratch = crate::detector_native::DetectorScratch::default();
+
+        for &(height, width) in &[(768usize, 576usize), (640usize, 896usize)] {
+            let mut input = vec![0.0_f32; height * width];
+            for y in (40..height - 40).step_by(24) {
+                for dy in 0..8usize {
+                    for x in 48..width - 48 {
+                        if (x / 5 + dy) % 3 != 0 {
+                            input[(y + dy) * width + x] = 0.85;
+                        }
+                    }
+                }
+            }
+            let tensor = TensorRef::from_array_view(([1usize, 1, height, width], input.as_slice())).unwrap();
+            let outputs = session.run(ort::inputs![input_name.as_str() => tensor]).unwrap();
+            let (shape, ort_out) = outputs[0].try_extract_tensor::<f32>().unwrap();
+            assert_eq!(shape.as_ref(), &[1, 3, (height / 2) as i64, (width / 2) as i64]);
+
+            let nat_out = native.run(&input, height, width, &mut scratch);
+            assert_eq!(nat_out.len(), ort_out.len());
+            let mut max_diff = 0.0_f32;
+            let mut worst_idx = 0usize;
+            for (i, (&a, &b)) in nat_out.iter().zip(ort_out.iter()).enumerate() {
+                let d = (a - b).abs();
+                if d > max_diff {
+                    max_diff = d;
+                    worst_idx = i;
+                }
+            }
+            eprintln!(
+                "[parity] detector {height}x{width}: max_abs_diff={max_diff:.2e} at idx={worst_idx} (nat={}, ort={})",
+                nat_out[worst_idx], ort_out[worst_idx]
+            );
+            assert!(max_diff < 1e-4, "detector {height}x{width}: max_abs_diff {max_diff} >= 1e-4");
+        }
+
+        let (height, width) = (768usize, 576usize);
+        let input = vec![0.25_f32; height * width];
+        for _ in 0..3 {
+            let tensor = TensorRef::from_array_view(([1usize, 1, height, width], input.as_slice())).unwrap();
+            let _ = session.run(ort::inputs![input_name.as_str() => tensor]).unwrap();
+            let _ = native.run(&input, height, width, &mut scratch);
+        }
+        let iters = 12usize;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let tensor = TensorRef::from_array_view(([1usize, 1, height, width], input.as_slice())).unwrap();
+            let outputs = session.run(ort::inputs![input_name.as_str() => tensor]).unwrap();
+            let _ = outputs[0].try_extract_tensor::<f32>().unwrap();
+        }
+        let ort_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            let _ = native.run(&input, height, width, &mut scratch);
+        }
+        let nat_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        eprintln!(
+            "[bench] detector {height}x{width}: ORT={ort_ms:.2}ms/page, DetectorNative={nat_ms:.2}ms/page, speedup={:.2}x",
+            ort_ms / nat_ms.max(1e-9)
+        );
     }
 }

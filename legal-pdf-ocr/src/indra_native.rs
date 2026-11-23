@@ -4,14 +4,22 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
-const HARD_SWISH_SIXTH: f32 = 1.0 / 6.0;
+pub(crate) const HARD_SWISH_SIXTH: f32 = 1.0 / 6.0;
 const BLANK_LABEL: usize = 0;
 
 /// Minimal decoded ONNX float tensor.
-struct OnnxTensor {
-    name: String,
-    dims: Vec<usize>,
-    data: Vec<f32>,
+pub(crate) struct OnnxTensor {
+    pub(crate) name: String,
+    pub(crate) dims: Vec<usize>,
+    pub(crate) data: Vec<f32>,
+}
+
+/// Minimal decoded ONNX graph node metadata (op type, input/output names, optional tensor attribute).
+pub(crate) struct OnnxNode {
+    pub(crate) op_type: String,
+    pub(crate) inputs: Vec<String>,
+    pub(crate) outputs: Vec<String>,
+    pub(crate) attr_t: Option<OnnxTensor>,
 }
 
 /// Reusable per-worker scratch buffers so per-line inference allocates zero heap memory after warmup.
@@ -27,27 +35,41 @@ pub struct IndraScratch {
     logits_block: Vec<f32>,
 }
 
-struct PackedLinear {
-    /// `[out_pad / 16, inp, 16]` layout so both AVX2 (`2 x f32x8`) and Wasm SIMD128 (`4 x f32x4`)
-    /// load contiguous output-channel vectors with zero horizontal reductions.
-    w: Vec<f32>,
-    b: Vec<f32>,
-    out_pad: usize,
-    inp: usize,
+pub(crate) struct PackedLinear {
+    /// `[tiles16, inp, 16]` followed by an optional `[inp, 8]` tail tile when `out_pad % 16 == 8`,
+    /// so AVX2 (`2 x f32x8` / `1 x f32x8`) and Wasm SIMD128 (`4 x f32x4` / `2 x f32x4`) load
+    /// contiguous output-channel vectors with zero horizontal reductions.
+    pub(crate) w: Vec<f32>,
+    pub(crate) b: Vec<f32>,
+    pub(crate) out_pad: usize,
+    pub(crate) inp: usize,
 }
 
 impl PackedLinear {
-    fn pack(raw_w: &[f32], raw_b: &[f32], out_dim: usize, inp: usize) -> Self {
-        let out_pad = out_dim.div_ceil(16) * 16;
-        let tiles = out_pad / 16;
-        let mut w = vec![0.0_f32; tiles * inp * 16];
-        for tile in 0..tiles {
+    pub(crate) fn pack(raw_w: &[f32], raw_b: &[f32], out_dim: usize, inp: usize) -> Self {
+        let out_pad = out_dim.div_ceil(8) * 8;
+        let tiles16 = out_pad / 16;
+        let has_tail8 = (out_pad & 8) != 0;
+        let mut w = vec![0.0_f32; out_pad * inp];
+        for tile in 0..tiles16 {
             for lane in 0..16 {
                 let oc = tile * 16 + lane;
                 if oc < out_dim {
                     let src_row = &raw_w[oc * inp..(oc + 1) * inp];
                     for (k, &val) in src_row.iter().enumerate() {
                         w[(tile * inp + k) * 16 + lane] = val;
+                    }
+                }
+            }
+        }
+        if has_tail8 {
+            let base = tiles16 * inp * 16;
+            for lane in 0..8 {
+                let oc = tiles16 * 16 + lane;
+                if oc < out_dim {
+                    let src_row = &raw_w[oc * inp..(oc + 1) * inp];
+                    for (k, &val) in src_row.iter().enumerate() {
+                        w[base + k * 8 + lane] = val;
                     }
                 }
             }
@@ -626,7 +648,7 @@ fn hardswish_scalar(x: f32) -> f32 {
     x * ((x + 3.0).clamp(0.0, 6.0) * HARD_SWISH_SIXTH)
 }
 
-fn hardswish_inplace(data: &mut [f32]) {
+pub(crate) fn hardswish_inplace(data: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
         unsafe { hardswish_inplace_avx2(data) };
@@ -1030,8 +1052,8 @@ fn depthwise_conv1d_k9_wasm(
     }
 }
 
-/// Outer-product GEMM over weights pre-packed as `[out_pad / 16, inp, 16]` with output stride `lin.out_pad`.
-fn linear_packed<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &PackedLinear, dst: &mut [f32]) {
+/// Outer-product GEMM over weights pre-packed as `[tiles16, inp, 16]` (+ optional `[inp, 8]`) with stride `lin.out_pad`.
+pub(crate) fn linear_packed<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &PackedLinear, dst: &mut [f32]) {
     if rows == 0 || lin.out_pad == 0 {
         return;
     }
@@ -1050,6 +1072,7 @@ fn linear_packed<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &PackedLin
         let inp = lin.inp;
         let out_pad = lin.out_pad;
         let tiles = out_pad / 16;
+        let has_tail8 = (out_pad & 8) != 0;
         assert!(x.len() >= rows * inp && dst.len() >= rows * out_pad);
         for tile in 0..tiles {
             let c = tile * 16;
@@ -1073,6 +1096,28 @@ fn linear_packed<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &PackedLin
                 }
             }
         }
+        if has_tail8 {
+            let c = tiles * 16;
+            let w_tail = &lin.w[tiles * inp * 16..];
+            let b_tail = &lin.b[c..c + 8];
+            for r in 0..rows {
+                let xr = &x[r * inp..(r + 1) * inp];
+                let dr = &mut dst[r * out_pad + c..r * out_pad + c + 8];
+                if ADD_TO_DST {
+                    for lane in 0..8 {
+                        dr[lane] += b_tail[lane];
+                    }
+                } else {
+                    dr.copy_from_slice(b_tail);
+                }
+                for (k, &xv) in xr.iter().enumerate() {
+                    let w_k = &w_tail[k * 8..k * 8 + 8];
+                    for lane in 0..8 {
+                        dr[lane] += xv * w_k[lane];
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1088,6 +1133,7 @@ unsafe fn linear_packed_avx2<const ADD_TO_DST: bool>(
     let inp = lin.inp;
     let out_pad = lin.out_pad;
     let tiles = out_pad / 16;
+    let has_tail8 = (out_pad & 8) != 0;
     assert!(x.len() >= rows * inp && dst.len() >= rows * out_pad);
     let x_base = x.as_ptr();
     let w_base = lin.w.as_ptr();
@@ -1229,6 +1275,65 @@ unsafe fn linear_packed_avx2<const ADD_TO_DST: bool>(
             _mm256_storeu_ps(dp0.add(8), a1);
         }
     }
+
+    if has_tail8 {
+        let c = tiles * 16;
+        let w_tail = w_base.add(tiles * inp * 16);
+        let bv = _mm256_loadu_ps(b_base.add(c));
+        let mut r = 0usize;
+        while r + 6 <= rows {
+            let xp0 = x_base.add(r * inp);
+            let xp1 = x_base.add((r + 1) * inp);
+            let xp2 = x_base.add((r + 2) * inp);
+            let xp3 = x_base.add((r + 3) * inp);
+            let xp4 = x_base.add((r + 4) * inp);
+            let xp5 = x_base.add((r + 5) * inp);
+            let dp0 = d_base.add(r * out_pad + c);
+            let dp1 = d_base.add((r + 1) * out_pad + c);
+            let dp2 = d_base.add((r + 2) * out_pad + c);
+            let dp3 = d_base.add((r + 3) * out_pad + c);
+            let dp4 = d_base.add((r + 4) * out_pad + c);
+            let dp5 = d_base.add((r + 5) * out_pad + c);
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) = if ADD_TO_DST {
+                (
+                    _mm256_add_ps(bv, _mm256_loadu_ps(dp0)),
+                    _mm256_add_ps(bv, _mm256_loadu_ps(dp1)),
+                    _mm256_add_ps(bv, _mm256_loadu_ps(dp2)),
+                    _mm256_add_ps(bv, _mm256_loadu_ps(dp3)),
+                    _mm256_add_ps(bv, _mm256_loadu_ps(dp4)),
+                    _mm256_add_ps(bv, _mm256_loadu_ps(dp5)),
+                )
+            } else {
+                (bv, bv, bv, bv, bv, bv)
+            };
+            for k in 0..inp {
+                let wv = _mm256_loadu_ps(w_tail.add(k * 8));
+                a0 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp0.add(k)), wv, a0);
+                a1 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp1.add(k)), wv, a1);
+                a2 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp2.add(k)), wv, a2);
+                a3 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp3.add(k)), wv, a3);
+                a4 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp4.add(k)), wv, a4);
+                a5 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp5.add(k)), wv, a5);
+            }
+            _mm256_storeu_ps(dp0, a0);
+            _mm256_storeu_ps(dp1, a1);
+            _mm256_storeu_ps(dp2, a2);
+            _mm256_storeu_ps(dp3, a3);
+            _mm256_storeu_ps(dp4, a4);
+            _mm256_storeu_ps(dp5, a5);
+            r += 6;
+        }
+        while r < rows {
+            let xp0 = x_base.add(r * inp);
+            let dp0 = d_base.add(r * out_pad + c);
+            let mut a0 = if ADD_TO_DST { _mm256_add_ps(bv, _mm256_loadu_ps(dp0)) } else { bv };
+            for k in 0..inp {
+                a0 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp0.add(k)), _mm256_loadu_ps(w_tail.add(k * 8)), a0);
+            }
+            _mm256_storeu_ps(dp0, a0);
+            r += 1;
+        }
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -1237,6 +1342,7 @@ fn linear_packed_wasm<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &Pack
     let inp = lin.inp;
     let out_pad = lin.out_pad;
     let tiles = out_pad / 16;
+    let has_tail8 = (out_pad & 8) != 0;
     assert!(x.len() >= rows * inp && dst.len() >= rows * out_pad);
     let x_base = x.as_ptr();
     let w_base = lin.w.as_ptr();
@@ -1342,6 +1448,93 @@ fn linear_packed_wasm<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &Pack
             r += 1;
         }
     }
+
+    if has_tail8 {
+        let c = tiles * 16;
+        let w_tail = unsafe { w_base.add(tiles * inp * 16) };
+        let (bv0, bv1) = unsafe {
+            (
+                v128_load(b_base.add(c) as *const v128),
+                v128_load(b_base.add(c + 4) as *const v128),
+            )
+        };
+        let mut r = 0usize;
+        while r + 4 <= rows {
+            unsafe {
+                let xp0 = x_base.add(r * inp);
+                let xp1 = x_base.add((r + 1) * inp);
+                let xp2 = x_base.add((r + 2) * inp);
+                let xp3 = x_base.add((r + 3) * inp);
+                let dp0 = d_base.add(r * out_pad + c);
+                let dp1 = d_base.add((r + 1) * out_pad + c);
+                let dp2 = d_base.add((r + 2) * out_pad + c);
+                let dp3 = d_base.add((r + 3) * out_pad + c);
+                let (mut a00, mut a01, mut a10, mut a11, mut a20, mut a21, mut a30, mut a31) = if ADD_TO_DST {
+                    (
+                        f32x4_add(bv0, v128_load(dp0 as *const v128)),
+                        f32x4_add(bv1, v128_load(dp0.add(4) as *const v128)),
+                        f32x4_add(bv0, v128_load(dp1 as *const v128)),
+                        f32x4_add(bv1, v128_load(dp1.add(4) as *const v128)),
+                        f32x4_add(bv0, v128_load(dp2 as *const v128)),
+                        f32x4_add(bv1, v128_load(dp2.add(4) as *const v128)),
+                        f32x4_add(bv0, v128_load(dp3 as *const v128)),
+                        f32x4_add(bv1, v128_load(dp3.add(4) as *const v128)),
+                    )
+                } else {
+                    (bv0, bv1, bv0, bv1, bv0, bv1, bv0, bv1)
+                };
+                for k in 0..inp {
+                    let wp = w_tail.add(k * 8);
+                    let wv0 = v128_load(wp as *const v128);
+                    let wv1 = v128_load(wp.add(4) as *const v128);
+                    let x0 = f32x4_splat(*xp0.add(k));
+                    let x1 = f32x4_splat(*xp1.add(k));
+                    let x2 = f32x4_splat(*xp2.add(k));
+                    let x3 = f32x4_splat(*xp3.add(k));
+                    a00 = f32x4_add(a00, f32x4_mul(x0, wv0));
+                    a01 = f32x4_add(a01, f32x4_mul(x0, wv1));
+                    a10 = f32x4_add(a10, f32x4_mul(x1, wv0));
+                    a11 = f32x4_add(a11, f32x4_mul(x1, wv1));
+                    a20 = f32x4_add(a20, f32x4_mul(x2, wv0));
+                    a21 = f32x4_add(a21, f32x4_mul(x2, wv1));
+                    a30 = f32x4_add(a30, f32x4_mul(x3, wv0));
+                    a31 = f32x4_add(a31, f32x4_mul(x3, wv1));
+                }
+                v128_store(dp0 as *mut v128, a00);
+                v128_store(dp0.add(4) as *mut v128, a01);
+                v128_store(dp1 as *mut v128, a10);
+                v128_store(dp1.add(4) as *mut v128, a11);
+                v128_store(dp2 as *mut v128, a20);
+                v128_store(dp2.add(4) as *mut v128, a21);
+                v128_store(dp3 as *mut v128, a30);
+                v128_store(dp3.add(4) as *mut v128, a31);
+            }
+            r += 4;
+        }
+        while r < rows {
+            unsafe {
+                let xp0 = x_base.add(r * inp);
+                let dp0 = d_base.add(r * out_pad + c);
+                let (mut a0, mut a1) = if ADD_TO_DST {
+                    (
+                        f32x4_add(bv0, v128_load(dp0 as *const v128)),
+                        f32x4_add(bv1, v128_load(dp0.add(4) as *const v128)),
+                    )
+                } else {
+                    (bv0, bv1)
+                };
+                for k in 0..inp {
+                    let wp = w_tail.add(k * 8);
+                    let x0 = f32x4_splat(*xp0.add(k));
+                    a0 = f32x4_add(a0, f32x4_mul(x0, v128_load(wp as *const v128)));
+                    a1 = f32x4_add(a1, f32x4_mul(x0, v128_load(wp.add(4) as *const v128)));
+                }
+                v128_store(dp0 as *mut v128, a0);
+                v128_store(dp0.add(4) as *mut v128, a1);
+            }
+            r += 1;
+        }
+    }
 }
 
 // ============================================================================
@@ -1423,6 +1616,19 @@ impl<'a> ProtoReader<'a> {
 }
 
 fn parse_onnx_initializers(bytes: &[u8]) -> Result<std::collections::HashMap<String, OnnxTensor>, String> {
+    parse_onnx_graph(bytes, false).map(|(tensors, _)| tensors)
+}
+
+pub(crate) fn parse_onnx_model(
+    bytes: &[u8],
+) -> Result<(std::collections::HashMap<String, OnnxTensor>, Vec<OnnxNode>), String> {
+    parse_onnx_graph(bytes, true)
+}
+
+fn parse_onnx_graph(
+    bytes: &[u8],
+    with_nodes: bool,
+) -> Result<(std::collections::HashMap<String, OnnxTensor>, Vec<OnnxNode>), String> {
     let mut model = ProtoReader::new(bytes);
     let mut graph_bytes = None;
     while !model.is_eof() {
@@ -1439,6 +1645,7 @@ fn parse_onnx_initializers(bytes: &[u8]) -> Result<std::collections::HashMap<Str
 
     let mut graph = ProtoReader::new(graph_bytes);
     let mut out = std::collections::HashMap::new();
+    let mut nodes = Vec::new();
     while !graph.is_eof() {
         let tag = graph.read_varint()?;
         let field = tag >> 3;
@@ -1448,11 +1655,75 @@ fn parse_onnx_initializers(bytes: &[u8]) -> Result<std::collections::HashMap<Str
             if !tensor.name.is_empty() {
                 out.insert(tensor.name.clone(), tensor);
             }
+        } else if with_nodes && field == 1 && wire == 2 {
+            nodes.push(parse_node_proto(graph.read_bytes()?)?);
         } else {
             graph.skip_field(wire)?;
         }
     }
-    Ok(out)
+    Ok((out, nodes))
+}
+
+fn parse_node_proto(bytes: &[u8]) -> Result<OnnxNode, String> {
+    let mut reader = ProtoReader::new(bytes);
+    let mut op_type = String::new();
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut attr_t = None;
+    while !reader.is_eof() {
+        let tag = reader.read_varint()?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        match (field, wire) {
+            (1, 2) => inputs.push(
+                std::str::from_utf8(reader.read_bytes()?)
+                    .map_err(|_| "non-UTF8 node input in ONNX model".to_owned())?
+                    .to_owned(),
+            ),
+            (2, 2) => outputs.push(
+                std::str::from_utf8(reader.read_bytes()?)
+                    .map_err(|_| "non-UTF8 node output in ONNX model".to_owned())?
+                    .to_owned(),
+            ),
+            (4, 2) => {
+                op_type = std::str::from_utf8(reader.read_bytes()?)
+                    .map_err(|_| "non-UTF8 node op_type in ONNX model".to_owned())?
+                    .to_owned();
+            }
+            (5, 2) => {
+                if let Some(tensor) = parse_attribute_tensor(reader.read_bytes()?)? {
+                    attr_t = Some(tensor);
+                }
+            }
+            _ => reader.skip_field(wire)?,
+        }
+    }
+    Ok(OnnxNode { op_type, inputs, outputs, attr_t })
+}
+
+fn parse_attribute_tensor(bytes: &[u8]) -> Result<Option<OnnxTensor>, String> {
+    let mut reader = ProtoReader::new(bytes);
+    let mut attr_name = "";
+    let mut tensor_bytes = None;
+    while !reader.is_eof() {
+        let tag = reader.read_varint()?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        match (field, wire) {
+            (1, 2) => {
+                attr_name = std::str::from_utf8(reader.read_bytes()?)
+                    .map_err(|_| "non-UTF8 attr name in ONNX model".to_owned())?;
+            }
+            (5, 2) => tensor_bytes = Some(reader.read_bytes()?),
+            _ => reader.skip_field(wire)?,
+        }
+    }
+    if attr_name == "value" {
+        if let Some(tb) = tensor_bytes {
+            return parse_tensor_proto(tb).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 fn parse_tensor_proto(bytes: &[u8]) -> Result<OnnxTensor, String> {
