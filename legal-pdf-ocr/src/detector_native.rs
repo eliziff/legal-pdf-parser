@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::indra_native::{
-    hardswish_inplace, linear_packed, parse_onnx_model, OnnxTensor, PackedLinear, HARD_SWISH_SIXTH,
+    linear_packed, parse_onnx_model, OnnxTensor, PackedLinear, HARD_SWISH_SIXTH,
 };
 
 /// Reusable per-worker scratch buffers so per-page detection allocates zero heap memory after warmup.
@@ -375,17 +375,15 @@ impl DetectorNative {
             tmp_a.resize(n * in_c, 0.0);
             depthwise_conv2d_hardswish(&stage.down_dw, 2, src, in_h, in_w, tmp_a);
             dst.resize(n * out_c, 0.0);
-            linear_packed::<false>(&tmp_a[..n * in_c], n, &stage.down_pw, dst);
-            hardswish_inplace(&mut dst[..n * out_c]);
+            linear_packed::<false, true>(&tmp_a[..n * in_c], n, &stage.down_pw, dst);
 
             for block in &stage.blocks {
                 let ec = block.expand_channels;
                 tmp_a.resize(n * ec, 0.0);
-                linear_packed::<false>(&dst[..n * out_c], n, &block.expand, tmp_a);
-                hardswish_inplace(&mut tmp_a[..n * ec]);
+                linear_packed::<false, true>(&dst[..n * out_c], n, &block.expand, tmp_a);
                 tmp_exp.resize(n * ec, 0.0);
                 depthwise_conv2d_hardswish(&block.dw, 1, tmp_a, out_h, out_w, tmp_exp);
-                linear_packed::<true>(&tmp_exp[..n * ec], n, &block.project, dst);
+                linear_packed::<true, false>(&tmp_exp[..n * ec], n, &block.project, dst);
             }
         };
 
@@ -444,22 +442,18 @@ impl DetectorNative {
         let fpn_c = self.fpn_channels;
         // FPN top-down: lat3 (H/32) -> +lat2 (H/16) -> +lat1 (H/8) -> +lat0 (H/4) -> smooth.
         scratch.fpn_a.resize(h32 * w32 * fpn_c, 0.0);
-        linear_packed::<false>(&scratch.b[..h32 * w32 * self.stages[3].out_channels], h32 * w32, &self.lat[3], &mut scratch.fpn_a);
-        hardswish_inplace(&mut scratch.fpn_a[..h32 * w32 * fpn_c]);
+        linear_packed::<false, true>(&scratch.b[..h32 * w32 * self.stages[3].out_channels], h32 * w32, &self.lat[3], &mut scratch.fpn_a);
 
         scratch.fpn_b.resize(h16 * w16 * fpn_c, 0.0);
-        linear_packed::<false>(&scratch.s2[..h16 * w16 * self.stages[2].out_channels], h16 * w16, &self.lat[2], &mut scratch.fpn_b);
-        hardswish_inplace(&mut scratch.fpn_b[..h16 * w16 * fpn_c]);
+        linear_packed::<false, true>(&scratch.s2[..h16 * w16 * self.stages[2].out_channels], h16 * w16, &self.lat[2], &mut scratch.fpn_b);
         upsample_nearest2x_add(&scratch.fpn_a, h32, w32, fpn_c, &mut scratch.fpn_b);
 
         scratch.fpn_a.resize(h8 * w8 * fpn_c, 0.0);
-        linear_packed::<false>(&scratch.s1[..h8 * w8 * self.stages[1].out_channels], h8 * w8, &self.lat[1], &mut scratch.fpn_a);
-        hardswish_inplace(&mut scratch.fpn_a[..h8 * w8 * fpn_c]);
+        linear_packed::<false, true>(&scratch.s1[..h8 * w8 * self.stages[1].out_channels], h8 * w8, &self.lat[1], &mut scratch.fpn_a);
         upsample_nearest2x_add(&scratch.fpn_b, h16, w16, fpn_c, &mut scratch.fpn_a);
 
         scratch.fpn_b.resize(h4 * w4 * fpn_c, 0.0);
-        linear_packed::<false>(&scratch.s0[..h4 * w4 * self.stages[0].out_channels], h4 * w4, &self.lat[0], &mut scratch.fpn_b);
-        hardswish_inplace(&mut scratch.fpn_b[..h4 * w4 * fpn_c]);
+        linear_packed::<false, true>(&scratch.s0[..h4 * w4 * self.stages[0].out_channels], h4 * w4, &self.lat[0], &mut scratch.fpn_b);
         upsample_nearest2x_add(&scratch.fpn_a, h8, w8, fpn_c, &mut scratch.fpn_b);
 
         scratch.fpn_a.resize(h4 * w4 * fpn_c, 0.0);
@@ -468,8 +462,7 @@ impl DetectorNative {
         // stem_lat: [H2 * W2, stem_channels] -> [H2 * W2, out_pad(=8)] + HardSwish.
         let stem_lat_stride = self.stem_lat.out_pad;
         scratch.b.resize(h2 * w2 * stem_lat_stride, 0.0);
-        linear_packed::<false>(&scratch.stem_act[..h2 * w2 * self.stem_channels], h2 * w2, &self.stem_lat, &mut scratch.b);
-        hardswish_inplace(&mut scratch.b[..h2 * w2 * stem_lat_stride]);
+        linear_packed::<false, true>(&scratch.stem_act[..h2 * w2 * self.stem_channels], h2 * w2, &self.stem_lat, &mut scratch.b);
 
         // Concat [smooth (fpn_c), PixelUnshuffle(2)(stem_lat) (stem_lat_c * 4)] into scratch.fpn_b.
         let concat_c = self.head0.inp;
@@ -494,14 +487,13 @@ impl DetectorNative {
 
         // Head: head0 (concat_c -> fpn_c + HS) -> head1 (DW 3x3 + HS) -> head2 (fpn_c -> 12).
         scratch.a.resize(h4 * w4 * fpn_c, 0.0);
-        linear_packed::<false>(&scratch.fpn_b[..h4 * w4 * concat_c], h4 * w4, &self.head0, &mut scratch.a);
-        hardswish_inplace(&mut scratch.a[..h4 * w4 * fpn_c]);
+        linear_packed::<false, true>(&scratch.fpn_b[..h4 * w4 * concat_c], h4 * w4, &self.head0, &mut scratch.a);
 
         depthwise_conv2d_hardswish(&self.head1, 1, &scratch.a, h4, w4, &mut scratch.fpn_a);
 
         let head2_stride = self.head2.out_pad;
         scratch.b.resize(h4 * w4 * head2_stride, 0.0);
-        linear_packed::<false>(&scratch.fpn_a[..h4 * w4 * fpn_c], h4 * w4, &self.head2, &mut scratch.b);
+        linear_packed::<false, false>(&scratch.fpn_a[..h4 * w4 * fpn_c], h4 * w4, &self.head2, &mut scratch.b);
 
         // DepthToSpace(blocksize=2, mode='CRD') into NCHW [3, H2, W2] with Softplus * scale on ch 1..2.
         let plane = h2 * w2;

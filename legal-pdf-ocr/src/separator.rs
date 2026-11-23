@@ -1,5 +1,4 @@
 //! A page render's horizontal rules, and of them the rule printed above the page's notes.
-use std::collections::BTreeMap;
 
 const OTSU_MIN_THRESHOLD: usize = 64;
 const OTSU_MAX_THRESHOLD: usize = 200;
@@ -29,38 +28,80 @@ const STACK_OVERLAP_SHARE: f64 = 0.5;
 const TWO_COLUMN_Y_DELTA_RATIO: f64 = 0.012;
 const VERTICAL_CROSS_X_PAD_RATIO: f64 = 0.01;
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_next_dark_avx2(row: &[u8], mut x: usize, thresh: u8) -> usize {
+    use std::arch::x86_64::*;
+    let len = row.len();
+    let ptr = row.as_ptr();
+    let sign = _mm256_set1_epi8(-128);
+    let t_biased = _mm256_set1_epi8((thresh ^ 0x80) as i8);
+    while x + 32 <= len {
+        let px = _mm256_loadu_si256(ptr.add(x) as *const __m256i);
+        let dark = _mm256_cmpgt_epi8(t_biased, _mm256_xor_si256(px, sign));
+        let mask = _mm256_movemask_epi8(dark) as u32;
+        if mask != 0 {
+            return x + mask.trailing_zeros() as usize;
+        }
+        x += 32;
+    }
+    while x < len && *ptr.add(x) >= thresh {
+        x += 1;
+    }
+    x
+}
+
+#[inline]
+fn find_next_dark(row: &[u8], mut x: usize, thresh: u8) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: x <= row.len(), bounds checked inside helper.
+        return unsafe { find_next_dark_avx2(row, x, thresh) };
+    }
+    while x < row.len() && row[x] >= thresh {
+        x += 1;
+    }
+    x
+}
+
 /// Horizontal rules, as `(x0, x1, top, bottom)` pixels, all inclusive: runs of dark pixels (gaps of
 /// two bridged) at least `min_length` long, a run in the row just under one already read joining it
 /// as the same rule, thicker; at most `max_rows` rows thick, with light rows three pixels above its
 /// top and below its bottom across most of it.
-pub(crate) fn horizontal_rules(
-    dark: impl Fn(usize, usize) -> bool,
+fn horizontal_rules_gray(
+    gray: &[u8],
+    thresh: u8,
     width: usize,
     height: usize,
     min_length: usize,
     max_rows: usize,
 ) -> Vec<(usize, usize, usize, usize)> {
-    let light_share = |y: usize, a: usize, b: usize| (a..b).filter(|&x| !dark(x, y)).count() * 10 >= (b - a) * 7;
+    let light_share = |y: usize, a: usize, b: usize| {
+        let row = &gray[y * width + a..y * width + b];
+        row.iter().filter(|&&v| v >= thresh).count() * 10 >= (b - a) * 7
+    };
     let mut rules: Vec<(usize, usize, usize, usize)> = Vec::new();
     // The rules reaching the row above, which a run in this row may carry on.
     let mut open: Vec<usize> = Vec::new();
+    let mut reaching: Vec<usize> = Vec::new();
     for y in 0..height {
-        let mut reaching = Vec::new();
+        reaching.clear();
+        let row = &gray[y * width..(y + 1) * width];
         let mut x = 0;
         while x < width {
-            if !dark(x, y) {
-                x += 1;
-                continue;
+            x = find_next_dark(row, x, thresh);
+            if x >= width {
+                break;
             }
             let start = x;
             let mut gap = 0;
             let mut end = x;
             while x < width && gap <= 2 {
-                if dark(x, y) {
+                if row[x] < thresh {
                     end = x;
-                    gap = 0
+                    gap = 0;
                 } else {
-                    gap += 1
+                    gap += 1;
                 }
                 x += 1;
             }
@@ -77,7 +118,7 @@ pub(crate) fn horizontal_rules(
                 }
             }
         }
-        open = reaching;
+        std::mem::swap(&mut open, &mut reaching);
     }
     rules.retain(|rule| {
         rule.3 - rule.2 < max_rows
@@ -95,14 +136,13 @@ pub(crate) fn separator_y(gray: &[u8], width: usize, height: usize, page_height:
     if width < 64 || height < 64 || gray.len() != width * height {
         return None;
     }
-    let threshold = otsu_threshold(gray).clamp(OTSU_MIN_THRESHOLD, OTSU_MAX_THRESHOLD);
-    let dark = gray.iter().map(|value| usize::from(*value) < threshold).collect::<Vec<_>>();
-    if dark.iter().filter(|value| **value).count() as f64 / dark.len() as f64 > DARK_PAGE_SHARE {
+    let (threshold, dark_count) = otsu_threshold_and_dark_count(gray);
+    if dark_count as f64 / gray.len() as f64 > DARK_PAGE_SHARE {
         return None;
     }
-    let rules = rule_records(&dark, width, height);
-    let verticals = vertical_rules(&dark, width, height);
-    separator(&rules, &verticals).map(|ratio| ratio * page_height)
+    let thresh = threshold as u8;
+    let rules = rule_records(gray, thresh, width, height);
+    separator(gray, thresh, width, height, &rules).map(|ratio| ratio * page_height)
 }
 
 /// A horizontal rule, its place and size as shares of the page's, its darkness and the ink just
@@ -132,21 +172,32 @@ struct VerticalRule {
     y1: f64,
 }
 
-fn otsu_threshold(gray: &[u8]) -> usize {
-    let mut histogram = [0_f64; 256];
-    for &value in gray {
-        histogram[usize::from(value)] += 1.0;
+fn otsu_threshold_and_dark_count(gray: &[u8]) -> (usize, usize) {
+    let (mut h0, mut h1, mut h2, mut h3) = ([0_u32; 256], [0_u32; 256], [0_u32; 256], [0_u32; 256]);
+    let mut chunks = gray.chunks_exact(4);
+    for c in &mut chunks {
+        h0[usize::from(c[0])] += 1;
+        h1[usize::from(c[1])] += 1;
+        h2[usize::from(c[2])] += 1;
+        h3[usize::from(c[3])] += 1;
     }
-    let total = histogram.iter().sum::<f64>();
-    if total <= 0.0 {
-        return 128;
+    for &v in chunks.remainder() {
+        h0[usize::from(v)] += 1;
     }
+    let mut histogram = [0_u32; 256];
+    let mut total_mu = 0.0_f64;
+    for value in 0..256 {
+        let c = h0[value] + h1[value] + h2[value] + h3[value];
+        histogram[value] = c;
+        total_mu += value as f64 * f64::from(c);
+    }
+    let total = gray.len() as f64;
     let mut omega = 0.0;
     let mut mu = 0.0;
-    let total_mu = histogram.iter().enumerate().map(|(value, count)| value as f64 * count).sum::<f64>();
     let mut best_index = 0;
     let mut best_sigma = 0.0;
-    for (value, count) in histogram.iter().enumerate() {
+    for (value, &cnt) in histogram.iter().enumerate() {
+        let count = f64::from(cnt);
         omega += count;
         mu += value as f64 * count;
         let denominator = omega * (total - omega);
@@ -156,18 +207,9 @@ fn otsu_threshold(gray: &[u8]) -> usize {
             best_index = value;
         }
     }
-    best_index
-}
-
-fn groups(indices: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
-    let mut result: Vec<(usize, usize)> = Vec::new();
-    for value in indices {
-        match result.last_mut() {
-            Some(last) if value == last.1 + 1 => last.1 = value,
-            _ => result.push((value, value)),
-        }
-    }
-    result
+    let clamped = best_index.clamp(OTSU_MIN_THRESHOLD, OTSU_MAX_THRESHOLD);
+    let dark_count = histogram[..clamped].iter().map(|&c| c as usize).sum();
+    (clamped, dark_count)
 }
 
 fn median_usize(values: impl IntoIterator<Item = usize>) -> usize {
@@ -183,33 +225,35 @@ fn median_usize(values: impl IntoIterator<Item = usize>) -> usize {
 
 /// The dark share of rows `y0..y1` (clipped to the page) between `x0` and `x1`; `empty` where no
 /// row is left.
-fn ink_share(dark: &[bool], width: usize, height: usize, (y0, y1): (isize, isize), (x0, x1): (usize, usize), empty: f64) -> f64 {
+fn ink_share(gray: &[u8], thresh: u8, width: usize, height: usize, (y0, y1): (isize, isize), (x0, x1): (usize, usize), empty: f64) -> f64 {
     let y0 = y0.max(0) as usize;
     let y1 = y1.min(height as isize).max(0) as usize;
     if y1 <= y0 || x1 <= x0 {
         return empty;
     }
-    let count = (y0..y1).map(|y| dark[y * width + x0..y * width + x1].iter().filter(|value| **value).count()).sum::<usize>();
+    let count = (y0..y1)
+        .map(|y| gray[y * width + x0..y * width + x1].iter().filter(|&&value| value < thresh).count())
+        .sum::<usize>();
     count as f64 / ((y1 - y0) * (x1 - x0)) as f64
 }
 
-fn rule_records(dark: &[bool], width: usize, height: usize) -> Vec<Rule> {
+fn rule_records(gray: &[u8], thresh: u8, width: usize, height: usize) -> Vec<Rule> {
     let minimum = 8.max((width as f64 * MIN_RULE_WIDTH_RATIO) as usize);
     let maximum_thickness = 4.max((height as f64 * MAX_RULE_THICKNESS_RATIO) as usize);
     let guard = 2.max((height as f64 * INK_GUARD_RATIO) as usize) as isize;
     let ink_window = 4.max((height as f64 * INK_WINDOW_RATIO) as usize) as isize;
     let block_window = (ink_window * 2).max((height as f64 * BLOCK_INK_WINDOW_RATIO) as isize);
     let (w, h) = (width as f64, height as f64);
-    horizontal_rules(|x, y| dark[y * width + x], width, height, minimum, maximum_thickness)
+    horizontal_rules_gray(gray, thresh, width, height, minimum, maximum_thickness)
         .into_iter()
         .map(|(x0, end, top, bottom)| {
             let x1 = end + 1;
             let darkness = (top..=bottom)
-                .map(|y| dark[y * width + x0..y * width + x1].iter().filter(|value| **value).count() as f64 / (x1 - x0) as f64)
+                .map(|y| gray[y * width + x0..y * width + x1].iter().filter(|&&value| value < thresh).count() as f64 / (x1 - x0) as f64)
                 .fold(0.0, f64::max);
             let above = top as isize - guard;
             let below = (bottom + 1) as isize + guard;
-            let share = |rows, empty| ink_share(dark, width, height, rows, (x0, x1), empty);
+            let share = |rows, empty| ink_share(gray, thresh, width, height, rows, (x0, x1), empty);
             Rule {
                 y: (top + bottom + 1) as f64 / 2.0 / h,
                 x0: x0 as f64 / w,
@@ -225,55 +269,78 @@ fn rule_records(dark: &[bool], width: usize, height: usize) -> Vec<Rule> {
         .collect()
 }
 
-fn vertical_rules(dark: &[bool], width: usize, height: usize) -> Vec<VerticalRule> {
-    let minimum = 12.max((height as f64 * MIN_VERTICAL_RULE_LENGTH_RATIO) as usize);
-    let mut metrics = BTreeMap::new();
-    for x in 0..width {
-        let mut ink = 0;
-        let mut transitions = 0;
-        let mut best_length = 0;
-        let mut best_start = 0;
-        let mut run_length = 0;
-        let mut run_start = 0;
-        let mut prior = false;
-        for y in 0..height {
-            let value = dark[y * width + x] || (x > 0 && dark[y * width + x - 1]) || (x + 1 < width && dark[y * width + x + 1]);
-            ink += usize::from(value);
-            if y > 0 && value != prior {
-                transitions += 1;
+/// Row-major computation of vertical rule columns, invoked only when candidate horizontal rules exist.
+fn vertical_rules(gray: &[u8], thresh: u8, width: usize, height: usize) -> Vec<VerticalRule> {
+    #[derive(Clone, Copy, Default)]
+    struct ColState {
+        ink: u32,
+        transitions: u32,
+        best_length: u32,
+        best_start: u32,
+        run_length: u32,
+        run_start: u32,
+        prior: bool,
+    }
+    let minimum = 12.max((height as f64 * MIN_VERTICAL_RULE_LENGTH_RATIO) as usize) as u32;
+    let mut cols = vec![ColState::default(); width];
+    for y in 0..height {
+        let row = &gray[y * width..(y + 1) * width];
+        let yu = y as u32;
+        for (x, state) in cols.iter_mut().enumerate() {
+            let value = row[x] < thresh || (x > 0 && row[x - 1] < thresh) || (x + 1 < width && row[x + 1] < thresh);
+            state.ink += u32::from(value);
+            if y > 0 && value != state.prior {
+                state.transitions += 1;
             }
             if value {
-                if run_length == 0 {
-                    run_start = y;
+                if state.run_length == 0 {
+                    state.run_start = yu;
                 }
-                run_length += 1;
-                if run_length > best_length {
-                    best_length = run_length;
-                    best_start = run_start;
+                state.run_length += 1;
+                if state.run_length > state.best_length {
+                    state.best_length = state.run_length;
+                    state.best_start = state.run_start;
                 }
             } else {
-                run_length = 0;
+                state.run_length = 0;
             }
-            prior = value;
-        }
-        if ink >= minimum && transitions <= MAX_ROW_TRANSITIONS && best_length >= minimum {
-            metrics.insert(x, (best_start, best_start + best_length));
+            state.prior = value;
         }
     }
-    let maximum_thickness = 4.max((width as f64 * MAX_RULE_THICKNESS_RATIO) as usize);
-    groups(metrics.keys().copied())
+    let metrics: Vec<Option<(usize, usize)>> = cols
         .into_iter()
-        .filter(|(x0, x1)| x1 - x0 < maximum_thickness + 2)
-        .filter_map(|(band_x0, band_x1)| {
-            let y0 = median_usize((band_x0..=band_x1).map(|column| metrics[&column].0));
-            let y1 = median_usize((band_x0..=band_x1).map(|column| metrics[&column].1));
-            (y1 > y0).then(|| VerticalRule {
-                x: (band_x0 + band_x1 + 1) as f64 / 2.0 / width as f64,
-                y0: y0 as f64 / height as f64,
-                y1: y1 as f64 / height as f64,
-            })
+        .map(|s| {
+            (s.ink >= minimum && s.transitions <= MAX_ROW_TRANSITIONS as u32 && s.best_length >= minimum)
+                .then_some((s.best_start as usize, (s.best_start + s.best_length) as usize))
         })
-        .collect()
+        .collect();
+    let maximum_thickness = 4.max((width as f64 * MAX_RULE_THICKNESS_RATIO) as usize);
+    let mut result = Vec::new();
+    let mut x = 0;
+    while x < width {
+        if metrics[x].is_none() {
+            x += 1;
+            continue;
+        }
+        let band_x0 = x;
+        while x + 1 < width && metrics[x + 1].is_some() {
+            x += 1;
+        }
+        let band_x1 = x;
+        x += 1;
+        if band_x1 - band_x0 < maximum_thickness + 2 {
+            let y0 = median_usize((band_x0..=band_x1).map(|c| metrics[c].unwrap().0));
+            let y1 = median_usize((band_x0..=band_x1).map(|c| metrics[c].unwrap().1));
+            if y1 > y0 {
+                result.push(VerticalRule {
+                    x: (band_x0 + band_x1 + 1) as f64 / 2.0 / width as f64,
+                    y0: y0 as f64 / height as f64,
+                    y1: y1 as f64 / height as f64,
+                });
+            }
+        }
+    }
+    result
 }
 
 /// How much of the narrower of two rules the other spans.
@@ -291,8 +358,8 @@ fn overlap_share(left: &Rule, right: &Rule) -> f64 {
 /// near its left margin, dark, thin, clear of ink just above and below, between blocks of text,
 /// with no rule stacked on it and none crossing it; one such rule, or two at one height over two
 /// columns (the left one's).
-fn separator(rules: &[Rule], verticals: &[VerticalRule]) -> Option<f64> {
-    let candidates = rules
+fn separator(gray: &[u8], thresh: u8, width: usize, height: usize, rules: &[Rule]) -> Option<f64> {
+    let pre_candidates = rules
         .iter()
         .enumerate()
         .filter(|(index, rule)| {
@@ -309,12 +376,21 @@ fn separator(rules: &[Rule], verticals: &[VerticalRule]) -> Option<f64> {
                 && !rules.iter().enumerate().any(|(other_index, other)| {
                     other_index != *index && (other.y - rule.y).abs() <= STACK_NEIGHBOR_Y_RATIO && overlap_share(rule, other) >= STACK_OVERLAP_SHARE
                 })
-                && !verticals.iter().any(|vertical| {
-                    (rule.x0 - VERTICAL_CROSS_X_PAD_RATIO..=rule.x1 + VERTICAL_CROSS_X_PAD_RATIO).contains(&vertical.x)
-                        && (vertical.y0..=vertical.y1).contains(&rule.y)
-                })
         })
         .map(|(_, rule)| rule)
+        .collect::<Vec<_>>();
+    if pre_candidates.is_empty() {
+        return None;
+    }
+    let verticals = vertical_rules(gray, thresh, width, height);
+    let candidates = pre_candidates
+        .into_iter()
+        .filter(|rule| {
+            !verticals.iter().any(|vertical| {
+                (rule.x0 - VERTICAL_CROSS_X_PAD_RATIO..=rule.x1 + VERTICAL_CROSS_X_PAD_RATIO).contains(&vertical.x)
+                    && (vertical.y0..=vertical.y1).contains(&rule.y)
+            })
+        })
         .collect::<Vec<_>>();
     match candidates.as_slice() {
         [rule] => Some(rule.y),
@@ -323,5 +399,50 @@ fn separator(rules: &[Rule], verticals: &[VerticalRule]) -> Option<f64> {
             ((left.y - right.y).abs() <= TWO_COLUMN_Y_DELTA_RATIO && left.x1 <= right.x0).then_some(left.y)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn separator_y_detects_footnote_rule_and_rejects_crossed_box() {
+        let (w, h) = (400usize, 600usize);
+        let mut page = vec![255u8; w * h];
+        // Text block above and below separator.
+        for y in (120..360).step_by(24) {
+            for dy in 0..8 {
+                for x in 40..340 {
+                    if (x / 4 + dy) % 3 != 0 {
+                        page[(y + dy) * w + x] = 25;
+                    }
+                }
+            }
+        }
+        for y in (450..560).step_by(24) {
+            for dy in 0..8 {
+                for x in 40..340 {
+                    if (x / 4 + dy) % 3 != 0 {
+                        page[(y + dy) * w + x] = 25;
+                    }
+                }
+            }
+        }
+        // Horizontal separator at y = 410..412, x = 40..180.
+        for y in 410..=411 {
+            for x in 40..180 {
+                page[y * w + x] = 10;
+            }
+        }
+        let expected_ratio = (410 + 411 + 1) as f64 / 2.0 / h as f64;
+        let found = separator_y(&page, w, h, 792.0).expect("expected footnote separator");
+        assert!((found - expected_ratio * 792.0).abs() < 1e-6);
+
+        // Crossing vertical rule across the separator disqualifies it as a box border.
+        for y in 360..460 {
+            page[y * w + 100] = 10;
+        }
+        assert_eq!(separator_y(&page, w, h, 792.0), None);
     }
 }

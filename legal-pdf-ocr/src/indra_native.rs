@@ -351,7 +351,7 @@ impl IndraNative {
         self.run_backbone(timesteps, scratch);
         let head_stride = self.head.out_pad;
         scratch.logits_block.resize(timesteps * head_stride, 0.0);
-        linear_packed::<false>(&scratch.a, timesteps, &self.head, &mut scratch.logits_block);
+        linear_packed::<false, false>(&scratch.a, timesteps, &self.head, &mut scratch.logits_block);
         if head_stride == self.vocab_size {
             return (timesteps, scratch.logits_block[..timesteps * self.vocab_size].to_vec());
         }
@@ -367,8 +367,7 @@ impl IndraNative {
         let c = self.channels;
         scratch.a.resize(timesteps * c, 0.0);
         scratch.b.resize(timesteps * c, 0.0);
-        linear_packed::<false>(&scratch.patches, timesteps, &self.stem, &mut scratch.a);
-        hardswish_inplace(&mut scratch.a[..timesteps * c]);
+        linear_packed::<false, true>(&scratch.patches, timesteps, &self.stem, &mut scratch.a);
 
         for block in &self.blocks {
             let e = block.expand_channels;
@@ -387,7 +386,7 @@ impl IndraNative {
                 &mut scratch.b[..timesteps * c],
             );
 
-            linear_packed::<false>(&scratch.b[..timesteps * c], timesteps, &block.expand, &mut scratch.exp[..timesteps * e]);
+            linear_packed::<false, false>(&scratch.b[..timesteps * c], timesteps, &block.expand, &mut scratch.exp[..timesteps * e]);
             hardswish_and_channel_sum(
                 &mut scratch.exp[..timesteps * e],
                 timesteps,
@@ -399,18 +398,18 @@ impl IndraNative {
             for v in &mut scratch.se_mean[..e] {
                 *v *= inv_t;
             }
-            linear_packed::<false>(&scratch.se_mean[..e], 1, &block.fc1, &mut scratch.se_mid[..s]);
+            linear_packed::<false, false>(&scratch.se_mean[..e], 1, &block.fc1, &mut scratch.se_mid[..s]);
             for v in &mut scratch.se_mid[..s] {
                 *v = v.max(0.0);
             }
-            linear_packed::<false>(&scratch.se_mid[..s], 1, &block.fc2, &mut scratch.se_gate[..e]);
+            linear_packed::<false, false>(&scratch.se_mid[..s], 1, &block.fc2, &mut scratch.se_gate[..e]);
             for v in &mut scratch.se_gate[..e] {
                 *v = 1.0 / (1.0 + (-*v).exp());
             }
 
             scale_channels_inplace(&mut scratch.exp[..timesteps * e], timesteps, e, &scratch.se_gate[..e]);
 
-            linear_packed::<true>(&scratch.exp[..timesteps * e], timesteps, &block.project, &mut scratch.a[..timesteps * c]);
+            linear_packed::<true, false>(&scratch.exp[..timesteps * e], timesteps, &block.project, &mut scratch.a[..timesteps * c]);
         }
     }
 
@@ -443,7 +442,7 @@ impl IndraNative {
                     let rows = (timesteps - t).min(chunk_rows);
                     let x_slice = &scratch.a[t * c..(t + rows) * c];
                     let out_slice = &mut scratch.logits_block[..rows * fast_stride];
-                    linear_packed::<false>(x_slice, rows, &sl.fast, out_slice);
+                    linear_packed::<false, false>(x_slice, rows, &sl.fast, out_slice);
 
                     for row_idx in 0..rows {
                         let row = &out_slice[row_idx * fast_stride..row_idx * fast_stride + fast_len];
@@ -451,7 +450,7 @@ impl IndraNative {
                         let mut best_label = sl.fast_ids[fast_pos];
                         if best_val < 2.0 && tail_len > 0 {
                             let x_row = &x_slice[row_idx * c..(row_idx + 1) * c];
-                            linear_packed::<false>(x_row, 1, &sl.tail, &mut scratch.b[..tail_stride]);
+                            linear_packed::<false, false>(x_row, 1, &sl.tail, &mut scratch.b[..tail_stride]);
                             let (tail_pos, tail_val) = argmax_f32(&scratch.b[..tail_len]);
                             if tail_val > best_val {
                                 best_label = sl.tail_ids[tail_pos];
@@ -477,7 +476,7 @@ impl IndraNative {
             let rows = (timesteps - t).min(chunk_rows);
             let x_slice = &scratch.a[t * c..(t + rows) * c];
             let out_slice = &mut scratch.logits_block[..rows * head_stride];
-            linear_packed::<false>(x_slice, rows, &self.head, out_slice);
+            linear_packed::<false, false>(x_slice, rows, &self.head, out_slice);
 
             for row_idx in 0..rows {
                 let row = &out_slice[row_idx * head_stride..row_idx * head_stride + v];
@@ -646,74 +645,6 @@ fn extract_patches_f32(
 #[inline]
 fn hardswish_scalar(x: f32) -> f32 {
     x * ((x + 3.0).clamp(0.0, 6.0) * HARD_SWISH_SIXTH)
-}
-
-pub(crate) fn hardswish_inplace(data: &mut [f32]) {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        unsafe { hardswish_inplace_avx2(data) };
-        return;
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        hardswish_inplace_wasm(data);
-        return;
-    }
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-    for v in data {
-        *v = hardswish_scalar(*v);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn hardswish_inplace_avx2(data: &mut [f32]) {
-    use std::arch::x86_64::*;
-    let len = data.len();
-    let ptr = data.as_mut_ptr();
-    let zero = _mm256_setzero_ps();
-    let three = _mm256_set1_ps(3.0);
-    let six = _mm256_set1_ps(6.0);
-    let sixth = _mm256_set1_ps(HARD_SWISH_SIXTH);
-    let mut i = 0usize;
-    while i + 8 <= len {
-        let x = _mm256_loadu_ps(ptr.add(i));
-        let t = _mm256_min_ps(_mm256_max_ps(_mm256_add_ps(x, three), zero), six);
-        let y = _mm256_mul_ps(x, _mm256_mul_ps(t, sixth));
-        _mm256_storeu_ps(ptr.add(i), y);
-        i += 8;
-    }
-    while i < len {
-        let p = ptr.add(i);
-        *p = hardswish_scalar(*p);
-        i += 1;
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn hardswish_inplace_wasm(data: &mut [f32]) {
-    use core::arch::wasm32::*;
-    let len = data.len();
-    let ptr = data.as_mut_ptr();
-    let zero = f32x4_splat(0.0);
-    let three = f32x4_splat(3.0);
-    let six = f32x4_splat(6.0);
-    let sixth = f32x4_splat(HARD_SWISH_SIXTH);
-    let mut i = 0usize;
-    while i + 4 <= len {
-        // SAFETY: i + 4 <= len.
-        unsafe {
-            let x = v128_load(ptr.add(i) as *const v128);
-            let t = f32x4_min(f32x4_max(f32x4_add(x, three), zero), six);
-            let y = f32x4_mul(x, f32x4_mul(t, sixth));
-            v128_store(ptr.add(i) as *mut v128, y);
-        }
-        i += 4;
-    }
-    while i < len {
-        data[i] = hardswish_scalar(data[i]);
-        i += 1;
-    }
 }
 
 fn hardswish_and_channel_sum(data: &mut [f32], timesteps: usize, channels: usize, sum: &mut [f32]) {
@@ -1052,19 +983,25 @@ fn depthwise_conv1d_k9_wasm(
     }
 }
 
-/// Outer-product GEMM over weights pre-packed as `[tiles16, inp, 16]` (+ optional `[inp, 8]`) with stride `lin.out_pad`.
-pub(crate) fn linear_packed<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &PackedLinear, dst: &mut [f32]) {
+/// Outer-product GEMM over weights pre-packed as `[tiles16, inp, 16]` (+ optional `[inp, 8]`)
+/// with stride `lin.out_pad`, optionally fusing residual addition and/or HardSwish before storing.
+pub(crate) fn linear_packed<const ADD_TO_DST: bool, const HARDSWISH: bool>(
+    x: &[f32],
+    rows: usize,
+    lin: &PackedLinear,
+    dst: &mut [f32],
+) {
     if rows == 0 || lin.out_pad == 0 {
         return;
     }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        unsafe { linear_packed_avx2::<ADD_TO_DST>(x, rows, lin, dst) };
+        unsafe { linear_packed_avx2::<ADD_TO_DST, HARDSWISH>(x, rows, lin, dst) };
         return;
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        linear_packed_wasm::<ADD_TO_DST>(x, rows, lin, dst);
+        linear_packed_wasm::<ADD_TO_DST, HARDSWISH>(x, rows, lin, dst);
         return;
     }
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
@@ -1094,6 +1031,11 @@ pub(crate) fn linear_packed<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin:
                         dr[lane] += xv * w_k[lane];
                     }
                 }
+                if HARDSWISH {
+                    for lane in 0..16 {
+                        dr[lane] = hardswish_scalar(dr[lane]);
+                    }
+                }
             }
         }
         if has_tail8 {
@@ -1116,6 +1058,11 @@ pub(crate) fn linear_packed<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin:
                         dr[lane] += xv * w_k[lane];
                     }
                 }
+                if HARDSWISH {
+                    for lane in 0..8 {
+                        dr[lane] = hardswish_scalar(dr[lane]);
+                    }
+                }
             }
         }
     }
@@ -1123,7 +1070,28 @@ pub(crate) fn linear_packed<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin:
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn linear_packed_avx2<const ADD_TO_DST: bool>(
+#[inline]
+unsafe fn store_avx2<const HARDSWISH: bool>(
+    dp: *mut f32,
+    v: std::arch::x86_64::__m256,
+    zero: std::arch::x86_64::__m256,
+    three: std::arch::x86_64::__m256,
+    six: std::arch::x86_64::__m256,
+    sixth: std::arch::x86_64::__m256,
+) {
+    use std::arch::x86_64::*;
+    let out = if HARDSWISH {
+        let gate = _mm256_min_ps(_mm256_max_ps(_mm256_add_ps(v, three), zero), six);
+        _mm256_mul_ps(v, _mm256_mul_ps(gate, sixth))
+    } else {
+        v
+    };
+    _mm256_storeu_ps(dp, out);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn linear_packed_avx2<const ADD_TO_DST: bool, const HARDSWISH: bool>(
     x: &[f32],
     rows: usize,
     lin: &PackedLinear,
@@ -1139,6 +1107,10 @@ unsafe fn linear_packed_avx2<const ADD_TO_DST: bool>(
     let w_base = lin.w.as_ptr();
     let b_base = lin.b.as_ptr();
     let d_base = dst.as_mut_ptr();
+    let zero = _mm256_setzero_ps();
+    let three = _mm256_set1_ps(3.0);
+    let six = _mm256_set1_ps(6.0);
+    let sixth = _mm256_set1_ps(HARD_SWISH_SIXTH);
 
     for tile in 0..tiles {
         let c = tile * 16;
@@ -1206,18 +1178,18 @@ unsafe fn linear_packed_avx2<const ADD_TO_DST: bool>(
                 a51 = _mm256_fmadd_ps(x5, wv1, a51);
             }
 
-            _mm256_storeu_ps(dp0, a00);
-            _mm256_storeu_ps(dp0.add(8), a01);
-            _mm256_storeu_ps(dp1, a10);
-            _mm256_storeu_ps(dp1.add(8), a11);
-            _mm256_storeu_ps(dp2, a20);
-            _mm256_storeu_ps(dp2.add(8), a21);
-            _mm256_storeu_ps(dp3, a30);
-            _mm256_storeu_ps(dp3.add(8), a31);
-            _mm256_storeu_ps(dp4, a40);
-            _mm256_storeu_ps(dp4.add(8), a41);
-            _mm256_storeu_ps(dp5, a50);
-            _mm256_storeu_ps(dp5.add(8), a51);
+            store_avx2::<HARDSWISH>(dp0, a00, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp0.add(8), a01, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp1, a10, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp1.add(8), a11, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp2, a20, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp2.add(8), a21, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp3, a30, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp3.add(8), a31, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp4, a40, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp4.add(8), a41, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp5, a50, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp5.add(8), a51, zero, three, six, sixth);
             r += 6;
         }
 
@@ -1247,10 +1219,10 @@ unsafe fn linear_packed_avx2<const ADD_TO_DST: bool>(
                 a10 = _mm256_fmadd_ps(x1, wv0, a10);
                 a11 = _mm256_fmadd_ps(x1, wv1, a11);
             }
-            _mm256_storeu_ps(dp0, a00);
-            _mm256_storeu_ps(dp0.add(8), a01);
-            _mm256_storeu_ps(dp1, a10);
-            _mm256_storeu_ps(dp1.add(8), a11);
+            store_avx2::<HARDSWISH>(dp0, a00, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp0.add(8), a01, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp1, a10, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp1.add(8), a11, zero, three, six, sixth);
             r += 2;
         }
 
@@ -1271,8 +1243,8 @@ unsafe fn linear_packed_avx2<const ADD_TO_DST: bool>(
                 a0 = _mm256_fmadd_ps(x0, _mm256_loadu_ps(wp), a0);
                 a1 = _mm256_fmadd_ps(x0, _mm256_loadu_ps(wp.add(8)), a1);
             }
-            _mm256_storeu_ps(dp0, a0);
-            _mm256_storeu_ps(dp0.add(8), a1);
+            store_avx2::<HARDSWISH>(dp0, a0, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp0.add(8), a1, zero, three, six, sixth);
         }
     }
 
@@ -1315,12 +1287,12 @@ unsafe fn linear_packed_avx2<const ADD_TO_DST: bool>(
                 a4 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp4.add(k)), wv, a4);
                 a5 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp5.add(k)), wv, a5);
             }
-            _mm256_storeu_ps(dp0, a0);
-            _mm256_storeu_ps(dp1, a1);
-            _mm256_storeu_ps(dp2, a2);
-            _mm256_storeu_ps(dp3, a3);
-            _mm256_storeu_ps(dp4, a4);
-            _mm256_storeu_ps(dp5, a5);
+            store_avx2::<HARDSWISH>(dp0, a0, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp1, a1, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp2, a2, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp3, a3, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp4, a4, zero, three, six, sixth);
+            store_avx2::<HARDSWISH>(dp5, a5, zero, three, six, sixth);
             r += 6;
         }
         while r < rows {
@@ -1330,14 +1302,39 @@ unsafe fn linear_packed_avx2<const ADD_TO_DST: bool>(
             for k in 0..inp {
                 a0 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp0.add(k)), _mm256_loadu_ps(w_tail.add(k * 8)), a0);
             }
-            _mm256_storeu_ps(dp0, a0);
+            store_avx2::<HARDSWISH>(dp0, a0, zero, three, six, sixth);
             r += 1;
         }
     }
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn linear_packed_wasm<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &PackedLinear, dst: &mut [f32]) {
+#[inline]
+unsafe fn store_wasm<const HARDSWISH: bool>(
+    dp: *mut f32,
+    v: core::arch::wasm32::v128,
+    zero: core::arch::wasm32::v128,
+    three: core::arch::wasm32::v128,
+    six: core::arch::wasm32::v128,
+    sixth: core::arch::wasm32::v128,
+) {
+    use core::arch::wasm32::*;
+    let out = if HARDSWISH {
+        let gate = f32x4_min(f32x4_max(f32x4_add(v, three), zero), six);
+        f32x4_mul(v, f32x4_mul(gate, sixth))
+    } else {
+        v
+    };
+    v128_store(dp as *mut v128, out);
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn linear_packed_wasm<const ADD_TO_DST: bool, const HARDSWISH: bool>(
+    x: &[f32],
+    rows: usize,
+    lin: &PackedLinear,
+    dst: &mut [f32],
+) {
     use core::arch::wasm32::*;
     let inp = lin.inp;
     let out_pad = lin.out_pad;
@@ -1348,6 +1345,10 @@ fn linear_packed_wasm<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &Pack
     let w_base = lin.w.as_ptr();
     let b_base = lin.b.as_ptr();
     let d_base = dst.as_mut_ptr();
+    let zero = f32x4_splat(0.0);
+    let three = f32x4_splat(3.0);
+    let six = f32x4_splat(6.0);
+    let sixth = f32x4_splat(HARD_SWISH_SIXTH);
 
     for tile in 0..tiles {
         let c = tile * 16;
@@ -1405,14 +1406,14 @@ fn linear_packed_wasm<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &Pack
                         a30 = f32x4_add(a30, f32x4_mul(x3, wv0));
                         a31 = f32x4_add(a31, f32x4_mul(x3, wv1));
                     }
-                    v128_store(dp0 as *mut v128, a00);
-                    v128_store(dp0.add(4) as *mut v128, a01);
-                    v128_store(dp1 as *mut v128, a10);
-                    v128_store(dp1.add(4) as *mut v128, a11);
-                    v128_store(dp2 as *mut v128, a20);
-                    v128_store(dp2.add(4) as *mut v128, a21);
-                    v128_store(dp3 as *mut v128, a30);
-                    v128_store(dp3.add(4) as *mut v128, a31);
+                    store_wasm::<HARDSWISH>(dp0, a00, zero, three, six, sixth);
+                    store_wasm::<HARDSWISH>(dp0.add(4), a01, zero, three, six, sixth);
+                    store_wasm::<HARDSWISH>(dp1, a10, zero, three, six, sixth);
+                    store_wasm::<HARDSWISH>(dp1.add(4), a11, zero, three, six, sixth);
+                    store_wasm::<HARDSWISH>(dp2, a20, zero, three, six, sixth);
+                    store_wasm::<HARDSWISH>(dp2.add(4), a21, zero, three, six, sixth);
+                    store_wasm::<HARDSWISH>(dp3, a30, zero, three, six, sixth);
+                    store_wasm::<HARDSWISH>(dp3.add(4), a31, zero, three, six, sixth);
                 }
             }
             r += 4;
@@ -1440,10 +1441,10 @@ fn linear_packed_wasm<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &Pack
                     a2 = f32x4_add(a2, f32x4_mul(x0, v128_load(wp.add(8) as *const v128)));
                     a3 = f32x4_add(a3, f32x4_mul(x0, v128_load(wp.add(12) as *const v128)));
                 }
-                v128_store(dp0 as *mut v128, a0);
-                v128_store(dp0.add(4) as *mut v128, a1);
-                v128_store(dp0.add(8) as *mut v128, a2);
-                v128_store(dp0.add(12) as *mut v128, a3);
+                store_wasm::<HARDSWISH>(dp0, a0, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp0.add(4), a1, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp0.add(8), a2, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp0.add(12), a3, zero, three, six, sixth);
             }
             r += 1;
         }
@@ -1500,14 +1501,14 @@ fn linear_packed_wasm<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &Pack
                     a30 = f32x4_add(a30, f32x4_mul(x3, wv0));
                     a31 = f32x4_add(a31, f32x4_mul(x3, wv1));
                 }
-                v128_store(dp0 as *mut v128, a00);
-                v128_store(dp0.add(4) as *mut v128, a01);
-                v128_store(dp1 as *mut v128, a10);
-                v128_store(dp1.add(4) as *mut v128, a11);
-                v128_store(dp2 as *mut v128, a20);
-                v128_store(dp2.add(4) as *mut v128, a21);
-                v128_store(dp3 as *mut v128, a30);
-                v128_store(dp3.add(4) as *mut v128, a31);
+                store_wasm::<HARDSWISH>(dp0, a00, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp0.add(4), a01, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp1, a10, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp1.add(4), a11, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp2, a20, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp2.add(4), a21, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp3, a30, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp3.add(4), a31, zero, three, six, sixth);
             }
             r += 4;
         }
@@ -1529,8 +1530,8 @@ fn linear_packed_wasm<const ADD_TO_DST: bool>(x: &[f32], rows: usize, lin: &Pack
                     a0 = f32x4_add(a0, f32x4_mul(x0, v128_load(wp as *const v128)));
                     a1 = f32x4_add(a1, f32x4_mul(x0, v128_load(wp.add(4) as *const v128)));
                 }
-                v128_store(dp0 as *mut v128, a0);
-                v128_store(dp0.add(4) as *mut v128, a1);
+                store_wasm::<HARDSWISH>(dp0, a0, zero, three, six, sixth);
+                store_wasm::<HARDSWISH>(dp0.add(4), a1, zero, three, six, sixth);
             }
             r += 1;
         }

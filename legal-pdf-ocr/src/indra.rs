@@ -954,12 +954,11 @@ fn render_pdf_pages(
     const MARGIN: usize = 16;
     let mut rendered = Vec::new();
     for request in requests {
-        let pixmap = pages
-            .render(request.page_index)
+        let pixmap = measure("ocr.render.hayro", || pages.render(request.page_index))
             .ok_or_else(|| Error::Message(format!("OCR renderer could not draw page {}", request.page_index + 1)))?;
         let (width, height) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
         let scale = [request.width / width as f64, request.height / height as f64];
-        let (gray_raw, ink_raw) = crate::ocr::gray_and_ink_of(&pixmap);
+        let (gray_raw, ink_raw) = measure("ocr.render.gray", || crate::ocr::gray_and_ink_of(&pixmap));
         let gray = GrayImage::from_raw(width as u32, height as u32, gray_raw)
             .expect("renderer dimensions match its pixel buffer");
         let ink = ink_raw.map(|buf| {
@@ -975,7 +974,9 @@ fn render_pdf_pages(
                 None => 0,
             };
             // A turned page's rule runs across its print, not across the page as drawn.
-            let separator = (turns == 0).then(|| crate::separator::separator_y(gray.as_raw(), width, height, request.height)).flatten();
+            let separator = (turns == 0)
+                .then(|| measure("ocr.render.sep", || crate::separator::separator_y(gray.as_raw(), width, height, request.height)))
+                .flatten();
             let (image, ink) = if turns == 0 { (gray, ink) } else { (turn(&gray, turns), ink.map(|img| turn(&img, turns))) };
             let drawn = [width as f64, height as f64];
             rendered.push((Placement { page_index: request.page_index, separator, scale, origin: [0.0, 0.0], turns, drawn }, image, ink));

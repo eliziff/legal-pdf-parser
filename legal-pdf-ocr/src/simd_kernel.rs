@@ -430,6 +430,9 @@ pub(crate) fn text_quality_score(lines: &[OcrLine]) -> f64 {
 pub(crate) struct DownsampleScratch {
     horiz: Vec<f32>,
     acc_row: Vec<f32>,
+    src_f32: Vec<f32>,
+    x0_packed: Vec<usize>,
+    w8_packed: Vec<f32>,
     x_ranges: Vec<(usize, usize)>,
     x_weights: Vec<f32>,
     x_active: Vec<(usize, usize, usize, f32)>,
@@ -638,6 +641,57 @@ pub(crate) fn resize_cropped_padded_triangle_u8(
     out
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn horiz_8tap_row_avx2(
+    src_row: &[u8],
+    src_f32: &mut [f32],
+    x0_packed: &[usize],
+    w8_packed: &[f32],
+    h_row: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let src_w = src_row.len();
+    let dst_w = h_row.len();
+    let sp = src_row.as_ptr();
+    let fp = src_f32.as_mut_ptr();
+    let mut i = 0usize;
+    while i + 8 <= src_w {
+        let bytes = _mm_loadl_epi64(sp.add(i) as *const __m128i);
+        _mm256_storeu_ps(fp.add(i), _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes)));
+        i += 8;
+    }
+    while i < src_w {
+        *fp.add(i) = f32::from(*sp.add(i));
+        i += 1;
+    }
+
+    let x0p = x0_packed.as_ptr();
+    let wp = w8_packed.as_ptr();
+    let dp = h_row.as_mut_ptr();
+    let mut dx = 0usize;
+    while dx + 4 <= dst_w {
+        let p0 = _mm256_mul_ps(_mm256_loadu_ps(fp.add(*x0p.add(dx))), _mm256_loadu_ps(wp.add(dx * 8)));
+        let p1 = _mm256_mul_ps(_mm256_loadu_ps(fp.add(*x0p.add(dx + 1))), _mm256_loadu_ps(wp.add((dx + 1) * 8)));
+        let p2 = _mm256_mul_ps(_mm256_loadu_ps(fp.add(*x0p.add(dx + 2))), _mm256_loadu_ps(wp.add((dx + 2) * 8)));
+        let p3 = _mm256_mul_ps(_mm256_loadu_ps(fp.add(*x0p.add(dx + 3))), _mm256_loadu_ps(wp.add((dx + 3) * 8)));
+        let h01 = _mm256_hadd_ps(p0, p1);
+        let h23 = _mm256_hadd_ps(p2, p3);
+        let h = _mm256_hadd_ps(h01, h23);
+        let out4 = _mm_add_ps(_mm256_castps256_ps128(h), _mm256_extractf128_ps::<1>(h));
+        _mm_storeu_ps(dp.add(dx), out4);
+        dx += 4;
+    }
+    while dx < dst_w {
+        let p = _mm256_mul_ps(_mm256_loadu_ps(fp.add(*x0p.add(dx))), _mm256_loadu_ps(wp.add(dx * 8)));
+        let h = _mm256_hadd_ps(p, p);
+        let h = _mm256_hadd_ps(h, h);
+        let s = _mm_add_ss(_mm256_castps256_ps128(h), _mm256_extractf128_ps::<1>(h));
+        _mm_store_ss(dp.add(dx), s);
+        dx += 1;
+    }
+}
+
 /// Zero-alloc separable Triangle (tent) downsample directly from `image` into `f32` `dst` with `1.0 - px/255.0` normalization and 0.0 right/bottom padding.
 pub(crate) fn downsample_to_norm_f32(
     image: &GrayImage,
@@ -658,25 +712,56 @@ pub(crate) fn downsample_to_norm_f32(
     fill_triangle_taps(src_w, dst_w, &mut scratch.x_ranges, &mut scratch.x_weights);
     fill_triangle_taps(src_h, dst_h, &mut scratch.y_ranges, &mut scratch.y_weights);
 
+    #[cfg(target_arch = "x86_64")]
+    let has_avx2 = is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_avx2 = false;
+    #[cfg(target_arch = "x86_64")]
+    let has_avx2_fma = has_avx2 && is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_avx2_fma = false;
+
+    let max_taps = (0..dst_w)
+        .map(|dx| scratch.x_ranges[dx + 1].1 - scratch.x_ranges[dx].1)
+        .max()
+        .unwrap_or(0);
+
     scratch.horiz.resize(src_h * dst_w, 0.0);
-    for sy in 0..src_h {
-        let src_row = &raw[sy * src_w..(sy + 1) * src_w];
-        let h_row = &mut scratch.horiz[sy * dst_w..(sy + 1) * dst_w];
+    if has_avx2 && max_taps <= 8 {
+        scratch.x0_packed.resize(dst_w, 0);
+        scratch.w8_packed.resize(dst_w * 8, 0.0);
+        scratch.w8_packed.fill(0.0);
         for dx in 0..dst_w {
             let (x0, w_start) = scratch.x_ranges[dx];
             let w_end = scratch.x_ranges[dx + 1].1;
-            let mut acc = 0.0f32;
-            for (k, &w) in scratch.x_weights[w_start..w_end].iter().enumerate() {
-                acc += f32::from(src_row[x0 + k]) * w;
+            scratch.x0_packed[dx] = x0;
+            scratch.w8_packed[dx * 8..dx * 8 + (w_end - w_start)].copy_from_slice(&scratch.x_weights[w_start..w_end]);
+        }
+        scratch.src_f32.resize(src_w + 8, 0.0);
+        scratch.src_f32[src_w..src_w + 8].fill(0.0);
+        for sy in 0..src_h {
+            let src_row = &raw[sy * src_w..(sy + 1) * src_w];
+            let h_row = &mut scratch.horiz[sy * dst_w..(sy + 1) * dst_w];
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                horiz_8tap_row_avx2(src_row, &mut scratch.src_f32, &scratch.x0_packed, &scratch.w8_packed, h_row);
             }
-            h_row[dx] = acc;
+        }
+    } else {
+        for sy in 0..src_h {
+            let src_row = &raw[sy * src_w..(sy + 1) * src_w];
+            let h_row = &mut scratch.horiz[sy * dst_w..(sy + 1) * dst_w];
+            for dx in 0..dst_w {
+                let (x0, w_start) = scratch.x_ranges[dx];
+                let w_end = scratch.x_ranges[dx + 1].1;
+                let mut acc = 0.0f32;
+                for (k, &w) in scratch.x_weights[w_start..w_end].iter().enumerate() {
+                    acc += f32::from(src_row[x0 + k]) * w;
+                }
+                h_row[dx] = acc;
+            }
         }
     }
-
-    #[cfg(target_arch = "x86_64")]
-    let has_avx2_fma = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
-    #[cfg(not(target_arch = "x86_64"))]
-    let has_avx2_fma = false;
 
     const INV255: f32 = 1.0 / 255.0;
     for dy in 0..dst_h {

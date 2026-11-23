@@ -1,6 +1,7 @@
 use crate::detector_native::{DetectorNative, DetectorScratch};
 use crate::indra::{open_session, ort_error, LineBox};
 use image::GrayImage;
+use legal_pdf_core::profile::measure;
 use legal_pdf_core::{Error, OrtBackend, Result};
 use ort::{
     session::{builder::PrepackedWeights, Session},
@@ -79,54 +80,66 @@ impl LineDetector {
         let resized_height = (f64::from(height) * scale).round().max(1.0) as usize;
         let input_width = resized_width.div_ceil(32) * 32;
         let input_height = resized_height.div_ceil(32) * 32;
-        crate::simd_kernel::downsample_to_norm_f32(
-            image,
-            resized_width,
-            resized_height,
-            input_width,
-            input_height,
-            &mut self.input,
-            &mut self.scratch,
-        );
+        measure("ocr.layout.downsample", || {
+            crate::simd_kernel::downsample_to_norm_f32(
+                image,
+                resized_width,
+                resized_height,
+                input_width,
+                input_height,
+                &mut self.input,
+                &mut self.scratch,
+            );
+        });
         let raw_boxes = match &mut self.engine {
             DetectorEngine::Native { model, scratch } => {
-                let out = model.run(&self.input, input_height, input_width, scratch);
-                decode(
-                    out,
-                    input_width / 2,
-                    input_height / 2,
-                    scale,
-                    width as usize,
-                    height as usize,
-                    &mut self.mask,
-                    &mut self.queue,
-                )
+                let out = measure("ocr.layout.nn", || model.run(&self.input, input_height, input_width, scratch));
+                measure("ocr.layout.decode", || {
+                    decode(
+                        out,
+                        input_width / 2,
+                        input_height / 2,
+                        scale,
+                        width as usize,
+                        height as usize,
+                        &mut self.mask,
+                        &mut self.queue,
+                    )
+                })
             }
             DetectorEngine::Ort { session, input_name } => {
                 let tensor = TensorRef::from_array_view(([1, 1, input_height, input_width], self.input.as_slice()))
                     .map_err(ort_error)?;
-                let outputs = session.run(ort::inputs![input_name.as_str() => tensor]).map_err(ort_error)?;
+                let outputs = measure("ocr.layout.nn", || {
+                    session.run(ort::inputs![input_name.as_str() => tensor]).map_err(ort_error)
+                })?;
                 let (shape, values) = outputs[0].try_extract_tensor::<f32>().map_err(ort_error)?;
                 if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 || shape[2] <= 0 || shape[3] <= 0 {
                     return Err(Error::Message(format!(
                         "Indra detector returned unexpected dimensions {shape:?}"
                     )));
                 }
-                decode(
-                    values,
-                    shape[3] as usize,
-                    shape[2] as usize,
-                    scale,
-                    width as usize,
-                    height as usize,
-                    &mut self.mask,
-                    &mut self.queue,
-                )
+                measure("ocr.layout.decode", || {
+                    decode(
+                        values,
+                        shape[3] as usize,
+                        shape[2] as usize,
+                        scale,
+                        width as usize,
+                        height as usize,
+                        &mut self.mask,
+                        &mut self.queue,
+                    )
+                })
             }
         };
-        let mut boxes = crate::gutter::split_across_gutters(image.as_raw(), width as usize, raw_boxes);
+        let mut boxes = measure("ocr.layout.gutter", || {
+            crate::gutter::split_across_gutters(image.as_raw(), width as usize, raw_boxes)
+        });
         xycut(&mut boxes);
-        let boxes = crate::uncovered::recover_uncovered_lines(image.as_raw(), width as usize, height as usize, boxes);
+        let boxes = measure("ocr.layout.uncovered", || {
+            crate::uncovered::recover_uncovered_lines(image.as_raw(), width as usize, height as usize, boxes)
+        });
         Ok(
             order_footnotes(boxes, width as usize, height as usize)
                 .into_iter()
