@@ -70,6 +70,13 @@ struct BlockWeights {
     se_channels: usize,
 }
 
+struct ShortlistHead {
+    fast: PackedLinear,
+    fast_ids: Vec<usize>,
+    tail: PackedLinear,
+    tail_ids: Vec<usize>,
+}
+
 /// Loaded Indra 1D-CNN CTC recognizer model ready for zero-allocation per-line SIMD inference.
 pub struct IndraNative {
     channels: usize,
@@ -78,6 +85,7 @@ pub struct IndraNative {
     stem: PackedLinear,
     blocks: Vec<BlockWeights>,
     head: PackedLinear,
+    shortlist: Option<ShortlistHead>,
 }
 
 impl IndraNative {
@@ -229,6 +237,39 @@ impl IndraNative {
             return Err(format!("unexpected model.head.bias len {}", head_b.len()));
         }
         let head = PackedLinear::pack(&head_w_t.data, &head_b, vocab_size, channels);
+        const PUNCT_EXT: [usize; 8] = [834, 835, 838, 839, 842, 843, 848, 892];
+        let shortlist = if vocab_size > 256 {
+            let mut in_fast = vec![false; vocab_size];
+            let mut fast_ids = Vec::with_capacity(264);
+            for id in 0..256 {
+                in_fast[id] = true;
+                fast_ids.push(id);
+            }
+            for &id in &PUNCT_EXT {
+                if id < vocab_size && !in_fast[id] {
+                    in_fast[id] = true;
+                    fast_ids.push(id);
+                }
+            }
+            let tail_ids: Vec<usize> = (0..vocab_size).filter(|&id| !in_fast[id]).collect();
+            let pack_subset = |ids: &[usize]| -> PackedLinear {
+                let mut w_sub = Vec::with_capacity(ids.len() * channels);
+                let mut b_sub = Vec::with_capacity(ids.len());
+                for &oc in ids {
+                    w_sub.extend_from_slice(&head_w_t.data[oc * channels..(oc + 1) * channels]);
+                    b_sub.push(head_b[oc]);
+                }
+                PackedLinear::pack(&w_sub, &b_sub, ids.len(), channels)
+            };
+            Some(ShortlistHead {
+                fast: pack_subset(&fast_ids),
+                fast_ids,
+                tail: pack_subset(&tail_ids),
+                tail_ids,
+            })
+        } else {
+            None
+        };
 
         Ok(Self {
             channels,
@@ -236,6 +277,7 @@ impl IndraNative {
             stem,
             blocks,
             head,
+            shortlist,
         })
     }
 
@@ -360,13 +402,53 @@ impl IndraNative {
 
         let c = self.channels;
         let v = self.vocab_size;
-        let head_stride = self.head.out_pad;
         let chunk_rows = 24.min(timesteps);
-        scratch.logits_block.resize(chunk_rows * head_stride, 0.0);
-
         let mut step_labels = Vec::with_capacity(timesteps);
         let mut ctc_spans: Vec<(usize, f32)> = Vec::new();
         let mut previous = usize::MAX;
+
+        if !need_confidence {
+            if let Some(sl) = &self.shortlist {
+                let fast_stride = sl.fast.out_pad;
+                let fast_len = sl.fast_ids.len();
+                let tail_stride = sl.tail.out_pad;
+                let tail_len = sl.tail_ids.len();
+                scratch.logits_block.resize(chunk_rows * fast_stride, 0.0);
+                scratch.b.resize(tail_stride, 0.0);
+
+                let mut t = 0usize;
+                while t < timesteps {
+                    let rows = (timesteps - t).min(chunk_rows);
+                    let x_slice = &scratch.a[t * c..(t + rows) * c];
+                    let out_slice = &mut scratch.logits_block[..rows * fast_stride];
+                    linear_packed::<false>(x_slice, rows, &sl.fast, out_slice);
+
+                    for row_idx in 0..rows {
+                        let row = &out_slice[row_idx * fast_stride..row_idx * fast_stride + fast_len];
+                        let (fast_pos, best_val) = argmax_f32(row);
+                        let mut best_label = sl.fast_ids[fast_pos];
+                        if best_val < 2.0 && tail_len > 0 {
+                            let x_row = &x_slice[row_idx * c..(row_idx + 1) * c];
+                            linear_packed::<false>(x_row, 1, &sl.tail, &mut scratch.b[..tail_stride]);
+                            let (tail_pos, tail_val) = argmax_f32(&scratch.b[..tail_len]);
+                            if tail_val > best_val {
+                                best_label = sl.tail_ids[tail_pos];
+                            }
+                        }
+                        step_labels.push((best_label != BLANK_LABEL).then_some(best_label));
+                        if best_label != BLANK_LABEL && best_label != previous {
+                            ctc_spans.push((best_label, 1.0));
+                        }
+                        previous = best_label;
+                    }
+                    t += rows;
+                }
+                return (timesteps, step_labels, ctc_spans);
+            }
+        }
+
+        let head_stride = self.head.out_pad;
+        scratch.logits_block.resize(chunk_rows * head_stride, 0.0);
 
         let mut t = 0usize;
         while t < timesteps {

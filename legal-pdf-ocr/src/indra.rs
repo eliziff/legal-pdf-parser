@@ -1509,21 +1509,27 @@ mod tests {
         legal_pdf_core::init_ort_runtime(&ort_dll, None).expect("init ort runtime");
 
         let weights = PrepackedWeights::new();
+        let browser_followup = manifest_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("legal-browser-ocr/assets/indra-followup");
         let models = [
             (
                 "student8cropids",
-                runtime_dir.join("indra/assets/indra-followup/student8cropids/model.onnx"),
-                runtime_dir.join("indra/assets/indra-followup/student8cropids/codec.json"),
+                browser_followup.join("student8cropids/model.onnx"),
+                browser_followup.join("student8cropids/codec.json"),
             ),
             (
                 "student10c64cropids",
-                runtime_dir.join("indra/assets/indra-followup/student10c64cropids/model.onnx"),
-                runtime_dir.join("indra/assets/indra-followup/student10c64cropids/codec.json"),
+                browser_followup.join("student10c64cropids/model.onnx"),
+                browser_followup.join("student10c64cropids/codec.json"),
             ),
             (
                 "wise_a075",
-                runtime_dir.join("indra-wise-a075/assets/markers/model.onnx"),
-                runtime_dir.join("indra-wise-a075/assets/markers/codec.json"),
+                runtime_dir.join("indra/assets/markers/model.onnx"),
+                runtime_dir.join("indra/assets/markers/codec.json"),
             ),
         ];
 
@@ -1580,6 +1586,9 @@ mod tests {
 
                 let (nat_t_u8, step_labels, ctc_spans) = native.recognize_u8(&u8_line, width, true, &mut scratch);
                 assert_eq!(nat_t_u8, ort_len);
+                let (fast_t_u8, fast_labels, _) = native.recognize_u8(&u8_line, width, false, &mut scratch);
+                assert_eq!(fast_t_u8, ort_len);
+                assert_eq!(fast_labels, step_labels, "{label} width={width}: shortlist class_ids mismatch");
                 for t in 0..ort_len {
                     let ort_id = usize::try_from(ids_data[t]).unwrap();
                     let nat_id = step_labels[t].unwrap_or(0);

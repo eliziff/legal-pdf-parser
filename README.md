@@ -8,10 +8,12 @@ Local PDF extraction, OCR, and legal document structure parsing in Rust. Digital
 
 | Engine / preset | Pages/s | CER |
 | --- | ---: | ---: |
-| Full-alphabet blended model, CPU (12-page scan) | **2.8** | — |
-| Full-alphabet blended model, GPU DirectML FP32 (12-page scan) | **2.1** | — |
-| Pruned Balanced GPU DirectML FP16 (55-page scan) | **13.7** | **2.5%** |
-| Pruned Quality GPU DirectML FP16 (55-page scan) | **12.1** | **2.3%** |
+| Balanced CPU, full-alphabet blended model (12-page scan) | **5.2** | — |
+| Extreme CPU, compact 64-ch model (12-page scan) | **6.9** | — |
+| Balanced GPU DirectML FP16, full-alphabet (12-page scan) | **2.1** | — |
+| Extreme GPU DirectML FP16, compact 64-ch (12-page scan) | **2.9** | — |
+| Pruned Balanced GPU DirectML FP16 (55-page scan baseline) | **13.7** | **2.5%** |
+| Pruned Quality GPU DirectML FP16 (55-page scan baseline) | **12.1** | **2.3%** |
 | Pruned Balanced CPU baseline (55-page scan) | **8.3** | **2.5%** |
 | Stock Indra CPU (browser baseline, 55-page scan) | 6.9 | 3.4% |
 | Tesseract CPU (browser baseline, 6 workers, 55-page scan) | 2.3 | 2.3% |
