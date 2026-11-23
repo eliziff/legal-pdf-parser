@@ -1837,7 +1837,7 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 #[cfg(target_arch = "wasm32")]
-mod wasm_abi {
+pub mod wasm_abi {
     use super::{IndraNative, IndraScratch};
     use std::alloc::{alloc as heap_alloc, dealloc as heap_dealloc, Layout};
 

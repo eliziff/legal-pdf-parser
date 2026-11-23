@@ -1079,3 +1079,64 @@ fn upsample_nearest2x_add_wasm(
         }
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_abi {
+    use super::{DetectorNative, DetectorScratch};
+
+    struct WasmDetector {
+        model: DetectorNative,
+        scratch: DetectorScratch,
+    }
+
+    #[no_mangle]
+    pub extern "C" fn detector_load(ptr: *const u8, len: usize) -> usize {
+        if ptr.is_null() || len == 0 {
+            return 0;
+        }
+        // SAFETY: caller provides `len` readable bytes allocated in Wasm linear memory.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        match DetectorNative::from_onnx_bytes(bytes) {
+            Ok(model) => Box::into_raw(Box::new(WasmDetector {
+                model,
+                scratch: DetectorScratch::default(),
+            })) as usize,
+            Err(_) => 0,
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn detector_free(handle: usize) {
+        if handle != 0 {
+            // SAFETY: handle was created by Box::into_raw in detector_load.
+            unsafe { drop(Box::from_raw(handle as *mut WasmDetector)) };
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn detector_run(
+        handle: usize,
+        input_ptr: *const f32,
+        height: usize,
+        width: usize,
+        out_ptr: *mut f32,
+    ) -> usize {
+        if handle == 0
+            || input_ptr.is_null()
+            || out_ptr.is_null()
+            || height < 32
+            || width < 32
+            || !height.is_multiple_of(32)
+            || !width.is_multiple_of(32)
+        {
+            return 0;
+        }
+        // SAFETY: caller passes `height * width` input f32s and `3 * (height/2) * (width/2)` output slots.
+        let state = unsafe { &mut *(handle as *mut WasmDetector) };
+        let input = unsafe { std::slice::from_raw_parts(input_ptr, height * width) };
+        let output = state.model.run(input, height, width, &mut state.scratch);
+        let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr, output.len()) };
+        dst.copy_from_slice(output);
+        output.len()
+    }
+}
