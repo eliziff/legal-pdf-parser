@@ -12,6 +12,24 @@ use log::debug;
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
+pub(crate) trait EncodingLookup<'a> {
+    fn get_encoding(&self, name: &str) -> Option<&Encoding<'a>>;
+}
+
+pub(crate) struct BorrowedEncodings<'b, 'a>(pub(crate) HashMap<String, &'b Encoding<'a>>);
+
+impl<'a> EncodingLookup<'a> for HashMap<String, Encoding<'a>> {
+    fn get_encoding(&self, name: &str) -> Option<&Encoding<'a>> {
+        self.get(name)
+    }
+}
+
+impl<'a> EncodingLookup<'a> for BorrowedEncodings<'_, 'a> {
+    fn get_encoding(&self, name: &str) -> Option<&Encoding<'a>> {
+        self.0.get(name).copied()
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum CMapChoice {
     Primary,
@@ -894,7 +912,7 @@ pub(crate) fn extract_fidelity_glyphs(
     font_tounicode_refs: &HashMap<String, u32>,
     inline_cmaps: &HashMap<String, crate::tounicode::CMapEntry>,
     font_encodings: &PageFontEncodings,
-    encoding_cache: &HashMap<String, Encoding<'_>>,
+    encoding_cache: &dyn EncodingLookup<'_>,
     cmap_decisions: &mut CMapDecisionCache,
     font_widths: &PageFontWidths,
     font_kinds: &PageFontKinds,
@@ -2786,7 +2804,7 @@ pub(crate) fn extract_text_from_operand(
     font_tounicode_refs: &std::collections::HashMap<String, u32>,
     inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
     font_encodings: &PageFontEncodings,
-    encoding_cache: &HashMap<String, Encoding<'_>>,
+    encoding_cache: &dyn EncodingLookup<'_>,
     cmap_decisions: &mut CMapDecisionCache,
     font_widths: &PageFontWidths,
     font_kinds: &PageFontKinds,
@@ -2821,7 +2839,7 @@ pub(crate) fn extract_text_from_operand_fidelity(
     font_tounicode_refs: &std::collections::HashMap<String, u32>,
     inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
     font_encodings: &PageFontEncodings,
-    encoding_cache: &HashMap<String, Encoding<'_>>,
+    encoding_cache: &dyn EncodingLookup<'_>,
     cmap_decisions: &mut CMapDecisionCache,
     font_widths: &PageFontWidths,
     font_kinds: &PageFontKinds,
@@ -2852,7 +2870,7 @@ fn extract_text_from_operand_impl(
     font_tounicode_refs: &std::collections::HashMap<String, u32>,
     inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
     font_encodings: &PageFontEncodings,
-    encoding_cache: &HashMap<String, Encoding<'_>>,
+    encoding_cache: &dyn EncodingLookup<'_>,
     cmap_decisions: &mut CMapDecisionCache,
     font_widths: &PageFontWidths,
     font_kinds: &PageFontKinds,
@@ -3351,7 +3369,7 @@ fn extract_text_from_operand_impl(
             }
 
             // Try to decode using cached font encoding from lopdf
-            if let Some(encoding) = encoding_cache.get(current_font) {
+            if let Some(encoding) = encoding_cache.get_encoding(current_font) {
                 if let Ok(text) = Document::decode_text(encoding, bytes) {
                     let text = normalize_cp1252_controls(text, use_cp1252_fallback);
                     if text.contains('\u{FFFD}') {

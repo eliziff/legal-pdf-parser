@@ -164,9 +164,6 @@ pub fn extract_fidelity_from_doc(
         read_document_info(doc),
         &DetectionConfig::default(),
     );
-    // The text-quality pass the Markdown path runs: decoding garbage the page
-    // evidence cannot see (private-use and C1 runs, CID garbage, `Word$Word`,
-    // replacement runs, substitution-cipher letters) routes its page to OCR.
     let text_quality = crate::text_quality::analyze_text_quality(&extraction.0);
     for page in text_quality.pages_needing_ocr {
         if !detection.pages_needing_ocr.contains(&page) {
@@ -819,8 +816,8 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     .map(without_evidence)
 }
 
-fn extract_positioned_text_impl(
-    doc: &Document,
+fn extract_positioned_text_impl<'a>(
+    doc: &'a Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     options: TextExtractionOptions,
@@ -831,11 +828,12 @@ fn extract_positioned_text_impl(
     frame: CoordinateFrame,
 ) -> Result<EvidencedExtraction, PdfError> {
     let pages = doc.get_pages();
-    // Decode the largest content streams before accumulated page results can
-    // inflate their peak. Results are restored to page order below.
-    let mut extraction_pages: Vec<_> = pages
+    // Schedule the largest content streams first for better worker load balance
+    // and bounded peak memory; results are restored to page order below.
+    let mut target_pages: Vec<(u32, ObjectId, usize)> = pages
         .iter()
-        .map(|(number, &id)| {
+        .filter(|(number, _)| page_filter.is_none_or(|filter| filter.contains(number)))
+        .map(|(&number, &id)| {
             let bytes = doc
                 .get_page_contents(id)
                 .iter()
@@ -846,14 +844,11 @@ fn extract_positioned_text_impl(
             (number, id, bytes)
         })
         .collect();
-    extraction_pages.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(right.0)));
-    let mut extracted_pages = Vec::with_capacity(pages.len());
+    target_pages.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
     // Per font, the codes shown through its CMap over every extracted page.
     let mut cmap_coverage = CMapCoverageByFont::new();
-    // Font products are document-scoped: pages commonly reuse the same set.
-    let mut font_cache = FontProductCache::new();
     let mut page_rotations: PageRotations = HashMap::new();
 
     // Build page ObjectId → page number map for form field extraction
@@ -866,22 +861,32 @@ fn extract_positioned_text_impl(
         }
     }
 
-    for (page_num, page_id, _) in extraction_pages {
-        if let Some(filter) = page_filter {
-            if !filter.contains(page_num) {
-                continue;
-            }
-        }
-        let page_result = content_stream::extract_page_text_items_impl(
+    struct ExtractedPage {
+        page_num: u32,
+        extraction: PageExtraction,
+        detection: PageDetectionEvidence,
+        has_gid_fonts: bool,
+        coords_rotated: geometry::PageRotation,
+        coverage: CMapCoverageByFont,
+        threshold: f32,
+    }
+
+    let process_page = |font_cache: &mut FontProductCache,
+                        lopdf_encodings: &mut HashMap<usize, Option<lopdf::Encoding<'a>>>,
+                        &(page_num, page_id, _): &(u32, ObjectId, usize)|
+     -> Result<Option<ExtractedPage>, PdfError> {
+        let page_result = content_stream::extract_page_text_items_with_caches(
             doc,
             page_id,
-            *page_num,
+            page_num,
             font_cmaps,
             options,
-            &mut font_cache,
+            font_cache,
+            lopdf_encodings,
             &mut FormWalkBudget::new(),
             merge_text,
             merge_scripts,
+            fidelity,
             fidelity,
         );
         let (
@@ -893,21 +898,18 @@ fn extract_positioned_text_impl(
             page_detection,
         ) = match page_result {
             Ok(extraction) => extraction,
-            Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
+            Err(error) if required_pages.is_some_and(|required| !required.contains(&page_num)) => {
                 debug!(
                     "page {}: skipping context-only extraction error: {}",
                     page_num, error
                 );
-                continue;
+                return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        // The fidelity reader's OCR-layer fallback, as the region reader has it: a scan that
-        // carries its text as an invisible (Tr 3) layer behind the raster has no visible text,
-        // and the layer is the page's text until the page is recognized again. Adopted only when
-        // the page shows no visible text (the layer would duplicate it) and the whole layer
-        // carries real, non-garbage text; the page's detection evidence is kept, so the page
-        // still reports its invisible layer.
+        // The fidelity reader's OCR-layer fallback, when the page carries no
+        // visible text and the skipped Tr 3 text is coherent (not the
+        // boilerplate placeholder an OCR generator stamps behind a blank side).
         if fidelity
             && skipped_invisible
             && !options.include_invisible
@@ -915,18 +917,25 @@ fn extract_positioned_text_impl(
                 !matches!(item.item_type, crate::types::ItemType::Image) && !item.text.trim().is_empty()
             })
         {
-            if let Ok(((layer, _, _, _), _, _, _, _, _)) = content_stream::extract_page_text_items_impl(
-                doc,
-                page_id,
-                *page_num,
-                font_cmaps,
-                TextExtractionOptions { include_invisible: true, ..options },
-                &mut font_cache,
-                &mut FormWalkBudget::new(),
-                merge_text,
-                merge_scripts,
-                fidelity,
-            ) {
+            if let Ok(((layer, _, _, _), _, _, _, _, _)) =
+                content_stream::extract_page_text_items_with_caches(
+                    doc,
+                    page_id,
+                    page_num,
+                    font_cmaps,
+                    TextExtractionOptions {
+                        include_invisible: true,
+                        ..options
+                    },
+                    font_cache,
+                    lopdf_encodings,
+                    &mut FormWalkBudget::new(),
+                    merge_text,
+                    merge_scripts,
+                    fidelity,
+                    false,
+                )
+            {
                 let text: String = layer
                     .iter()
                     .filter(|item| !matches!(item.item_type, crate::types::ItemType::Image))
@@ -938,9 +947,6 @@ fn extract_positioned_text_impl(
                     items = layer;
                 }
             }
-        }
-        if coords_rotated != geometry::PageRotation::Upright {
-            page_rotations.insert(*page_num, coords_rotated);
         }
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
@@ -1028,24 +1034,10 @@ fn extract_positioned_text_impl(
                 }
             }
         }
-        if has_gid_fonts {
-            gid_encoded_pages.insert(*page_num);
-        }
-        for RunCoverage { font, stats, .. } in run_coverage {
-            match cmap_coverage.get_mut(&*font) {
-                Some(total) => total.add(stats),
-                None => {
-                    cmap_coverage.insert(font.to_string(), stats);
-                }
-            }
-        }
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
-        if threshold > 0.10 {
-            page_thresholds.insert(*page_num, threshold);
-        }
         // A fidelity consumer reads its own tables, and clears their rulings' underlines itself.
         if !fidelity {
-            suppress_table_underlines(&mut items, &rects, &lines, *page_num);
+            suppress_table_underlines(&mut items, &rects, &lines, page_num);
         }
         debug!(
             "page {}: {} text items, {} rects, {} lines{}",
@@ -1083,7 +1075,7 @@ fn extract_positioned_text_impl(
         // Extract hyperlinks from page annotations. A turned page turns its
         // annotation boxes too, so links stay on the text they cover and in
         // the regions that text is assigned to.
-        let mut links = extract_page_links(doc, page_id, *page_num);
+        let mut links = extract_page_links(doc, page_id, page_num);
         for link in &mut links {
             coords_rotated.rotate_box(&mut link.x, &mut link.y, &mut link.width, &mut link.height);
         }
@@ -1101,7 +1093,7 @@ fn extract_positioned_text_impl(
         if frame == CoordinateFrame::VisiblePageBox {
             frame_box.translate_items(&mut links, coords_rotated);
         }
-        let mut fields = form_items.remove(page_num).unwrap_or_default();
+        let mut fields = form_items.get(&page_num).cloned().unwrap_or_default();
         for field in &mut fields {
             coords_rotated.rotate_box(
                 &mut field.x,
@@ -1113,24 +1105,82 @@ fn extract_positioned_text_impl(
         if frame == CoordinateFrame::VisiblePageBox {
             frame_box.translate_items(&mut fields, coords_rotated);
         }
+        let mut page_coverage = CMapCoverageByFont::new();
+        for RunCoverage { font, stats, .. } in run_coverage {
+            match page_coverage.get_mut(&*font) {
+                Some(total) => total.add(stats),
+                None => {
+                    page_coverage.insert(font.to_string(), stats);
+                }
+            }
+        }
         items.extend(links);
         items.extend(fields);
-        extracted_pages.push((*page_num, (items, rects, lines, rules), page_detection));
-    }
+        Ok(Some(ExtractedPage {
+            page_num,
+            extraction: (items, rects, lines, rules),
+            detection: page_detection,
+            has_gid_fonts,
+            coords_rotated,
+            coverage: page_coverage,
+            threshold,
+        }))
+    };
 
-    extracted_pages.sort_by_key(|(page, _, _)| *page);
+    #[cfg(not(target_arch = "wasm32"))]
+    let page_results: Vec<Option<ExtractedPage>> = {
+        use rayon::prelude::*;
+        target_pages
+            .par_iter()
+            .map_init(
+                || (FontProductCache::new(), HashMap::new()),
+                |(font_cache, lopdf_encodings), page| {
+                    process_page(font_cache, lopdf_encodings, page)
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    #[cfg(target_arch = "wasm32")]
+    let page_results: Vec<Option<ExtractedPage>> = {
+        let mut font_cache = FontProductCache::new();
+        let mut lopdf_encodings = HashMap::new();
+        target_pages
+            .iter()
+            .map(|page| process_page(&mut font_cache, &mut lopdf_encodings, page))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut extracted_pages: Vec<ExtractedPage> = page_results.into_iter().flatten().collect();
+    extracted_pages.sort_by_key(|page| page.page_num);
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
     let mut all_rules = Vec::new();
     let mut detection = Vec::with_capacity(if fidelity { extracted_pages.len() } else { 0 });
-    for (_, (items, rects, lines, rules), page_detection) in extracted_pages {
-        all_items.extend(items);
-        all_rects.extend(rects);
-        all_lines.extend(lines);
-        all_rules.extend(rules);
+    for page in extracted_pages {
+        if page.coords_rotated != geometry::PageRotation::Upright {
+            page_rotations.insert(page.page_num, page.coords_rotated);
+        }
+        if page.has_gid_fonts {
+            gid_encoded_pages.insert(page.page_num);
+        }
+        for (font, stats) in page.coverage {
+            match cmap_coverage.get_mut(&font) {
+                Some(total) => total.add(stats),
+                None => {
+                    cmap_coverage.insert(font, stats);
+                }
+            }
+        }
+        if page.threshold > 0.10 {
+            page_thresholds.insert(page.page_num, page.threshold);
+        }
+        all_items.extend(page.extraction.0);
+        all_rects.extend(page.extraction.1);
+        all_lines.extend(page.extraction.2);
+        all_rules.extend(page.extraction.3);
         if fidelity {
-            detection.push(page_detection);
+            detection.push(page.detection);
         }
     }
 

@@ -1011,6 +1011,48 @@ pub(crate) fn extract_page_text_items_impl(
     ),
     PdfError,
 > {
+    let mut lopdf_encodings = HashMap::new();
+    extract_page_text_items_with_caches(
+        doc,
+        page_id,
+        page_num,
+        font_cmaps,
+        options,
+        font_cache,
+        &mut lopdf_encodings,
+        form_budget,
+        merge_text,
+        merge_scripts,
+        fidelity,
+        fidelity,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn extract_page_text_items_with_caches<'a>(
+    doc: &'a Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    options: TextExtractionOptions,
+    font_cache: &mut FontProductCache,
+    lopdf_encodings: &mut HashMap<usize, Option<Encoding<'a>>>,
+    form_budget: &mut FormWalkBudget,
+    merge_text: bool,
+    merge_scripts: bool,
+    fidelity: bool,
+    need_detection: bool,
+) -> Result<
+    (
+        PageExtraction,
+        bool,
+        PageRotation,
+        bool,
+        Vec<RunCoverage>,
+        PageDetectionEvidence,
+    ),
+    PdfError,
+> {
     let include_invisible = options.include_invisible;
     let mut items = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
@@ -1067,7 +1109,7 @@ pub(crate) fn extract_page_text_items_impl(
         stream_ranges.push(start..raw_content.len());
         raw_content.push(b'\n');
     }
-    let detection = fidelity
+    let detection = (fidelity && need_detection)
         .then(|| {
             analyze_page_content_streams(
                 doc,
@@ -1151,15 +1193,25 @@ pub(crate) fn extract_page_text_items_impl(
     let font_styles = &products.style_flags;
     let font_fidelity = &products.fidelity;
 
-    // Cache font encodings from lopdf (once per font, not per text operand).
-    // This avoids re-parsing ToUnicode CMap streams for every Tj/TJ operator.
-    let mut encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
-    for (font_name, font_dict) in &fonts {
-        let name = String::from_utf8_lossy(font_name).to_string();
-        if let Ok(enc) = font_dict.get_font_encoding(doc) {
-            encoding_cache.insert(name, enc);
-        }
+    // Reuse parsed lopdf font encodings across pages in the same worker by
+    // font dictionary identity, avoiding repeated encoding resolution on every
+    // page while mapping each page's local resource names to the cached value.
+    for font_dict in fonts.values() {
+        let ptr = std::ptr::from_ref(*font_dict) as usize;
+        lopdf_encodings
+            .entry(ptr)
+            .or_insert_with(|| font_dict.get_font_encoding(doc).ok());
     }
+    let encoding_cache = super::fonts::BorrowedEncodings(
+        fonts
+            .iter()
+            .filter_map(|(font_name, font_dict)| {
+                let ptr = std::ptr::from_ref(*font_dict) as usize;
+                let enc = lopdf_encodings.get(&ptr)?.as_ref()?;
+                Some((String::from_utf8_lossy(font_name).into_owned(), enc))
+            })
+            .collect(),
+    );
 
     let mut cmap_decisions = CMapDecisionCache::new();
 
