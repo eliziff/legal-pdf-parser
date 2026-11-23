@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
 
@@ -138,11 +138,10 @@ struct Recognition {
     words: Vec<OcrWord>,
 }
 
-/// Where a recognized image stands on its page: its page, the rule above the page's notes, the
-/// points each pixel spans, its top-left corner on the page in points, and the quarter turns
-/// counter-clockwise that stood it upright with its size as drawn, in pixels.
+/// Where a recognized image stands on its page: the rule above the page's notes, the points each
+/// pixel spans, its top-left corner on the page in points, and the quarter turns counter-clockwise
+/// that stood it upright with its size as drawn, in pixels.
 struct Placement {
-    page_index: usize,
     separator: Option<f64>,
     scale: [f64; 2],
     origin: [f64; 2],
@@ -444,15 +443,16 @@ impl OcrProvider {
         Ok(pages)
     }
 
-    /// The requested pages of `bytes` recognized, in request order: drawn by up to four workers,
-    /// their lines found and prepared, and read, each stage a window of pages ahead of the next.
+    /// The requested pages of `bytes` recognized, in request order: rendered pages stream directly
+    /// into persistent layout workers and from layout into micro-batched recognition without whole-window barriers.
     pub(crate) fn recognize_pdf(&mut self, bytes: &[u8], requests: &[OcrPageRequest]) -> Result<Vec<OcrPageResult>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let window_size = preparation_window_size(requests.len());
         let available = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let render_workers = available.div_ceil(4).clamp(1, 3).min(window_size);
+        let render_workers = available.div_ceil(4).clamp(1, 3).min(requests.len());
+        let layout_workers = self.layouts.len().min(requests.len()).max(1);
+        let queue_cap = (render_workers + layout_workers).max(4);
         let dpi = f64::from(self.dpi);
         // Picture regions use real confidence to distinguish print from seals and chart lettering.
         let confidence_pages =
@@ -465,107 +465,147 @@ impl OcrProvider {
             .map(|request| OcrPageResult { page_index: request.page_index, lines: Vec::new(), separator_y: None })
             .collect();
         measure("ocr.total", || {
+            let (render_tx, raw_render_rx) = sync_channel::<Result<(usize, Vec<(Placement, GrayImage, Option<GrayImage>)>)>>(queue_cap);
+            let render_rx = Mutex::new(raw_render_rx);
+            let (prep_tx, prep_rx) = sync_channel::<Result<(usize, Vec<(Placement, Vec<PreparedLine>)>)>>(queue_cap);
+            let next_render = AtomicUsize::new(0);
+            let aborted = AtomicBool::new(false);
+            let (pdf, orientation, confidence_pages, aborted_ref, next_render_ref, render_rx_ref) =
+                (&pdf, orientation.as_ref(), &confidence_pages, &aborted, &next_render, &render_rx);
             std::thread::scope(|scope| -> Result<()> {
-                let (render_sender, render_receiver) = sync_channel(1);
-                let (prepared_sender, prepared_receiver) = sync_channel(1);
-                let (pdf, orientation) = (&pdf, orientation.as_ref());
-                scope.spawn(move || {
-                    std::thread::scope(|render_scope| {
-                        let mut queues = Vec::new();
-                        for worker in 0..render_workers {
-                            let (sender, receiver) = sync_channel(0);
-                            queues.push(receiver);
-                            render_scope.spawn(move || {
-                                // Share the parsed PDF; each worker draws with its own render cache.
-                                let pages = PageRenderer::new(pdf, dpi);
-                                for window in requests.chunks(window_size) {
-                                    let start = worker * window.len() / render_workers;
-                                    let end = (worker + 1) * window.len() / render_workers;
-                                    let rendered = measure("ocr.render", || render_pdf_pages(&pages, &window[start..end], orientation));
-                                    let failed = rendered.is_err();
-                                    if sender.send(rendered).is_err() || failed {
-                                        break;
-                                    }
-                                }
-                            });
-                        }
-                        for _ in requests.chunks(window_size) {
-                            let value = queues.iter().try_fold(Vec::new(), |mut pages, queue| {
-                                pages.extend(queue.recv().map_err(|_| Error::Message("PDF render worker stopped before returning its pages".into()))??);
-                                Ok(pages)
-                            });
-                            let failed = value.is_err();
-                            if render_sender.send(value).is_err() || failed {
+                for _ in 0..render_workers {
+                    let render_tx = render_tx.clone();
+                    scope.spawn(move || {
+                        let pages = PageRenderer::new(pdf, dpi);
+                        while !aborted_ref.load(Ordering::Relaxed) {
+                            let req_idx = next_render_ref.fetch_add(1, Ordering::Relaxed);
+                            if req_idx >= requests.len() {
+                                break;
+                            }
+                            let rendered = measure("ocr.render", || {
+                                render_single_request(&pages, &requests[req_idx], orientation)
+                            })
+                            .map(|items| (req_idx, items));
+                            let failed = rendered.is_err();
+                            if failed {
+                                aborted_ref.store(true, Ordering::Relaxed);
+                            }
+                            if render_tx.send(rendered).is_err() || failed {
                                 break;
                             }
                         }
-                        // Closing every rendezvous queue also unblocks workers if a downstream stage fails.
-                        drop(queues);
                     });
-                });
-                scope.spawn(move || {
-                    for window in render_receiver {
-                        let value = window.and_then(|pages: Vec<(Placement, GrayImage, Option<GrayImage>)>| {
-                            let (mut placements, mut seen, mut ink) = (Vec::new(), Vec::new(), Vec::new());
-                            for (placement, page, read) in pages {
-                                placements.push(placement);
-                                seen.push(page);
-                                ink.push(read);
-                            }
-                            let mut prepared = prepare_window(layouts, &seen, &ink)?;
-                            for (placement, lines) in placements.iter().zip(&mut prepared) {
-                                if confidence_pages.contains(&placement.page_index) {
-                                    lines.iter_mut().for_each(|line| line.confidence_required = true);
+                }
+                drop(render_tx);
+
+                for layout in layouts.iter_mut().take(layout_workers) {
+                    let prep_tx = prep_tx.clone();
+                    scope.spawn(move || {
+                        while !aborted_ref.load(Ordering::Relaxed) {
+                            let msg = match render_rx_ref.lock() {
+                                Ok(rx) => rx.recv(),
+                                Err(_) => break,
+                            };
+                            let Ok(rendered) = msg else {
+                                break;
+                            };
+                            let out = rendered.and_then(|(req_idx, items)| {
+                                if items.is_empty() {
+                                    return Ok((req_idx, Vec::new()));
                                 }
+                                let need_conf = confidence_pages.contains(&requests[req_idx].page_index);
+                                let mut placements = Vec::with_capacity(items.len());
+                                let mut seen = Vec::with_capacity(items.len());
+                                let mut ink = Vec::with_capacity(items.len());
+                                for (p, s, i) in items {
+                                    placements.push(p);
+                                    seen.push(s);
+                                    ink.push(i);
+                                }
+                                let seen_refs: Vec<&GrayImage> = seen.iter().collect();
+                                let boxes = measure("ocr.layout", || {
+                                    seen_refs.iter().map(|img| layout.lines(img)).collect::<Result<Vec<_>>>()
+                                })?;
+                                let ink_refs: Vec<&GrayImage> =
+                                    seen.iter().zip(&ink).map(|(gray, sep)| sep.as_ref().unwrap_or(gray)).collect();
+                                let mut prepared = measure("ocr.prepare_lines", || prepare_pages_refs(&ink_refs, &boxes))?;
+                                if need_conf {
+                                    for item_lines in &mut prepared {
+                                        item_lines.iter_mut().for_each(|line| line.confidence_required = true);
+                                    }
+                                }
+                                Ok((req_idx, placements.into_iter().zip(prepared).collect()))
+                            });
+                            let failed = out.is_err();
+                            if failed {
+                                aborted_ref.store(true, Ordering::Relaxed);
                             }
-                            Ok((placements, prepared))
-                        });
-                        let failed = value.is_err();
-                        if prepared_sender.send(value).is_err() || failed {
-                            break;
+                            if prep_tx.send(out).is_err() || failed {
+                                aborted_ref.store(true, Ordering::Relaxed);
+                                break;
+                            }
                         }
-                    }
-                });
-                place_pages(&mut results, prepared_receiver, engine, codec, plan)
+                        if aborted_ref.load(Ordering::Relaxed) {
+                            while render_rx_ref.lock().is_ok_and(|rx| rx.try_recv().is_ok()) {}
+                        }
+                    });
+                }
+                drop(prep_tx);
+
+                let res = place_pages(&mut results, prep_rx, engine, codec, plan);
+                if res.is_err() {
+                    aborted_ref.store(true, Ordering::Relaxed);
+                }
+                res
             })
         })?;
         Ok(results)
     }
 }
 
-/// Each window's images read and their lines placed back on their pages, in request order: the
-/// parts of a page recognized apart are placed back on it, and a page none of whose parts reads as
-/// print has no lines.
+/// Prepared items placed into `results[req_idx]`, micro-batched from whatever pages are already ready
+/// so recognition starts immediately on the first page while amortizing larger bursts.
 fn place_pages(
     results: &mut [OcrPageResult],
-    windows: Receiver<Result<(Vec<Placement>, Vec<Vec<PreparedLine>>)>>,
+    prepared_rx: Receiver<Result<(usize, Vec<(Placement, Vec<PreparedLine>)>)>>,
     engine: &mut RecognizerEngine,
     codec: &Codec,
     plan: &RuntimePlan,
 ) -> Result<()> {
-    let mut at = 0;
-    for window in windows {
-        let (placements, prepared) = window?;
-        for (placement, mut lines) in placements.into_iter().zip(recognize_pages(engine, codec, plan, prepared)?) {
+    const MAX_MICROBATCH_ITEMS: usize = 4;
+    while let Ok(first) = prepared_rx.recv() {
+        let mut batch_meta = Vec::new();
+        let mut batch_prep = Vec::new();
+        let push_item = |item: Result<(usize, Vec<(Placement, Vec<PreparedLine>)>)>,
+                         meta: &mut Vec<(usize, Placement)>,
+                         prep: &mut Vec<Vec<PreparedLine>>|
+         -> Result<()> {
+            let (req_idx, entries) = item?;
+            for (placement, lines) in entries {
+                meta.push((req_idx, placement));
+                prep.push(lines);
+            }
+            Ok(())
+        };
+        push_item(first, &mut batch_meta, &mut batch_prep)?;
+        while batch_meta.len() < MAX_MICROBATCH_ITEMS {
+            match prepared_rx.try_recv() {
+                Ok(next) => push_item(next, &mut batch_meta, &mut batch_prep)?,
+                Err(_) => break,
+            }
+        }
+        if batch_prep.is_empty() {
+            continue;
+        }
+        for ((req_idx, placement), mut lines) in batch_meta.into_iter().zip(recognize_pages(engine, codec, plan, batch_prep)?) {
             place_back(&mut lines, placement.turns, placement.drawn[0], placement.drawn[1]);
             scale_lines(&mut lines, placement.scale);
             translate_lines(&mut lines, placement.origin);
-            while results[at].page_index != placement.page_index {
-                at += 1;
-            }
-            results[at].lines.extend(lines);
-            results[at].separator_y = results[at].separator_y.or(placement.separator);
+            results[req_idx].lines.extend(lines);
+            results[req_idx].separator_y = results[req_idx].separator_y.or(placement.separator);
         }
     }
     Ok(())
-}
-
-/// A window's images' lines found on `seen` and cut for reading from `ink`, falling back to `seen`
-/// on monochrome pages where `gray == ink`.
-fn prepare_window(layouts: &mut [LineDetector], seen: &[GrayImage], ink: &[Option<GrayImage>]) -> Result<Vec<Vec<PreparedLine>>> {
-    let seen_refs: Vec<&GrayImage> = seen.iter().collect();
-    let ink_refs: Vec<&GrayImage> = seen.iter().zip(ink).map(|(gray, separate)| separate.as_ref().unwrap_or(gray)).collect();
-    prepare_window_refs(layouts, &seen_refs, &ink_refs)
 }
 
 fn prepare_window_refs(layouts: &mut [LineDetector], seen: &[&GrayImage], ink: &[&GrayImage]) -> Result<Vec<Vec<PreparedLine>>> {
@@ -943,67 +983,79 @@ fn recognize_batch(
         .collect())
 }
 
-/// The requested pages drawn in grey: a whole page stood upright, with the rule above its notes; or
+/// The requested page drawn in grey: a whole page stood upright, with the rule above its notes; or
 /// each requested part of it that reads as print, on a white margin.
-fn render_pdf_pages(
+fn render_single_request(
     pages: &PageRenderer,
-    requests: &[OcrPageRequest],
+    request: &OcrPageRequest,
     orientation: Option<&Mutex<&mut Orientation>>,
 ) -> Result<Vec<(Placement, GrayImage, Option<GrayImage>)>> {
     // White margin around a part of a page, so the layout reads its first and last lines whole.
     const MARGIN: usize = 16;
     let mut rendered = Vec::new();
-    for request in requests {
+    let mut fallback_pixmap = None;
+    let (width, height, gray, ink) = if let Some(scan) = measure("ocr.render.scan", || pages.render_scan_gray(request.page_index)) {
+        let (w, h) = (usize::from(scan.width), usize::from(scan.height));
+        let gray = GrayImage::from_raw(w as u32, h as u32, scan.gray).expect("scan dimensions match its pixel buffer");
+        let ink = scan
+            .ink
+            .map(|buf| GrayImage::from_raw(w as u32, h as u32, buf).expect("scan dimensions match its pixel buffer"));
+        (w, h, gray, ink)
+    } else {
         let pixmap = measure("ocr.render.hayro", || pages.render(request.page_index))
             .ok_or_else(|| Error::Message(format!("OCR renderer could not draw page {}", request.page_index + 1)))?;
-        let (width, height) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
-        let scale = [request.width / width as f64, request.height / height as f64];
+        let (w, h) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
         let (gray_raw, ink_raw) = measure("ocr.render.gray", || crate::ocr::gray_and_ink_of(&pixmap));
-        let gray = GrayImage::from_raw(width as u32, height as u32, gray_raw)
-            .expect("renderer dimensions match its pixel buffer");
-        let ink = ink_raw.map(|buf| {
-            GrayImage::from_raw(width as u32, height as u32, buf).expect("renderer dimensions match its pixel buffer")
-        });
-        if request.regions.is_empty() {
-            let turns = match orientation {
-                Some(orientation) => {
-                    let page = RgbaImage::from_raw(width as u32, height as u32, pixmap.data_as_u8_slice().to_vec())
-                        .expect("renderer dimensions match its pixel buffer");
-                    orientation.lock().map_err(|_| Error::Message("OCR orientation lock poisoned".into()))?.upright_turns(&page)?
-                }
-                None => 0,
-            };
-            // A turned page's rule runs across its print, not across the page as drawn.
-            let separator = (turns == 0)
-                .then(|| measure("ocr.render.sep", || crate::separator::separator_y(gray.as_raw(), width, height, request.height)))
-                .flatten();
-            let (image, ink) = if turns == 0 { (gray, ink) } else { (turn(&gray, turns), ink.map(|img| turn(&img, turns))) };
-            let drawn = [width as f64, height as f64];
-            rendered.push((Placement { page_index: request.page_index, separator, scale, origin: [0.0, 0.0], turns, drawn }, image, ink));
+        let gray = GrayImage::from_raw(w as u32, h as u32, gray_raw).expect("renderer dimensions match its pixel buffer");
+        let ink = ink_raw
+            .map(|buf| GrayImage::from_raw(w as u32, h as u32, buf).expect("renderer dimensions match its pixel buffer"));
+        fallback_pixmap = Some(pixmap);
+        (w, h, gray, ink)
+    };
+    let scale = [request.width / width as f64, request.height / height as f64];
+    if request.regions.is_empty() {
+        let turns = match orientation {
+            Some(orientation) => {
+                let rgba = match fallback_pixmap {
+                    Some(ref pixmap) => pixmap.data_as_u8_slice().to_vec(),
+                    None => gray.as_raw().iter().flat_map(|&g| [g, g, g, 255]).collect(),
+                };
+                let page = RgbaImage::from_raw(width as u32, height as u32, rgba)
+                    .expect("renderer dimensions match its pixel buffer");
+                orientation.lock().map_err(|_| Error::Message("OCR orientation lock poisoned".into()))?.upright_turns(&page)?
+            }
+            None => 0,
+        };
+        // A turned page's rule runs across its print, not across the page as drawn.
+        let separator = (turns == 0)
+            .then(|| measure("ocr.render.sep", || crate::separator::separator_y(gray.as_raw(), width, height, request.height)))
+            .flatten();
+        let (image, ink) = if turns == 0 { (gray, ink) } else { (turn(&gray, turns), ink.map(|img| turn(&img, turns))) };
+        let drawn = [width as f64, height as f64];
+        rendered.push((Placement { separator, scale, origin: [0.0, 0.0], turns, drawn }, image, ink));
+        return Ok(rendered);
+    }
+    // Each part of the page is recognized on its own, at the page's resolution.
+    for region in &request.regions {
+        let x0 = ((region[0] / scale[0]).floor().max(0.0) as usize).min(width);
+        let y0 = ((region[1] / scale[1]).floor().max(0.0) as usize).min(height);
+        let x1 = ((region[2] / scale[0]).ceil().max(0.0) as usize).min(width);
+        let y1 = ((region[3] / scale[1]).ceil().max(0.0) as usize).min(height);
+        if x1 <= x0 || y1 <= y0 || !dark_print_on_light_ground(&gray, [x0, y0, x1, y1]) {
             continue;
         }
-        // Each part of the page is recognized on its own, at the page's resolution.
-        for region in &request.regions {
-            let x0 = ((region[0] / scale[0]).floor().max(0.0) as usize).min(width);
-            let y0 = ((region[1] / scale[1]).floor().max(0.0) as usize).min(height);
-            let x1 = ((region[2] / scale[0]).ceil().max(0.0) as usize).min(width);
-            let y1 = ((region[3] / scale[1]).ceil().max(0.0) as usize).min(height);
-            if x1 <= x0 || y1 <= y0 || !dark_print_on_light_ground(&gray, [x0, y0, x1, y1]) {
-                continue;
-            }
-            let framed = |image: &GrayImage| {
-                let mut crop = GrayImage::from_pixel((x1 - x0 + 2 * MARGIN) as u32, (y1 - y0 + 2 * MARGIN) as u32, Luma([255]));
-                let part = imageops::crop_imm(image, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32).to_image();
-                imageops::replace(&mut crop, &part, MARGIN as i64, MARGIN as i64);
-                crop
-            };
-            let origin = [(x0 as f64 - MARGIN as f64) * scale[0], (y0 as f64 - MARGIN as f64) * scale[1]];
-            rendered.push((
-                Placement { page_index: request.page_index, separator: None, scale, origin, turns: 0, drawn: [0.0, 0.0] },
-                framed(&gray),
-                ink.as_ref().map(|img| framed(img)),
-            ));
-        }
+        let framed = |image: &GrayImage| {
+            let mut crop = GrayImage::from_pixel((x1 - x0 + 2 * MARGIN) as u32, (y1 - y0 + 2 * MARGIN) as u32, Luma([255]));
+            let part = imageops::crop_imm(image, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32).to_image();
+            imageops::replace(&mut crop, &part, MARGIN as i64, MARGIN as i64);
+            crop
+        };
+        let origin = [(x0 as f64 - MARGIN as f64) * scale[0], (y0 as f64 - MARGIN as f64) * scale[1]];
+        rendered.push((
+            Placement { separator: None, scale, origin, turns: 0, drawn: [0.0, 0.0] },
+            framed(&gray),
+            ink.as_ref().map(|img| framed(img)),
+        ));
     }
     Ok(rendered)
 }
@@ -1802,5 +1854,112 @@ mod tests {
             "[bench] detector {height}x{width}: ORT={ort_ms:.2}ms/page, DetectorNative={nat_ms:.2}ms/page, speedup={:.2}x",
             ort_ms / nat_ms.max(1e-9)
         );
+    }
+
+    #[test]
+    fn scan_gray_fast_path_matches_hayro_and_falls_back() {
+        let mut pdf_buf = Vec::new();
+        let stream = b"0 0 0 rg 10 10 80 40 re f\n";
+        let objs = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>".to_vec(),
+            format!("<< /Length {} >>\nstream\n{}endstream", stream.len(), String::from_utf8_lossy(stream)).into_bytes(),
+        ];
+        pdf_buf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::with_capacity(objs.len() + 1);
+        offsets.push(0);
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(pdf_buf.len());
+            pdf_buf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            pdf_buf.extend_from_slice(body);
+            pdf_buf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_pos = pdf_buf.len();
+        pdf_buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+        for off in &offsets[1..] {
+            pdf_buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf_buf.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n", objs.len() + 1).as_bytes());
+
+        let vec_pdf = open_pdf(&pdf_buf).expect("parse synthetic vector PDF");
+        let vec_renderer = PageRenderer::new(&vec_pdf, 144.0);
+        assert!(vec_renderer.render_scan_gray(0).is_none(), "vector paths must fall back to hayro");
+        assert!(vec_renderer.render(0).is_some(), "vector fallback renders normally");
+
+        let input_pdf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("benchmarks/local-data/ocr-candidate-screen/browser/inputs/input.pdf");
+        if !input_pdf.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&input_pdf).expect("read input.pdf");
+        let pdf = open_pdf(&bytes).expect("open input.pdf");
+        let renderer = PageRenderer::new(&pdf, 144.0);
+        let scan = renderer.render_scan_gray(0).expect("page 0 of input.pdf should hit scan fast path");
+        let pix = renderer.render(0).expect("hayro render page 0");
+        assert_eq!(scan.width, pix.width());
+        assert_eq!(scan.height, pix.height());
+        let (hayro_gray, _) = crate::ocr::gray_and_ink_of(&pix);
+        assert_eq!(scan.gray.len(), hayro_gray.len());
+        let (w, h) = (usize::from(scan.width), usize::from(scan.height));
+        let mut scan_sum = 0u64;
+        let mut hayro_sum = 0u64;
+        let mut diff_hist = [0u32; 256];
+        let mut flip_diff = 0u64;
+        for y in 0..h {
+            let fy = h - 1 - y;
+            for x in 0..w {
+                let s = scan.gray[y * w + x];
+                let r = hayro_gray[y * w + x];
+                scan_sum += u64::from(s);
+                hayro_sum += u64::from(r);
+                diff_hist[usize::from(s.abs_diff(r))] += 1;
+                flip_diff += u64::from(scan.gray[fy * w + x].abs_diff(r));
+            }
+        }
+        let n = hayro_gray.len() as f64;
+        let total_diff: u64 = diff_hist.iter().enumerate().map(|(d, &c)| d as u64 * u64::from(c)).sum();
+        let mean_diff = total_diff as f64 / n;
+        let mean_flip_diff = flip_diff as f64 / n;
+        let mean_scan = scan_sum as f64 / n;
+        let mean_hayro = hayro_sum as f64 / n;
+        let target99 = (hayro_gray.len() * 99) / 100;
+        let mut acc = 0usize;
+        let mut p99 = 0usize;
+        for (d, &c) in diff_hist.iter().enumerate() {
+            acc += c as usize;
+            if acc >= target99 {
+                p99 = d;
+                break;
+            }
+        }
+        let mut best_shift = (0isize, 0isize, f64::INFINITY);
+        for dy in -1isize..=1 {
+            for dx in -1isize..=1 {
+                let mut sd = 0u64;
+                let mut cnt = 0u64;
+                for y in 1..h - 1 {
+                    let sy = (y as isize + dy) as usize;
+                    for x in 1..w - 1 {
+                        let sx = (x as isize + dx) as usize;
+                        sd += u64::from(scan.gray[sy * w + sx].abs_diff(hayro_gray[y * w + x]));
+                        cnt += 1;
+                    }
+                }
+                let md = sd as f64 / cnt as f64;
+                if md < best_shift.2 {
+                    best_shift = (dx, dy, md);
+                }
+            }
+        }
+        eprintln!(
+            "[parity] scan_gray vs hayro page 0 ({w}x{h}): mean_scan={mean_scan:.3}, mean_hayro={mean_hayro:.3}, mean_diff={mean_diff:.3}, flip_diff={mean_flip_diff:.3}, p99={p99}, best_shift={best_shift:?}, has_ink={}",
+            scan.ink.is_some()
+        );
+        assert!((mean_scan - mean_hayro).abs() < 1.0 && mean_diff < 10.0, "scan gray parity out of bounds");
     }
 }
