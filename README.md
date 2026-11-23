@@ -4,19 +4,25 @@ Local PDF extraction, OCR, and legal document structure parsing in Rust. Digital
 
 ## Performance
 
-**Scanned legal PDFs** (Ryzen 5 2600X + RTX 3080 Ti):
+**Scanned legal PDFs**
+
+Laptop (`13th Gen Intel Core i3-1315U`, CPU):
 
 | Engine / preset | Pages/s | CER |
 | --- | ---: | ---: |
-| Balanced CPU, full-alphabet blended model (12-page scan) | **5.2** | — |
-| Extreme CPU, compact 64-ch model (12-page scan) | **6.9** | — |
-| Balanced GPU DirectML FP16, full-alphabet (12-page scan) | **2.1** | — |
-| Extreme GPU DirectML FP16, compact 64-ch (12-page scan) | **2.9** | — |
-| Pruned Balanced GPU DirectML FP16 (55-page scan baseline) | **13.7** | **2.5%** |
-| Pruned Quality GPU DirectML FP16 (55-page scan baseline) | **12.1** | **2.3%** |
-| Pruned Balanced CPU baseline (55-page scan) | **8.3** | **2.5%** |
-| Stock Indra CPU (browser baseline, 55-page scan) | 6.9 | 3.4% |
-| Tesseract CPU (browser baseline, 6 workers, 55-page scan) | 2.3 | 2.3% |
+| Balanced CPU, full-alphabet (12-page scan) | **6.8** | **2.7%** |
+| Extreme CPU, compact 64-ch (12-page scan) | **7.2** | **3.3%** |
+| Pruned Balanced CPU baseline (55-page scan) | 3.9 | 2.5% |
+
+Desktop (`Ryzen 5 2600X + RTX 3080 Ti`, 55-page scan baselines):
+
+| Engine / preset | Pages/s | CER |
+| --- | ---: | ---: |
+| Pruned Balanced GPU DirectML FP16 | **13.7** | **2.5%** |
+| Pruned Quality GPU DirectML FP16 | **12.1** | **2.3%** |
+| Pruned Balanced CPU baseline | **8.3** | **2.5%** |
+| Stock Indra CPU (browser baseline) | 6.9 | 3.4% |
+| Tesseract CPU (browser baseline, 6 workers) | 2.3 | 2.3% |
 
 Across our broader scanned legal dev set, the full-alphabet blended model averages **2.7% CER**.
 
