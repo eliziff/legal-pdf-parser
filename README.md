@@ -10,8 +10,8 @@ Laptop (`13th Gen Intel Core i3-1315U`, CPU):
 
 | Engine / preset | Pages/s | CER |
 | --- | ---: | ---: |
-| Balanced CPU, full-alphabet (12-page scan) | **17.1** | **2.7%** |
-| Extreme CPU, compact 64-ch (12-page scan) | **21.8** | **3.3%** |
+| Balanced CPU, full-alphabet (12-page scan) | **19.0** | **2.7%** |
+| Extreme CPU, compact 64-ch (12-page scan) | **32.3** | **3.3%** |
 | Pruned Balanced CPU baseline (55-page scan) | 3.9 | 2.5% |
 
 Desktop (`Ryzen 5 2600X + RTX 3080 Ti`, 55-page scan baselines):

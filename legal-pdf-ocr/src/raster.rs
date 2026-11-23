@@ -21,11 +21,13 @@ pub fn raster_page_rules(pdf: &[u8], requests: &[OcrPageRequest]) -> Vec<RasterR
     requests
         .iter()
         .map(|request| {
-            let Some(pixmap) = pages.render(request.page_index).filter(|pixmap| pixmap.width() >= 2 && pixmap.height() >= 2) else {
+            let (width, height, gray) = if let Some(scan) = pages.render_scan_gray(request.page_index).filter(|s| s.width >= 2 && s.height >= 2) {
+                (usize::from(scan.width), usize::from(scan.height), scan.gray)
+            } else if let Some(pixmap) = pages.render(request.page_index).filter(|pixmap| pixmap.width() >= 2 && pixmap.height() >= 2) {
+                (usize::from(pixmap.width()), usize::from(pixmap.height()), gray_of(&pixmap))
+            } else {
                 return RasterReading::default();
             };
-            let gray = gray_of(&pixmap);
-            let (width, height) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
             let (sx, sy) = (request.width / width as f64, request.height / height as f64);
             let (half, half_width, half_height) = halved(&gray, width, height);
             let (hx, hy) = (request.width / half_width as f64, request.height / half_height as f64);

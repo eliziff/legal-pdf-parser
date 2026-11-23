@@ -450,7 +450,7 @@ impl OcrProvider {
             return Ok(Vec::new());
         }
         let available = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let render_workers = available.div_ceil(4).clamp(1, 3).min(requests.len());
+        let render_workers = available.div_ceil(3).clamp(1, 4).min(requests.len());
         let layout_workers = self.layouts.len().min(requests.len()).max(1);
         let queue_cap = (render_workers + layout_workers).max(4);
         let dpi = f64::from(self.dpi);

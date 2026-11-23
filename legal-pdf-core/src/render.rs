@@ -230,22 +230,65 @@ fn convert_and_resize_scan(image_data: ImageData, dst_w: usize, dst_h: usize) ->
 }
 
 fn rgb_to_gray_and_ink(data: &[u8], pixels: usize) -> (Vec<u8>, Option<Vec<u8>>) {
-    let mut gray = Vec::with_capacity(pixels);
-    for (idx, px) in data.chunks_exact(3).enumerate() {
-        let (r, g, b) = (px[0], px[1], px[2]);
+    let mut gray = vec![0u8; pixels];
+    let mut idx = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        idx = unsafe { rgb_to_gray_mono_prefix_avx2(data, &mut gray) };
+    }
+    while idx < pixels {
+        let off = idx * 3;
+        let (r, g, b) = (data[off], data[off + 1], data[off + 2]);
         if r != g || g != b {
-            let mut ink = Vec::with_capacity(pixels);
-            ink.extend_from_slice(&gray);
-            for rest in data[idx * 3..].chunks_exact(3) {
-                let (rr, gg, bb) = (u32::from(rest[0]), u32::from(rest[1]), u32::from(rest[2]));
-                gray.push(((rr * 77 + gg * 150 + bb * 29) >> 8) as u8);
-                ink.push(((rr + gg + bb + 1) / 3) as u8);
+            let mut ink = vec![0u8; pixels];
+            ink[..idx].copy_from_slice(&gray[..idx]);
+            for k in idx..pixels {
+                let p = k * 3;
+                let (rr, gg, bb) = (u32::from(data[p]), u32::from(data[p + 1]), u32::from(data[p + 2]));
+                gray[k] = ((rr * 77 + gg * 150 + bb * 29) >> 8) as u8;
+                ink[k] = ((rr + gg + bb + 1) / 3) as u8;
             }
             return (gray, Some(ink));
         }
-        gray.push(r);
+        gray[idx] = r;
+        idx += 1;
     }
     (gray, None)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rgb_to_gray_mono_prefix_avx2(data: &[u8], gray: &mut [u8]) -> usize {
+    use std::arch::x86_64::*;
+    let mr0 = _mm_setr_epi8(0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let mr1 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14, -1, -1, -1, -1, -1);
+    let mr2 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 4, 7, 10, 13);
+    let mg0 = _mm_setr_epi8(1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let mg1 = _mm_setr_epi8(-1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1);
+    let mg2 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14);
+    let mb0 = _mm_setr_epi8(2, 5, 8, 11, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let mb1 = _mm_setr_epi8(-1, -1, -1, -1, -1, 1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1);
+    let mb2 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15);
+    let mut i = 0usize;
+    let n = gray.len();
+    let ptr = data.as_ptr();
+    let gptr = gray.as_mut_ptr();
+    while i + 16 <= n {
+        let s = i * 3;
+        let p0 = _mm_loadu_si128(ptr.add(s) as *const __m128i);
+        let p1 = _mm_loadu_si128(ptr.add(s + 16) as *const __m128i);
+        let p2 = _mm_loadu_si128(ptr.add(s + 32) as *const __m128i);
+        let r = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(p0, mr0), _mm_shuffle_epi8(p1, mr1)), _mm_shuffle_epi8(p2, mr2));
+        let g = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(p0, mg0), _mm_shuffle_epi8(p1, mg1)), _mm_shuffle_epi8(p2, mg2));
+        let b = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(p0, mb0), _mm_shuffle_epi8(p1, mb1)), _mm_shuffle_epi8(p2, mb2));
+        let eq = _mm_and_si128(_mm_cmpeq_epi8(r, g), _mm_cmpeq_epi8(g, b));
+        if _mm_movemask_epi8(eq) != 0xFFFF {
+            break;
+        }
+        _mm_storeu_si128(gptr.add(i) as *mut __m128i, r);
+        i += 16;
+    }
+    i
 }
 
 fn build_triangle_q12(src_len: usize, dst_len: usize) -> (Vec<(usize, usize, usize)>, Vec<u16>, usize) {
@@ -298,7 +341,29 @@ fn build_triangle_q12(src_len: usize, dst_len: usize) -> (Vec<(usize, usize, usi
     (ranges, weights, max_taps)
 }
 
-fn horiz_filter_row_q4(src_row: &[u8], x_ranges: &[(usize, usize, usize)], x_weights: &[u16], dst_row: &mut [u16]) {
+fn horiz_filter_row_q4(
+    src_row: &[u8],
+    x_ranges: &[(usize, usize, usize)],
+    x_weights: &[u16],
+    x8_packed: Option<&[i16]>,
+    avx_end: usize,
+    dst_row: &mut [u16],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(w8) = x8_packed {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { horiz_filter_row_q4_avx2(src_row, x_ranges, w8, avx_end, dst_row) };
+            for (dx, &(x0, len, wo)) in x_ranges.iter().enumerate().skip(avx_end) {
+                let mut sum = 0u32;
+                for i in 0..len {
+                    sum += u32::from(src_row[x0 + i]) * u32::from(x_weights[wo + i]);
+                }
+                dst_row[dx] = ((sum + 128) >> 8) as u16;
+            }
+            return;
+        }
+    }
+    let _ = (x8_packed, avx_end);
     for (dx, &(x0, len, wo)) in x_ranges.iter().enumerate() {
         let mut sum = 0u32;
         for i in 0..len {
@@ -308,9 +373,87 @@ fn horiz_filter_row_q4(src_row: &[u8], x_ranges: &[(usize, usize, usize)], x_wei
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn horiz_filter_row_q4_avx2(
+    src_row: &[u8],
+    x_ranges: &[(usize, usize, usize)],
+    w8: &[i16],
+    avx_end: usize,
+    dst_row: &mut [u16],
+) {
+    use std::arch::x86_64::*;
+    let sptr = src_row.as_ptr();
+    let wptr = w8.as_ptr();
+    let dptr = dst_row.as_mut_ptr();
+    for dx in 0..avx_end {
+        let x0 = x_ranges.get_unchecked(dx).0;
+        let bytes = _mm_loadl_epi64(sptr.add(x0) as *const __m128i);
+        let px16 = _mm_cvtepu8_epi16(bytes);
+        let wt16 = _mm_loadu_si128(wptr.add(dx * 8) as *const __m128i);
+        let prod = _mm_madd_epi16(px16, wt16);
+        let h1 = _mm_hadd_epi32(prod, prod);
+        let sum = _mm_cvtsi128_si32(h1) + _mm_extract_epi32::<1>(h1);
+        *dptr.add(dx) = ((sum + 128) >> 8) as u16;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accum_row_q4_avx2(acc: &mut [u32], row: &[u16], w: u16) {
+    use std::arch::x86_64::*;
+    let vw = _mm256_set1_epi32(i32::from(w));
+    let len = acc.len();
+    let mut i = 0usize;
+    let aptr = acc.as_mut_ptr();
+    let rptr = row.as_ptr();
+    while i + 8 <= len {
+        let vh = _mm256_cvtepu16_epi32(_mm_loadu_si128(rptr.add(i) as *const __m128i));
+        let va = _mm256_loadu_si256(aptr.add(i) as *const __m256i);
+        let next = _mm256_add_epi32(va, _mm256_mullo_epi32(vh, vw));
+        _mm256_storeu_si256(aptr.add(i) as *mut __m256i, next);
+        i += 8;
+    }
+    let wu = u32::from(w);
+    while i < len {
+        *aptr.add(i) += u32::from(*rptr.add(i)) * wu;
+        i += 1;
+    }
+}
+
+#[inline]
+fn accum_row_q4(acc: &mut [u32], row: &[u16], w: u16) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe { accum_row_q4_avx2(acc, row, w) };
+        return;
+    }
+    let wu = u32::from(w);
+    for (a, &h) in acc.iter_mut().zip(row) {
+        *a += u32::from(h) * wu;
+    }
+}
+
 fn resize_u8_triangle(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
-    let (x_ranges, x_weights, _) = build_triangle_q12(src_w, dst_w);
+    let (x_ranges, x_weights, max_x_taps) = build_triangle_q12(src_w, dst_w);
     let (y_ranges, y_weights, max_y_taps) = build_triangle_q12(src_h, dst_h);
+    let mut x8_packed_buf = Vec::new();
+    let mut avx_end = 0usize;
+    let x8_packed = if max_x_taps <= 8 && src_w >= 8 {
+        x8_packed_buf.resize(dst_w * 8, 0i16);
+        for (dx, &(x0, len, wo)) in x_ranges.iter().enumerate() {
+            for i in 0..len {
+                x8_packed_buf[dx * 8 + i] = x_weights[wo + i] as i16;
+            }
+            if x0 + 8 <= src_w && avx_end == dx {
+                avx_end = dx + 1;
+            }
+        }
+        Some(x8_packed_buf.as_slice())
+    } else {
+        None
+    };
+
     let ring_cap = max_y_taps.max(1);
     let mut ring = vec![0u16; ring_cap * dst_w];
     let mut cached_sy = vec![usize::MAX; ring_cap];
@@ -328,14 +471,11 @@ fn resize_u8_triangle(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_
             if cached_sy[slot] != sy {
                 let src_row = &src[sy * src_w..(sy + 1) * src_w];
                 let ring_row = &mut ring[slot * dst_w..(slot + 1) * dst_w];
-                horiz_filter_row_q4(src_row, &x_ranges, &x_weights, ring_row);
+                horiz_filter_row_q4(src_row, &x_ranges, &x_weights, x8_packed, avx_end, ring_row);
                 cached_sy[slot] = sy;
             }
             let row = &ring[slot * dst_w..(slot + 1) * dst_w];
-            let w = u32::from(wy);
-            for (a, &h) in acc.iter_mut().zip(row) {
-                *a += u32::from(h) * w;
-            }
+            accum_row_q4(&mut acc, row, wy);
         }
         let dst_row = &mut out[dy * dst_w..(dy + 1) * dst_w];
         for (d, &a) in dst_row.iter_mut().zip(&acc) {

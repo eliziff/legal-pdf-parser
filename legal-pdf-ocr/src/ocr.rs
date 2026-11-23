@@ -71,7 +71,7 @@ pub fn read_bands(pdf: &[u8], indices: &[usize], ocr: &mut OcrProvider) -> Resul
     let pages = PageRenderer::new(&document, REREAD_SCALE * 72.0);
     let mut out = Vec::new();
     for &index in indices {
-        let Some(render) = pages.render(index).map(|pixmap| gray_render(&pixmap)) else { continue };
+        let Some(render) = scan_or_gray_render(&pages, index) else { continue };
         let (width, height) = (render.0 as f64 / REREAD_SCALE, render.1 as f64 / REREAD_SCALE);
         let mut read = |band: [f64; 4]| -> Result<Vec<EdgeLine>> {
             Ok(ocr.read_rendered_region(&render, band, REREAD_SCALE)?.into_iter().filter(|line| !line.text.trim().is_empty())
@@ -87,7 +87,15 @@ pub fn read_bands(pdf: &[u8], indices: &[usize], ocr: &mut OcrProvider) -> Resul
 /// One page of `pdf` rendered to 8-bit grey at `dpi`.
 pub fn render_gray_page(pdf: &[u8], page_index: usize, dpi: f64) -> Option<GrayRender> {
     let document = open_pdf(pdf).ok()?;
-    PageRenderer::new(&document, dpi).render(page_index).map(|pixmap| gray_render(&pixmap))
+    let pages = PageRenderer::new(&document, dpi);
+    scan_or_gray_render(&pages, page_index)
+}
+
+fn scan_or_gray_render(pages: &PageRenderer, page_index: usize) -> Option<GrayRender> {
+    pages
+        .render_scan_gray(page_index)
+        .map(|scan| (usize::from(scan.width), usize::from(scan.height), scan.gray))
+        .or_else(|| pages.render(page_index).map(|pixmap| gray_render(&pixmap)))
 }
 
 fn gray_render(pixmap: &Pixmap) -> GrayRender {
