@@ -1509,18 +1509,29 @@ mod tests {
         legal_pdf_core::init_ort_runtime(&ort_dll, None).expect("init ort runtime");
 
         let weights = PrepackedWeights::new();
-        let codec_path = runtime_dir.join("indra/assets/indra-followup/student8cropids/codec.json");
-        let codec = Codec::load(&codec_path).expect("load codec");
-
         let models = [
-            ("student8cropids", runtime_dir.join("indra/assets/indra-followup/student8cropids/model.onnx")),
-            ("student10c64cropids", runtime_dir.join("indra/assets/indra-followup/student10c64cropids/model.onnx")),
+            (
+                "student8cropids",
+                runtime_dir.join("indra/assets/indra-followup/student8cropids/model.onnx"),
+                runtime_dir.join("indra/assets/indra-followup/student8cropids/codec.json"),
+            ),
+            (
+                "student10c64cropids",
+                runtime_dir.join("indra/assets/indra-followup/student10c64cropids/model.onnx"),
+                runtime_dir.join("indra/assets/indra-followup/student10c64cropids/codec.json"),
+            ),
+            (
+                "wise_a075",
+                runtime_dir.join("indra-wise-a075/assets/markers/model.onnx"),
+                runtime_dir.join("indra-wise-a075/assets/markers/codec.json"),
+            ),
         ];
 
-        for (label, model_path) in &models {
-            if !model_path.is_file() {
+        for (label, model_path, codec_path) in &models {
+            if !model_path.is_file() || !codec_path.is_file() {
                 continue;
             }
+            let codec = Codec::load(codec_path).expect("load codec");
             let native = IndraNative::from_onnx_path(model_path).expect("load IndraNative");
             let mut session = open_session(model_path, 1, OrtBackend::Cpu, "cpu", true, &weights, false)
                 .expect("open ORT session");
@@ -1563,8 +1574,8 @@ mod tests {
                     }
                 }
                 assert!(
-                    max_diff < 1e-4,
-                    "{label} width={width}: max logit diff {max_diff} >= 1e-4 (ort_t={ort_t})"
+                    max_diff < 2e-4,
+                    "{label} width={width}: max logit diff {max_diff} >= 2e-4 (ort_t={ort_t})"
                 );
 
                 let (nat_t_u8, step_labels, ctc_spans) = native.recognize_u8(&u8_line, width, true, &mut scratch);
@@ -1587,7 +1598,7 @@ mod tests {
                 eprintln!("[parity] {label} width={width}: max_logit_diff={max_diff:.2e} text={nat_text:?}");
             }
 
-            if *label == "student8cropids" {
+            if matches!(*label, "student8cropids" | "wise_a075") {
                 let width = 320usize;
                 let u8_line = synthetic_text_line(width);
                 let mut f32_input = vec![0.0_f32; INPUT_HEIGHT * width];

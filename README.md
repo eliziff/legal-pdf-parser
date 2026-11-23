@@ -7,20 +7,24 @@ order and source witnesses, with content-addressed caching per stage.
 
 ## Performance
 
-Scanned OCR baseline measured on a 55-page image-only PDF (145,475 normalized
-characters, Ryzen 5 2600X + RTX 3080 Ti, medians of three warm passes excluding CLI
-startup):
+Dev OCR and document-structure evaluation (`wise_a075` WiSE-FT α=0.75 blend of stock
+Indra and legal fine-tuning, retaining the full 1,732-token charset):
 
-| Native OCR configuration | Pages/s | Character error rate |
-| --- | ---: | ---: |
-| Balanced, CPU (ORT baseline) | **8.28** | **2.546%** |
-| Balanced, automatic (DirectML GPU) | **13.73** | **2.548%** |
-| Quality, automatic (DirectML GPU) | **12.10** | **2.258%** |
+| Dev benchmark (`wise_a075`) | Metric | Value |
+| --- | --- | ---: |
+| OCR character error rate | CER | **2.69%** |
+| OCR word error rate | WER | **5.49%** |
+| Line coverage | F1 | **96.26%** |
+| Paragraph joins | F1 | **84.00%** |
+| Document hierarchy | F1 | **58.80%** |
 
-- CPU recognition in `legal-pdf-ocr` now runs on a pure-Rust AVX2+FMA `IndraNative`
-  kernel (`2.47 ms/line` vs `3.54 ms/line` ORT at `width=320`, `1.43x`, single-thread)
-  and single-pass monochrome/Triangle preprocessing; GPU backends stay on DirectML/CUDA
-  and full multi-doc re-benchmarking is pending.
+CPU single-line recognition in `legal-pdf-ocr` uses the pure-Rust AVX2+FMA `IndraNative`
+kernel (`width=320`, single-thread vs ONNX Runtime CPU):
+- `student8cropids`: **1.85–2.47 ms/line** vs **3.48–3.54 ms/line** ORT (**1.43×–1.88×** idle).
+- `wise_a075` (1,732-class 10-block model, under background worker load): **8.24 ms/line** vs **11.42 ms/line** ORT (**1.39×**).
+
+55-page scanned PDF reference (Ryzen 5 2600X + RTX 3080 Ti, pre-`IndraNative` ORT passes):
+Balanced DirectML **13.73 p/s** (`2.548%` CER), Quality DirectML **12.10 p/s** (`2.258%` CER), Balanced CPU ORT **8.28 p/s** (`2.546%` CER).
 
 Digital-born PDFs bypass OCR ([`experiments/digitalborn-benchmark`](experiments/digitalborn-benchmark)):
 
