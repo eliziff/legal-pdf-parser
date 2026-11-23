@@ -70,9 +70,12 @@ pub struct ConstructOut {
 
 struct Linear {
     out: usize,
+    out_pad: usize,
     inp: usize,
+    /// Weights packed as `[out_pad / 16, inp, 16]` with zero padding in `out..out_pad`.
     w: Vec<f32>,
-    b: Option<Vec<f32>>,
+    /// Bias padded to `out_pad` (zeros when absent).
+    b: Vec<f32>,
 }
 
 struct LayerNorm {
@@ -208,20 +211,36 @@ impl Linear {
         if scales.len() != out || wq.bytes.len() != out * inp {
             return Err(format!("{prefix}: mismatched weight/scale shapes"));
         }
-        let mut w = Vec::with_capacity(out * inp);
+        let tiles = out.div_ceil(16);
+        let out_pad = tiles * 16;
+        let mut w = vec![0f32; out_pad * inp];
         for (r, &scale) in scales.iter().enumerate() {
             let row = &wq.bytes[r * inp..(r + 1) * inp];
-            w.extend(row.iter().map(|&q| f32::from(q as i8) * scale));
+            let tile_base = (r >> 4) * inp * 16 + (r & 15);
+            for (k, &q) in row.iter().enumerate() {
+                w[tile_base + k * 16] = f32::from(q as i8) * scale;
+            }
         }
-        let b = tensors
-            .get(&format!("{prefix}.b"))
-            .map(Tensor::f32s);
-        Ok(Self { out, inp, w, b })
+        let mut b = vec![0f32; out_pad];
+        if let Some(bias) = tensors.get(&format!("{prefix}.b")) {
+            let vals = bias.f32s();
+            if vals.len() != out {
+                return Err(format!("{prefix}.b: expected {out} bias values, got {}", vals.len()));
+            }
+            b[..out].copy_from_slice(&vals);
+        }
+        Ok(Self {
+            out,
+            out_pad,
+            inp,
+            w,
+            b,
+        })
     }
 
     fn forward(&self, x: &[f32], n: usize, threads: usize) -> Vec<f32> {
         let mut out = vec![0f32; n * self.out];
-        if n == 0 {
+        if n == 0 || self.out == 0 {
             return out;
         }
         linear_into(x, n, self, &mut out, threads);
@@ -446,115 +465,151 @@ unsafe fn dot4_avx2(x: &[f32], w: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+unsafe fn fmadd_scaled_avx2(dst: &mut [f32], src: &[f32], scale: f32) {
+    use std::arch::x86_64::*;
+    let len = dst.len().min(src.len());
+    let dp = dst.as_mut_ptr();
+    let sp = src.as_ptr();
+    let pv = _mm256_set1_ps(scale);
+    let mut k = 0usize;
+    while k + 8 <= len {
+        let dv = _mm256_loadu_ps(dp.add(k));
+        let sv = _mm256_loadu_ps(sp.add(k));
+        _mm256_storeu_ps(dp.add(k), _mm256_fmadd_ps(sv, pv, dv));
+        k += 8;
+    }
+    while k < len {
+        *dp.add(k) += scale * *sp.add(k);
+        k += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn linear_chunk_avx2(x: &[f32], rows: usize, lin: &Linear, dst: &mut [f32]) {
     use std::arch::x86_64::*;
+    if rows == 0 || lin.out == 0 {
+        return;
+    }
     let inp = lin.inp;
     let out_dim = lin.out;
-    assert!(x.len() >= rows * inp && lin.w.len() >= out_dim * inp && dst.len() >= rows * out_dim);
-    let bias = lin.b.as_deref();
+    let tiles = lin.out_pad / 16;
+    assert!(
+        x.len() >= rows * inp
+            && lin.w.len() >= lin.out_pad * inp
+            && lin.b.len() >= lin.out_pad
+            && dst.len() >= rows * out_dim
+    );
     let x_base = x.as_ptr();
     let w_base = lin.w.as_ptr();
-    let mut r = 0usize;
-    while r + 2 <= rows {
-        let xp0 = x_base.add(r * inp);
-        let xp1 = x_base.add((r + 1) * inp);
-        let x0 = &x[r * inp..(r + 1) * inp];
-        let x1 = &x[(r + 1) * inp..(r + 2) * inp];
-        let (row0, rest) = dst[r * out_dim..].split_at_mut(out_dim);
-        let row1 = &mut rest[..out_dim];
-        let mut c = 0usize;
-        while c + 4 <= out_dim {
-            let wp0 = w_base.add(c * inp);
-            let wp1 = w_base.add((c + 1) * inp);
-            let wp2 = w_base.add((c + 2) * inp);
-            let wp3 = w_base.add((c + 3) * inp);
-            let mut s00 = _mm256_setzero_ps();
-            let mut s01 = _mm256_setzero_ps();
-            let mut s02 = _mm256_setzero_ps();
-            let mut s03 = _mm256_setzero_ps();
-            let mut s10 = _mm256_setzero_ps();
-            let mut s11 = _mm256_setzero_ps();
-            let mut s12 = _mm256_setzero_ps();
-            let mut s13 = _mm256_setzero_ps();
-            let mut k = 0usize;
-            while k + 8 <= inp {
-                let xv0 = _mm256_loadu_ps(xp0.add(k));
-                let xv1 = _mm256_loadu_ps(xp1.add(k));
-                let wv0 = _mm256_loadu_ps(wp0.add(k));
-                let wv1 = _mm256_loadu_ps(wp1.add(k));
-                let wv2 = _mm256_loadu_ps(wp2.add(k));
-                let wv3 = _mm256_loadu_ps(wp3.add(k));
-                s00 = _mm256_fmadd_ps(xv0, wv0, s00);
-                s01 = _mm256_fmadd_ps(xv0, wv1, s01);
-                s02 = _mm256_fmadd_ps(xv0, wv2, s02);
-                s03 = _mm256_fmadd_ps(xv0, wv3, s03);
-                s10 = _mm256_fmadd_ps(xv1, wv0, s10);
-                s11 = _mm256_fmadd_ps(xv1, wv1, s11);
-                s12 = _mm256_fmadd_ps(xv1, wv2, s12);
-                s13 = _mm256_fmadd_ps(xv1, wv3, s13);
-                k += 8;
+    let b_base = lin.b.as_ptr();
+    let dst_base = dst.as_mut_ptr();
+    let tile_stride = inp * 16;
+
+    let mut r_block = 0usize;
+    while r_block < rows {
+        let r_end = (r_block + 96).min(rows);
+        for tile in 0..tiles {
+            let c = tile * 16;
+            let rem = out_dim - c;
+            let full_tile = rem >= 16;
+            let b_lo = _mm256_loadu_ps(b_base.add(c));
+            let b_hi = _mm256_loadu_ps(b_base.add(c + 8));
+            let w_tile = w_base.add(tile * tile_stride);
+
+            let mut r = r_block;
+            while r + 6 <= r_end {
+                let xp0 = x_base.add(r * inp);
+                let xp1 = x_base.add((r + 1) * inp);
+                let xp2 = x_base.add((r + 2) * inp);
+                let xp3 = x_base.add((r + 3) * inp);
+                let xp4 = x_base.add((r + 4) * inp);
+                let xp5 = x_base.add((r + 5) * inp);
+
+                let (mut a0, mut b0) = (b_lo, b_hi);
+                let (mut a1, mut b1) = (b_lo, b_hi);
+                let (mut a2, mut b2) = (b_lo, b_hi);
+                let (mut a3, mut b3) = (b_lo, b_hi);
+                let (mut a4, mut b4) = (b_lo, b_hi);
+                let (mut a5, mut b5) = (b_lo, b_hi);
+
+                for k in 0..inp {
+                    let wp = w_tile.add(k * 16);
+                    let w0 = _mm256_loadu_ps(wp);
+                    let w1 = _mm256_loadu_ps(wp.add(8));
+
+                    let x0 = _mm256_set1_ps(*xp0.add(k));
+                    a0 = _mm256_fmadd_ps(x0, w0, a0);
+                    b0 = _mm256_fmadd_ps(x0, w1, b0);
+
+                    let x1 = _mm256_set1_ps(*xp1.add(k));
+                    a1 = _mm256_fmadd_ps(x1, w0, a1);
+                    b1 = _mm256_fmadd_ps(x1, w1, b1);
+
+                    let x2 = _mm256_set1_ps(*xp2.add(k));
+                    a2 = _mm256_fmadd_ps(x2, w0, a2);
+                    b2 = _mm256_fmadd_ps(x2, w1, b2);
+
+                    let x3 = _mm256_set1_ps(*xp3.add(k));
+                    a3 = _mm256_fmadd_ps(x3, w0, a3);
+                    b3 = _mm256_fmadd_ps(x3, w1, b3);
+
+                    let x4 = _mm256_set1_ps(*xp4.add(k));
+                    a4 = _mm256_fmadd_ps(x4, w0, a4);
+                    b4 = _mm256_fmadd_ps(x4, w1, b4);
+
+                    let x5 = _mm256_set1_ps(*xp5.add(k));
+                    a5 = _mm256_fmadd_ps(x5, w0, a5);
+                    b5 = _mm256_fmadd_ps(x5, w1, b5);
+                }
+
+                let accs = [(a0, b0), (a1, b1), (a2, b2), (a3, b3), (a4, b4), (a5, b5)];
+                if full_tile {
+                    for (ri, (alo, ahi)) in accs.into_iter().enumerate() {
+                        let dp = dst_base.add((r + ri) * out_dim + c);
+                        _mm256_storeu_ps(dp, alo);
+                        _mm256_storeu_ps(dp.add(8), ahi);
+                    }
+                } else {
+                    let mut tmp = [0.0f32; 16];
+                    for (ri, (alo, ahi)) in accs.into_iter().enumerate() {
+                        _mm256_storeu_ps(tmp.as_mut_ptr(), alo);
+                        _mm256_storeu_ps(tmp.as_mut_ptr().add(8), ahi);
+                        std::ptr::copy_nonoverlapping(
+                            tmp.as_ptr(),
+                            dst_base.add((r + ri) * out_dim + c),
+                            rem,
+                        );
+                    }
+                }
+                r += 6;
             }
-            let mut d00 = hsum256_ps(s00);
-            let mut d01 = hsum256_ps(s01);
-            let mut d02 = hsum256_ps(s02);
-            let mut d03 = hsum256_ps(s03);
-            let mut d10 = hsum256_ps(s10);
-            let mut d11 = hsum256_ps(s11);
-            let mut d12 = hsum256_ps(s12);
-            let mut d13 = hsum256_ps(s13);
-            while k < inp {
-                let xv0 = *xp0.add(k);
-                let xv1 = *xp1.add(k);
-                let wv0 = *wp0.add(k);
-                let wv1 = *wp1.add(k);
-                let wv2 = *wp2.add(k);
-                let wv3 = *wp3.add(k);
-                d00 += xv0 * wv0;
-                d01 += xv0 * wv1;
-                d02 += xv0 * wv2;
-                d03 += xv0 * wv3;
-                d10 += xv1 * wv0;
-                d11 += xv1 * wv1;
-                d12 += xv1 * wv2;
-                d13 += xv1 * wv3;
-                k += 1;
+            while r < r_end {
+                let xp0 = x_base.add(r * inp);
+                let mut a0 = b_lo;
+                let mut b0 = b_hi;
+                for k in 0..inp {
+                    let wp = w_tile.add(k * 16);
+                    let w0 = _mm256_loadu_ps(wp);
+                    let w1 = _mm256_loadu_ps(wp.add(8));
+                    let x0 = _mm256_set1_ps(*xp0.add(k));
+                    a0 = _mm256_fmadd_ps(x0, w0, a0);
+                    b0 = _mm256_fmadd_ps(x0, w1, b0);
+                }
+                let dp = dst_base.add(r * out_dim + c);
+                if full_tile {
+                    _mm256_storeu_ps(dp, a0);
+                    _mm256_storeu_ps(dp.add(8), b0);
+                } else {
+                    let mut tmp = [0.0f32; 16];
+                    _mm256_storeu_ps(tmp.as_mut_ptr(), a0);
+                    _mm256_storeu_ps(tmp.as_mut_ptr().add(8), b0);
+                    std::ptr::copy_nonoverlapping(tmp.as_ptr(), dp, rem);
+                }
+                r += 1;
             }
-            if let Some(b) = bias {
-                d00 += b[c];
-                d01 += b[c + 1];
-                d02 += b[c + 2];
-                d03 += b[c + 3];
-                d10 += b[c];
-                d11 += b[c + 1];
-                d12 += b[c + 2];
-                d13 += b[c + 3];
-            }
-            row0[c] = d00;
-            row0[c + 1] = d01;
-            row0[c + 2] = d02;
-            row0[c + 3] = d03;
-            row1[c] = d10;
-            row1[c + 1] = d11;
-            row1[c + 2] = d12;
-            row1[c + 3] = d13;
-            c += 4;
         }
-        while c < out_dim {
-            let w = &lin.w[c * inp..(c + 1) * inp];
-            let b = bias.map_or(0.0, |b| b[c]);
-            row0[c] = dot4_avx2(x0, w) + b;
-            row1[c] = dot4_avx2(x1, w) + b;
-            c += 1;
-        }
-        r += 2;
-    }
-    if r < rows {
-        let x0 = &x[r * inp..(r + 1) * inp];
-        let row0 = &mut dst[r * out_dim..(r + 1) * out_dim];
-        for c in 0..out_dim {
-            let w = &lin.w[c * inp..(c + 1) * inp];
-            row0[c] = dot4_avx2(x0, w) + bias.map_or(0.0, |b| b[c]);
-        }
+        r_block = r_end;
     }
 }
 
@@ -590,249 +645,242 @@ fn dot4_wasm(x: &[f32], w: &[f32]) -> f32 {
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn linear_chunk_wasm(x: &[f32], rows: usize, lin: &Linear, dst: &mut [f32]) {
+#[inline(always)]
+fn fmadd_scaled_wasm(dst: &mut [f32], src: &[f32], scale: f32) {
     use core::arch::wasm32::*;
-    let inp = lin.inp;
-    let out_dim = lin.out;
-    assert!(x.len() >= rows * inp && lin.w.len() >= out_dim * inp && dst.len() >= rows * out_dim);
-    let bias = lin.b.as_deref();
-    let x_base = x.as_ptr();
-    let w_base = lin.w.as_ptr();
-    let mut r = 0usize;
-    while r + 2 <= rows {
-        // SAFETY: rows * inp <= x.len(), out_dim * inp <= lin.w.len().
-        let (xp0, xp1) = unsafe { (x_base.add(r * inp), x_base.add((r + 1) * inp)) };
-        let x0 = &x[r * inp..(r + 1) * inp];
-        let x1 = &x[(r + 1) * inp..(r + 2) * inp];
-        let (row0, rest) = dst[r * out_dim..].split_at_mut(out_dim);
-        let row1 = &mut rest[..out_dim];
-        let mut c = 0usize;
-        while c + 4 <= out_dim {
-            let (wp0, wp1, wp2, wp3) = unsafe {
-                (
-                    w_base.add(c * inp),
-                    w_base.add((c + 1) * inp),
-                    w_base.add((c + 2) * inp),
-                    w_base.add((c + 3) * inp),
-                )
-            };
-            let mut s00 = f32x4_splat(0.0);
-            let mut s01 = f32x4_splat(0.0);
-            let mut s02 = f32x4_splat(0.0);
-            let mut s03 = f32x4_splat(0.0);
-            let mut s10 = f32x4_splat(0.0);
-            let mut s11 = f32x4_splat(0.0);
-            let mut s12 = f32x4_splat(0.0);
-            let mut s13 = f32x4_splat(0.0);
-            let mut k = 0usize;
-            while k + 4 <= inp {
-                let (xv0, xv1, wv0, wv1, wv2, wv3) = unsafe {
-                    (
-                        v128_load(xp0.add(k) as *const v128),
-                        v128_load(xp1.add(k) as *const v128),
-                        v128_load(wp0.add(k) as *const v128),
-                        v128_load(wp1.add(k) as *const v128),
-                        v128_load(wp2.add(k) as *const v128),
-                        v128_load(wp3.add(k) as *const v128),
-                    )
-                };
-                s00 = f32x4_add(s00, f32x4_mul(xv0, wv0));
-                s01 = f32x4_add(s01, f32x4_mul(xv0, wv1));
-                s02 = f32x4_add(s02, f32x4_mul(xv0, wv2));
-                s03 = f32x4_add(s03, f32x4_mul(xv0, wv3));
-                s10 = f32x4_add(s10, f32x4_mul(xv1, wv0));
-                s11 = f32x4_add(s11, f32x4_mul(xv1, wv1));
-                s12 = f32x4_add(s12, f32x4_mul(xv1, wv2));
-                s13 = f32x4_add(s13, f32x4_mul(xv1, wv3));
-                k += 4;
-            }
-            let mut d00 = hsum128_ps(s00);
-            let mut d01 = hsum128_ps(s01);
-            let mut d02 = hsum128_ps(s02);
-            let mut d03 = hsum128_ps(s03);
-            let mut d10 = hsum128_ps(s10);
-            let mut d11 = hsum128_ps(s11);
-            let mut d12 = hsum128_ps(s12);
-            let mut d13 = hsum128_ps(s13);
-            while k < inp {
-                let (xv0, xv1) = (x[r * inp + k], x[(r + 1) * inp + k]);
-                let wv0 = lin.w[c * inp + k];
-                let wv1 = lin.w[(c + 1) * inp + k];
-                let wv2 = lin.w[(c + 2) * inp + k];
-                let wv3 = lin.w[(c + 3) * inp + k];
-                d00 += xv0 * wv0;
-                d01 += xv0 * wv1;
-                d02 += xv0 * wv2;
-                d03 += xv0 * wv3;
-                d10 += xv1 * wv0;
-                d11 += xv1 * wv1;
-                d12 += xv1 * wv2;
-                d13 += xv1 * wv3;
-                k += 1;
-            }
-            if let Some(b) = bias {
-                d00 += b[c];
-                d01 += b[c + 1];
-                d02 += b[c + 2];
-                d03 += b[c + 3];
-                d10 += b[c];
-                d11 += b[c + 1];
-                d12 += b[c + 2];
-                d13 += b[c + 3];
-            }
-            row0[c] = d00;
-            row0[c + 1] = d01;
-            row0[c + 2] = d02;
-            row0[c + 3] = d03;
-            row1[c] = d10;
-            row1[c + 1] = d11;
-            row1[c + 2] = d12;
-            row1[c + 3] = d13;
-            c += 4;
+    let len = dst.len().min(src.len());
+    let dp = dst.as_mut_ptr();
+    let sp = src.as_ptr();
+    let pv = f32x4_splat(scale);
+    let mut k = 0usize;
+    while k + 4 <= len {
+        // SAFETY: k + 4 <= len <= min(dst.len(), src.len()).
+        unsafe {
+            let dv = v128_load(dp.add(k) as *const v128);
+            let sv = v128_load(sp.add(k) as *const v128);
+            v128_store(dp.add(k) as *mut v128, f32x4_add(dv, f32x4_mul(sv, pv)));
         }
-        while c < out_dim {
-            let w = &lin.w[c * inp..(c + 1) * inp];
-            let b = bias.map_or(0.0, |b| b[c]);
-            row0[c] = dot4_wasm(x0, w) + b;
-            row1[c] = dot4_wasm(x1, w) + b;
-            c += 1;
-        }
-        r += 2;
+        k += 4;
     }
-    if r < rows {
-        let x0 = &x[r * inp..(r + 1) * inp];
-        let row0 = &mut dst[r * out_dim..(r + 1) * out_dim];
-        for c in 0..out_dim {
-            let w = &lin.w[c * inp..(c + 1) * inp];
-            row0[c] = dot4_wasm(x0, w) + bias.map_or(0.0, |b| b[c]);
-        }
+    while k < len {
+        dst[k] += scale * src[k];
+        k += 1;
     }
 }
 
-#[inline(always)]
-fn dot4(x: &[f32], w: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
-        // SAFETY: AVX2+FMA availability checked above; dot4_avx2 guards bounds with min(len).
-        return unsafe { dot4_avx2(x, w) };
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn linear_chunk_wasm(x: &[f32], rows: usize, lin: &Linear, dst: &mut [f32]) {
+    use core::arch::wasm32::*;
+    if rows == 0 || lin.out == 0 {
+        return;
     }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        dot4_wasm(x, w)
-    }
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-    {
-        dot4_scalar(x, w)
+    let inp = lin.inp;
+    let out_dim = lin.out;
+    let tiles = lin.out_pad / 16;
+    assert!(
+        x.len() >= rows * inp
+            && lin.w.len() >= lin.out_pad * inp
+            && lin.b.len() >= lin.out_pad
+            && dst.len() >= rows * out_dim
+    );
+    let x_base = x.as_ptr();
+    let w_base = lin.w.as_ptr();
+    let b_base = lin.b.as_ptr();
+    let dst_base = dst.as_mut_ptr();
+    let tile_stride = inp * 16;
+
+    let mut r_block = 0usize;
+    while r_block < rows {
+        let r_end = (r_block + 96).min(rows);
+        for tile in 0..tiles {
+            let w_tile = unsafe { w_base.add(tile * tile_stride) };
+            for half in 0..2 {
+                let c = tile * 16 + half * 8;
+                if c >= out_dim {
+                    break;
+                }
+                let rem = out_dim - c;
+                let full_half = rem >= 8;
+                let w_off = half * 8;
+                // SAFETY: c + 8 <= out_pad == lin.b.len().
+                let (b_lo, b_hi) = unsafe {
+                    (
+                        v128_load(b_base.add(c) as *const v128),
+                        v128_load(b_base.add(c + 4) as *const v128),
+                    )
+                };
+                let mut r = r_block;
+                while r + 4 <= r_end {
+                    let (xp0, xp1, xp2, xp3) = unsafe {
+                        (
+                            x_base.add(r * inp),
+                            x_base.add((r + 1) * inp),
+                            x_base.add((r + 2) * inp),
+                            x_base.add((r + 3) * inp),
+                        )
+                    };
+                    let (mut a0, mut b0) = (b_lo, b_hi);
+                    let (mut a1, mut b1) = (b_lo, b_hi);
+                    let (mut a2, mut b2) = (b_lo, b_hi);
+                    let (mut a3, mut b3) = (b_lo, b_hi);
+                    for k in 0..inp {
+                        // SAFETY: (tile * tile_stride) + k * 16 + w_off + 8 <= out_pad * inp.
+                        unsafe {
+                            let wp = w_tile.add(k * 16 + w_off);
+                            let w0 = v128_load(wp as *const v128);
+                            let w1 = v128_load(wp.add(4) as *const v128);
+
+                            let x0 = f32x4_splat(*xp0.add(k));
+                            a0 = f32x4_add(a0, f32x4_mul(x0, w0));
+                            b0 = f32x4_add(b0, f32x4_mul(x0, w1));
+
+                            let x1 = f32x4_splat(*xp1.add(k));
+                            a1 = f32x4_add(a1, f32x4_mul(x1, w0));
+                            b1 = f32x4_add(b1, f32x4_mul(x1, w1));
+
+                            let x2 = f32x4_splat(*xp2.add(k));
+                            a2 = f32x4_add(a2, f32x4_mul(x2, w0));
+                            b2 = f32x4_add(b2, f32x4_mul(x2, w1));
+
+                            let x3 = f32x4_splat(*xp3.add(k));
+                            a3 = f32x4_add(a3, f32x4_mul(x3, w0));
+                            b3 = f32x4_add(b3, f32x4_mul(x3, w1));
+                        }
+                    }
+                    let accs = [(a0, b0), (a1, b1), (a2, b2), (a3, b3)];
+                    if full_half {
+                        for (ri, (alo, ahi)) in accs.into_iter().enumerate() {
+                            unsafe {
+                                let dp = dst_base.add((r + ri) * out_dim + c);
+                                v128_store(dp as *mut v128, alo);
+                                v128_store(dp.add(4) as *mut v128, ahi);
+                            }
+                        }
+                    } else {
+                        let mut tmp = [0.0f32; 8];
+                        for (ri, (alo, ahi)) in accs.into_iter().enumerate() {
+                            unsafe {
+                                v128_store(tmp.as_mut_ptr() as *mut v128, alo);
+                                v128_store(tmp.as_mut_ptr().add(4) as *mut v128, ahi);
+                                core::ptr::copy_nonoverlapping(
+                                    tmp.as_ptr(),
+                                    dst_base.add((r + ri) * out_dim + c),
+                                    rem,
+                                );
+                            }
+                        }
+                    }
+                    r += 4;
+                }
+                while r < r_end {
+                    let xp0 = unsafe { x_base.add(r * inp) };
+                    let mut a0 = b_lo;
+                    let mut b0 = b_hi;
+                    for k in 0..inp {
+                        unsafe {
+                            let wp = w_tile.add(k * 16 + w_off);
+                            let w0 = v128_load(wp as *const v128);
+                            let w1 = v128_load(wp.add(4) as *const v128);
+                            let x0 = f32x4_splat(*xp0.add(k));
+                            a0 = f32x4_add(a0, f32x4_mul(x0, w0));
+                            b0 = f32x4_add(b0, f32x4_mul(x0, w1));
+                        }
+                    }
+                    unsafe {
+                        let dp = dst_base.add(r * out_dim + c);
+                        if full_half {
+                            v128_store(dp as *mut v128, a0);
+                            v128_store(dp.add(4) as *mut v128, b0);
+                        } else {
+                            let mut tmp = [0.0f32; 8];
+                            v128_store(tmp.as_mut_ptr() as *mut v128, a0);
+                            v128_store(tmp.as_mut_ptr().add(4) as *mut v128, b0);
+                            core::ptr::copy_nonoverlapping(tmp.as_ptr(), dp, rem);
+                        }
+                    }
+                    r += 1;
+                }
+            }
+        }
+        r_block = r_end;
     }
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 #[inline(always)]
+fn fmadd_scaled_scalar(dst: &mut [f32], src: &[f32], scale: f32) {
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d += scale * s;
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 fn linear_chunk_scalar(x: &[f32], rows: usize, lin: &Linear, dst: &mut [f32]) {
+    if rows == 0 || lin.out == 0 {
+        return;
+    }
     let inp = lin.inp;
     let out_dim = lin.out;
-    let bias = lin.b.as_deref();
-    let mut r = 0usize;
-    while r + 2 <= rows {
-        let x0 = &x[r * inp..(r + 1) * inp];
-        let x1 = &x[(r + 1) * inp..(r + 2) * inp];
-        let (row0, rest) = dst[r * out_dim..].split_at_mut(out_dim);
-        let row1 = &mut rest[..out_dim];
-        let mut c = 0usize;
-        while c + 4 <= out_dim {
-            let w0 = &lin.w[c * inp..(c + 1) * inp];
-            let w1 = &lin.w[(c + 1) * inp..(c + 2) * inp];
-            let w2 = &lin.w[(c + 2) * inp..(c + 3) * inp];
-            let w3 = &lin.w[(c + 3) * inp..(c + 4) * inp];
-            let mut s00 = [0.0f32; 4];
-            let mut s01 = [0.0f32; 4];
-            let mut s02 = [0.0f32; 4];
-            let mut s03 = [0.0f32; 4];
-            let mut s10 = [0.0f32; 4];
-            let mut s11 = [0.0f32; 4];
-            let mut s12 = [0.0f32; 4];
-            let mut s13 = [0.0f32; 4];
-            let mut k = 0usize;
-            while k + 4 <= inp {
-                for l in 0..4 {
-                    let xv0 = x0[k + l];
-                    let xv1 = x1[k + l];
-                    let wv0 = w0[k + l];
-                    let wv1 = w1[k + l];
-                    let wv2 = w2[k + l];
-                    let wv3 = w3[k + l];
-                    s00[l] += xv0 * wv0;
-                    s01[l] += xv0 * wv1;
-                    s02[l] += xv0 * wv2;
-                    s03[l] += xv0 * wv3;
-                    s10[l] += xv1 * wv0;
-                    s11[l] += xv1 * wv1;
-                    s12[l] += xv1 * wv2;
-                    s13[l] += xv1 * wv3;
+    let tiles = lin.out_pad / 16;
+    assert!(
+        x.len() >= rows * inp
+            && lin.w.len() >= lin.out_pad * inp
+            && lin.b.len() >= lin.out_pad
+            && dst.len() >= rows * out_dim
+    );
+    let tile_stride = inp * 16;
+    let mut r_block = 0usize;
+    while r_block < rows {
+        let r_end = (r_block + 96).min(rows);
+        for tile in 0..tiles {
+            let c = tile * 16;
+            let rem = (out_dim - c).min(16);
+            let mut b_init = [0.0f32; 16];
+            b_init.copy_from_slice(&lin.b[c..c + 16]);
+            let w_tile = &lin.w[tile * tile_stride..(tile + 1) * tile_stride];
+            let mut r = r_block;
+            while r + 4 <= r_end {
+                let x0 = &x[r * inp..(r + 1) * inp];
+                let x1 = &x[(r + 1) * inp..(r + 2) * inp];
+                let x2 = &x[(r + 2) * inp..(r + 3) * inp];
+                let x3 = &x[(r + 3) * inp..(r + 4) * inp];
+                let mut a0 = b_init;
+                let mut a1 = b_init;
+                let mut a2 = b_init;
+                let mut a3 = b_init;
+                for k in 0..inp {
+                    let w = &w_tile[k * 16..k * 16 + 16];
+                    let (s0, s1, s2, s3) = (x0[k], x1[k], x2[k], x3[k]);
+                    for m in 0..16 {
+                        let wm = w[m];
+                        a0[m] += s0 * wm;
+                        a1[m] += s1 * wm;
+                        a2[m] += s2 * wm;
+                        a3[m] += s3 * wm;
+                    }
                 }
-                k += 4;
+                for (ri, acc) in [a0, a1, a2, a3].iter().enumerate() {
+                    let d = (r + ri) * out_dim + c;
+                    dst[d..d + rem].copy_from_slice(&acc[..rem]);
+                }
+                r += 4;
             }
-            let mut d00 = (s00[0] + s00[1]) + (s00[2] + s00[3]);
-            let mut d01 = (s01[0] + s01[1]) + (s01[2] + s01[3]);
-            let mut d02 = (s02[0] + s02[1]) + (s02[2] + s02[3]);
-            let mut d03 = (s03[0] + s03[1]) + (s03[2] + s03[3]);
-            let mut d10 = (s10[0] + s10[1]) + (s10[2] + s10[3]);
-            let mut d11 = (s11[0] + s11[1]) + (s11[2] + s11[3]);
-            let mut d12 = (s12[0] + s12[1]) + (s12[2] + s12[3]);
-            let mut d13 = (s13[0] + s13[1]) + (s13[2] + s13[3]);
-            while k < inp {
-                let xv0 = x0[k];
-                let xv1 = x1[k];
-                let wv0 = w0[k];
-                let wv1 = w1[k];
-                let wv2 = w2[k];
-                let wv3 = w3[k];
-                d00 += xv0 * wv0;
-                d01 += xv0 * wv1;
-                d02 += xv0 * wv2;
-                d03 += xv0 * wv3;
-                d10 += xv1 * wv0;
-                d11 += xv1 * wv1;
-                d12 += xv1 * wv2;
-                d13 += xv1 * wv3;
-                k += 1;
+            while r < r_end {
+                let x0 = &x[r * inp..(r + 1) * inp];
+                let mut a0 = b_init;
+                for k in 0..inp {
+                    let w = &w_tile[k * 16..k * 16 + 16];
+                    let s0 = x0[k];
+                    for m in 0..16 {
+                        a0[m] += s0 * w[m];
+                    }
+                }
+                let d = r * out_dim + c;
+                dst[d..d + rem].copy_from_slice(&a0[..rem]);
+                r += 1;
             }
-            if let Some(b) = bias {
-                d00 += b[c];
-                d01 += b[c + 1];
-                d02 += b[c + 2];
-                d03 += b[c + 3];
-                d10 += b[c];
-                d11 += b[c + 1];
-                d12 += b[c + 2];
-                d13 += b[c + 3];
-            }
-            row0[c] = d00;
-            row0[c + 1] = d01;
-            row0[c + 2] = d02;
-            row0[c + 3] = d03;
-            row1[c] = d10;
-            row1[c + 1] = d11;
-            row1[c + 2] = d12;
-            row1[c + 3] = d13;
-            c += 4;
         }
-        while c < out_dim {
-            let w = &lin.w[c * inp..(c + 1) * inp];
-            let b = bias.map_or(0.0, |b| b[c]);
-            row0[c] = dot4_scalar(x0, w) + b;
-            row1[c] = dot4_scalar(x1, w) + b;
-            c += 1;
-        }
-        r += 2;
-    }
-    if r < rows {
-        let x0 = &x[r * inp..(r + 1) * inp];
-        let row0 = &mut dst[r * out_dim..(r + 1) * out_dim];
-        for c in 0..out_dim {
-            let w = &lin.w[c * inp..(c + 1) * inp];
-            row0[c] = dot4_scalar(x0, w) + bias.map_or(0.0, |b| b[c]);
-        }
+        r_block = r_end;
     }
 }
 
@@ -962,6 +1010,88 @@ fn prepare_qkv(
 /// Half-window for Construct self-attention (`2 * 256 + 1 = 513` neighbor nodes), bounding long statutes to O(h * W).
 const CONSTRUCT_WINDOW: usize = 256;
 
+macro_rules! full_attn_body {
+    (
+        $row_start:expr, $rows:expr, $n:expr, $h:expr, $s:expr, $d:expr, $scale:expr,
+        $q:expr, $k:expr, $v:expr, $window:expr, $dst_chunk:expr, $dot:expr, $fmadd:expr
+    ) => {{
+        let cap = $window.map_or($n, |w| (2 * w + 1).min($n));
+        let mut scores = vec![0f32; cap];
+        for head in 0..$h {
+            let qh = &$q[head * $n * $s..(head + 1) * $n * $s];
+            let kh = &$k[head * $n * $s..(head + 1) * $n * $s];
+            let vh = &$v[head * $n * $s..(head + 1) * $n * $s];
+            for r in 0..$rows {
+                let i = $row_start + r;
+                let (lo, hi) = match $window {
+                    Some(w) if $n > 2 * w + 1 => (i.saturating_sub(w), (i + w + 1).min($n)),
+                    _ => (0, $n),
+                };
+                let len = hi - lo;
+                let qi = &qh[i * $s..(i + 1) * $s];
+                let mut top = f32::NEG_INFINITY;
+                for (idx, j) in (lo..hi).enumerate() {
+                    let sc = $dot(qi, &kh[j * $s..(j + 1) * $s]) * $scale;
+                    scores[idx] = sc;
+                    if sc > top {
+                        top = sc;
+                    }
+                }
+                let mut total = 0.0f32;
+                for sc in &mut scores[..len] {
+                    let e = (*sc - top).exp();
+                    *sc = e;
+                    total += e;
+                }
+                let inv = total.recip();
+                let dst = &mut $dst_chunk[r * $d + head * $s..r * $d + (head + 1) * $s];
+                for (idx, &w) in scores[..len].iter().enumerate() {
+                    let p = w * inv;
+                    if p != 0.0 {
+                        let vj = &vh[(lo + idx) * $s..(lo + idx + 1) * $s];
+                        $fmadd(dst, vj, p);
+                    }
+                }
+            }
+        }
+    }};
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn full_attn_chunk_avx2(
+    row_start: usize,
+    rows: usize,
+    n: usize,
+    h: usize,
+    s: usize,
+    d: usize,
+    scale: f32,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    window: Option<usize>,
+    dst_chunk: &mut [f32],
+) {
+    full_attn_body!(
+        row_start,
+        rows,
+        n,
+        h,
+        s,
+        d,
+        scale,
+        q,
+        k,
+        v,
+        window,
+        dst_chunk,
+        dot4_avx2,
+        fmadd_scaled_avx2
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn full_attn_chunk(
     row_start: usize,
@@ -977,45 +1107,50 @@ fn full_attn_chunk(
     window: Option<usize>,
     dst_chunk: &mut [f32],
 ) {
-    let cap = window.map_or(n, |w| (2 * w + 1).min(n));
-    let mut scores = vec![0f32; cap];
-    for head in 0..h {
-        let qh = &q[head * n * s..(head + 1) * n * s];
-        let kh = &k[head * n * s..(head + 1) * n * s];
-        let vh = &v[head * n * s..(head + 1) * n * s];
-        for r in 0..rows {
-            let i = row_start + r;
-            let (lo, hi) = match window {
-                Some(w) if n > 2 * w + 1 => (i.saturating_sub(w), (i + w + 1).min(n)),
-                _ => (0, n),
-            };
-            let len = hi - lo;
-            let qi = &qh[i * s..(i + 1) * s];
-            let mut top = f32::NEG_INFINITY;
-            for (idx, j) in (lo..hi).enumerate() {
-                let sc = dot4(qi, &kh[j * s..(j + 1) * s]) * scale;
-                scores[idx] = sc;
-                if sc > top {
-                    top = sc;
-                }
-            }
-            let mut total = 0.0f32;
-            for sc in &mut scores[..len] {
-                let e = (*sc - top).exp();
-                *sc = e;
-                total += e;
-            }
-            let inv = total.recip();
-            let dst = &mut dst_chunk[r * d + head * s..r * d + (head + 1) * s];
-            for (idx, &w) in scores[..len].iter().enumerate() {
-                let p = w * inv;
-                let vj = &vh[(lo + idx) * s..(lo + idx + 1) * s];
-                for c in 0..s {
-                    dst[c] += p * vj[c];
-                }
-            }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: AVX2+FMA availability checked above.
+        unsafe {
+            full_attn_chunk_avx2(
+                row_start, rows, n, h, s, d, scale, q, k, v, window, dst_chunk,
+            );
         }
+        return;
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    full_attn_body!(
+        row_start,
+        rows,
+        n,
+        h,
+        s,
+        d,
+        scale,
+        q,
+        k,
+        v,
+        window,
+        dst_chunk,
+        dot4_wasm,
+        fmadd_scaled_wasm
+    );
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    full_attn_body!(
+        row_start,
+        rows,
+        n,
+        h,
+        s,
+        d,
+        scale,
+        q,
+        k,
+        v,
+        window,
+        dst_chunk,
+        dot4_scalar,
+        fmadd_scaled_scalar
+    );
 }
 
 /// Self-attention layer (`Templates` global when `window.is_none()`, `Construct` windowed when `window.is_some()`).
@@ -1097,47 +1232,28 @@ fn spatial_window_features(
             let ay = 0.5 * (ay0 + ay1);
             let ah = (ay1 - ay0).max(1e-3);
             let aw = ax1 - ax0;
-            for c in 0..kw {
-                let is_self = c == blk + r;
-                let k_idx = if c < blk {
-                    if b == 0 {
-                        None
-                    } else {
-                        Some((b - 1) * blk + c)
-                    }
-                } else if c < 2 * blk {
-                    Some(b * blk + (c - blk))
-                } else if b + 1 >= blocks {
-                    None
-                } else {
-                    Some((b + 1) * blk + (c - 2 * blk))
-                };
-                let k_valid = k_idx.is_some_and(|ki| valid[ki]);
-                let ok = k_valid || is_self;
-                seen[row_off + c] = ok;
-                if !ok {
-                    continue;
-                }
-                let (bx0, by0, bx1, by1, k_page) = match k_idx {
-                    Some(ki) => (
-                        boxes[ki * 4],
-                        boxes[ki * 4 + 1],
-                        boxes[ki * 4 + 2],
-                        boxes[ki * 4 + 3],
-                        pages[ki],
-                    ),
-                    None => (0.0, 0.0, 0.0, 0.0, -1),
-                };
+            let mut fill_pair = |col_idx: usize, ki: usize| {
+                seen[col_idx] = true;
+                let (bx0, by0, bx1, by1, k_page) = (
+                    boxes[ki * 4],
+                    boxes[ki * 4 + 1],
+                    boxes[ki * 4 + 2],
+                    boxes[ki * 4 + 3],
+                    pages[ki],
+                );
                 let by = 0.5 * (by0 + by1);
-                let same_page = if q_page >= 0 && q_page == k_page { 1.0 } else { 0.0 };
+                let same_page = if q_page >= 0 && q_page == k_page {
+                    1.0
+                } else {
+                    0.0
+                };
                 let bh = (by1 - by0).max(1e-3);
                 let href = ah.max(bh);
                 let same_y = same_page * if (by - ay).abs() < 0.5 * href { 1.0 } else { 0.0 };
                 let same_x0 = same_page * if (bx0 - ax0).abs() < 0.015 { 1.0 } else { 0.0 };
-                let x_ov = same_page
-                    * (ax1.min(bx1) - ax0.max(bx0)).max(0.0)
+                let x_ov = same_page * (ax1.min(bx1) - ax0.max(bx0)).max(0.0)
                     / aw.max(bx1 - bx0).max(1e-3);
-                let f = &mut feats[(row_off + c) * 7..(row_off + c + 1) * 7];
+                let f = &mut feats[col_idx * 7..(col_idx + 1) * 7];
                 f[0] = (bx0 - ax0).clamp(-1.0, 1.0);
                 f[1] = (bx1 - ax1).clamp(-1.0, 1.0);
                 f[2] = ((by - ay) / href).clamp(-8.0, 8.0) / 8.0;
@@ -1145,10 +1261,257 @@ fn spatial_window_features(
                 f[4] = same_x0;
                 f[5] = x_ov;
                 f[6] = same_page;
+            };
+            if b > 0 {
+                let base_k = (b - 1) * blk;
+                for c in 0..blk {
+                    let ki = base_k + c;
+                    if valid[ki] {
+                        fill_pair(row_off + c, ki);
+                    }
+                }
+            }
+            {
+                let base_k = b * blk;
+                for c in 0..blk {
+                    let ki = base_k + c;
+                    if valid[ki] || c == r {
+                        fill_pair(row_off + blk + c, ki);
+                    }
+                }
+            }
+            if b + 1 < blocks {
+                let base_k = (b + 1) * blk;
+                for c in 0..blk {
+                    let ki = base_k + c;
+                    if valid[ki] {
+                        fill_pair(row_off + 2 * blk + c, ki);
+                    }
+                }
             }
         }
     }
     (feats, seen)
+}
+
+macro_rules! block_attn_body {
+    (
+        $b_start:expr, $b_end:expr, $n:expr, $blk:expr, $blocks:expr, $h:expr, $s:expr, $d:expr,
+        $scale:expr, $q:expr, $k:expr, $v:expr, $bias:expr, $seen:expr, $dst_chunk:expr, $dot:expr, $fmadd:expr
+    ) => {{
+        let kw = 3 * $blk;
+        let mut scores = vec![0f32; kw];
+        for b in $b_start..$b_end {
+            let local_b = b - $b_start;
+            let has_prev = b > 0;
+            let has_next = b + 1 < $blocks;
+            let k_prev = if has_prev { (b - 1) * $blk } else { 0 };
+            let k_cur = b * $blk;
+            let k_next = if has_next { (b + 1) * $blk } else { 0 };
+            let block_seen = if $bias.is_none() {
+                Some(&$seen[b * kw..(b + 1) * kw])
+            } else {
+                None
+            };
+            for head in 0..$h {
+                let qh = &$q[head * $n * $s..(head + 1) * $n * $s];
+                let kh = &$k[head * $n * $s..(head + 1) * $n * $s];
+                let vh = &$v[head * $n * $s..(head + 1) * $n * $s];
+                for r in 0..$blk {
+                    let qi_idx = b * $blk + r;
+                    let local_row = local_b * $blk + r;
+                    let qi = &qh[qi_idx * $s..(qi_idx + 1) * $s];
+                    let mut top = f32::NEG_INFINITY;
+                    if let Some(b_mat) = $bias {
+                        let row_seen = &$seen[qi_idx * kw..(qi_idx + 1) * kw];
+                        let row_bias = qi_idx * kw * $h + head;
+                        if has_prev {
+                            for c in 0..$blk {
+                                let raw_b = b_mat[row_bias + c * $h];
+                                let sc = if row_seen[c] {
+                                    let kj = k_prev + c;
+                                    $dot(qi, &kh[kj * $s..(kj + 1) * $s]) * $scale + raw_b
+                                } else {
+                                    raw_b
+                                };
+                                scores[c] = sc;
+                                if sc > top {
+                                    top = sc;
+                                }
+                            }
+                        } else {
+                            for c in 0..$blk {
+                                let sc = b_mat[row_bias + c * $h];
+                                scores[c] = sc;
+                                if sc > top {
+                                    top = sc;
+                                }
+                            }
+                        }
+                        for c in 0..$blk {
+                            let ci = $blk + c;
+                            let raw_b = b_mat[row_bias + ci * $h];
+                            let sc = if row_seen[ci] {
+                                let kj = k_cur + c;
+                                $dot(qi, &kh[kj * $s..(kj + 1) * $s]) * $scale + raw_b
+                            } else {
+                                raw_b
+                            };
+                            scores[ci] = sc;
+                            if sc > top {
+                                top = sc;
+                            }
+                        }
+                        if has_next {
+                            for c in 0..$blk {
+                                let ci = 2 * $blk + c;
+                                let raw_b = b_mat[row_bias + ci * $h];
+                                let sc = if row_seen[ci] {
+                                    let kj = k_next + c;
+                                    $dot(qi, &kh[kj * $s..(kj + 1) * $s]) * $scale + raw_b
+                                } else {
+                                    raw_b
+                                };
+                                scores[ci] = sc;
+                                if sc > top {
+                                    top = sc;
+                                }
+                            }
+                        } else {
+                            for c in 2 * $blk..kw {
+                                let sc = b_mat[row_bias + c * $h];
+                                scores[c] = sc;
+                                if sc > top {
+                                    top = sc;
+                                }
+                            }
+                        }
+                    } else {
+                        let b_seen = block_seen.unwrap();
+                        if has_prev {
+                            for c in 0..$blk {
+                                let sc = if b_seen[c] {
+                                    let kj = k_prev + c;
+                                    $dot(qi, &kh[kj * $s..(kj + 1) * $s]) * $scale
+                                } else {
+                                    f32::NEG_INFINITY
+                                };
+                                scores[c] = sc;
+                                if sc > top {
+                                    top = sc;
+                                }
+                            }
+                        } else {
+                            scores[..$blk].fill(f32::NEG_INFINITY);
+                        }
+                        for c in 0..$blk {
+                            let ci = $blk + c;
+                            let sc = if b_seen[ci] {
+                                let kj = k_cur + c;
+                                $dot(qi, &kh[kj * $s..(kj + 1) * $s]) * $scale
+                            } else {
+                                f32::NEG_INFINITY
+                            };
+                            scores[ci] = sc;
+                            if sc > top {
+                                top = sc;
+                            }
+                        }
+                        if has_next {
+                            for c in 0..$blk {
+                                let ci = 2 * $blk + c;
+                                let sc = if b_seen[ci] {
+                                    let kj = k_next + c;
+                                    $dot(qi, &kh[kj * $s..(kj + 1) * $s]) * $scale
+                                } else {
+                                    f32::NEG_INFINITY
+                                };
+                                scores[ci] = sc;
+                                if sc > top {
+                                    top = sc;
+                                }
+                            }
+                        } else {
+                            scores[2 * $blk..kw].fill(f32::NEG_INFINITY);
+                        }
+                    }
+                    if top.is_finite() {
+                        let mut total = 0.0f32;
+                        for sc in &mut scores {
+                            let e = (*sc - top).exp();
+                            *sc = e;
+                            total += e;
+                        }
+                        let inv = total.recip();
+                        let dst = &mut $dst_chunk[local_row * $d + head * $s..local_row * $d + (head + 1) * $s];
+                        if has_prev {
+                            for (c, &w) in scores[..$blk].iter().enumerate() {
+                                let p = w * inv;
+                                if p != 0.0 {
+                                    $fmadd(dst, &vh[(k_prev + c) * $s..(k_prev + c + 1) * $s], p);
+                                }
+                            }
+                        }
+                        for (c, &w) in scores[$blk..2 * $blk].iter().enumerate() {
+                            let p = w * inv;
+                            if p != 0.0 {
+                                $fmadd(dst, &vh[(k_cur + c) * $s..(k_cur + c + 1) * $s], p);
+                            }
+                        }
+                        if has_next {
+                            for (c, &w) in scores[2 * $blk..kw].iter().enumerate() {
+                                let p = w * inv;
+                                if p != 0.0 {
+                                    $fmadd(dst, &vh[(k_next + c) * $s..(k_next + c + 1) * $s], p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }};
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn block_attn_chunk_avx2(
+    b_start: usize,
+    b_end: usize,
+    n: usize,
+    blk: usize,
+    blocks: usize,
+    h: usize,
+    s: usize,
+    d: usize,
+    scale: f32,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    bias: Option<&[f32]>,
+    seen: &[bool],
+    dst_chunk: &mut [f32],
+) {
+    block_attn_body!(
+        b_start,
+        b_end,
+        n,
+        blk,
+        blocks,
+        h,
+        s,
+        d,
+        scale,
+        q,
+        k,
+        v,
+        bias,
+        seen,
+        dst_chunk,
+        dot4_avx2,
+        fmadd_scaled_avx2
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1169,99 +1532,56 @@ fn block_attn_chunk(
     seen: &[bool],
     dst_chunk: &mut [f32],
 ) {
-    let kw = 3 * blk;
-    let mut scores = vec![0f32; kw];
-    for b in b_start..b_end {
-        let local_b = b - b_start;
-        let block_seen = if bias.is_none() {
-            Some(&seen[b * kw..(b + 1) * kw])
-        } else {
-            None
-        };
-        for head in 0..h {
-            let qh = &q[head * n * s..(head + 1) * n * s];
-            let kh = &k[head * n * s..(head + 1) * n * s];
-            let vh = &v[head * n * s..(head + 1) * n * s];
-            for r in 0..blk {
-                let qi_idx = b * blk + r;
-                let local_row = local_b * blk + r;
-                let qi = &qh[qi_idx * s..(qi_idx + 1) * s];
-                let mut top = f32::NEG_INFINITY;
-                for c in 0..kw {
-                    let sc = if let Some(b_mat) = bias {
-                        let ok = seen[qi_idx * kw + c];
-                        let raw_b = b_mat[(qi_idx * kw + c) * h + head];
-                        if !ok {
-                            raw_b
-                        } else if c < blk {
-                            if b == 0 {
-                                raw_b
-                            } else {
-                                let kj = (b - 1) * blk + c;
-                                dot4(qi, &kh[kj * s..(kj + 1) * s]) * scale + raw_b
-                            }
-                        } else if c < 2 * blk {
-                            let kj = b * blk + (c - blk);
-                            dot4(qi, &kh[kj * s..(kj + 1) * s]) * scale + raw_b
-                        } else if b + 1 >= blocks {
-                            raw_b
-                        } else {
-                            let kj = (b + 1) * blk + (c - 2 * blk);
-                            dot4(qi, &kh[kj * s..(kj + 1) * s]) * scale + raw_b
-                        }
-                    } else if block_seen.unwrap()[c] {
-                        let kj = if c < blk {
-                            (b - 1) * blk + c
-                        } else if c < 2 * blk {
-                            b * blk + (c - blk)
-                        } else {
-                            (b + 1) * blk + (c - 2 * blk)
-                        };
-                        dot4(qi, &kh[kj * s..(kj + 1) * s]) * scale
-                    } else {
-                        f32::NEG_INFINITY
-                    };
-                    scores[c] = sc;
-                    if sc > top {
-                        top = sc;
-                    }
-                }
-                if top.is_finite() {
-                    let mut total = 0.0f32;
-                    for sc in &mut scores {
-                        let e = (*sc - top).exp();
-                        *sc = e;
-                        total += e;
-                    }
-                    let inv = total.recip();
-                    let dst = &mut dst_chunk[local_row * d + head * s..local_row * d + (head + 1) * s];
-                    for (c, &w) in scores.iter().enumerate() {
-                        let p = w * inv;
-                        if p == 0.0 {
-                            continue;
-                        }
-                        let kj = if c < blk {
-                            if b == 0 {
-                                continue;
-                            }
-                            (b - 1) * blk + c
-                        } else if c < 2 * blk {
-                            b * blk + (c - blk)
-                        } else {
-                            if b + 1 >= blocks {
-                                continue;
-                            }
-                            (b + 1) * blk + (c - 2 * blk)
-                        };
-                        let vj = &vh[kj * s..(kj + 1) * s];
-                        for m in 0..s {
-                            dst[m] += p * vj[m];
-                        }
-                    }
-                }
-            }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: AVX2+FMA availability checked above.
+        unsafe {
+            block_attn_chunk_avx2(
+                b_start, b_end, n, blk, blocks, h, s, d, scale, q, k, v, bias, seen, dst_chunk,
+            );
         }
+        return;
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    block_attn_body!(
+        b_start,
+        b_end,
+        n,
+        blk,
+        blocks,
+        h,
+        s,
+        d,
+        scale,
+        q,
+        k,
+        v,
+        bias,
+        seen,
+        dst_chunk,
+        dot4_wasm,
+        fmadd_scaled_wasm
+    );
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    block_attn_body!(
+        b_start,
+        b_end,
+        n,
+        blk,
+        blocks,
+        h,
+        s,
+        d,
+        scale,
+        q,
+        k,
+        v,
+        bias,
+        seen,
+        dst_chunk,
+        dot4_scalar,
+        fmadd_scaled_scalar
+    );
 }
 
 /// Block-local transformer layer for both `Detect` (`spatial_bias` over `3*blk`) and `Order` (`valid` mask over `3*blk`).
@@ -1284,10 +1604,28 @@ fn run_block_layer(
     let (q, k, v) = prepare_qkv(layer, x, n, Some(rope), threads);
 
     let bias = layer.spatial_bias.as_ref().zip(feats).map(|(sb, f)| {
-        let mut b = sb.forward(f, n * kw, threads);
-        for (idx, &ok) in seen.iter().enumerate() {
-            if !ok {
-                b[idx * h..(idx + 1) * h].fill(-1e4);
+        let f_dim = sb.inp;
+        let total = n * kw;
+        let active: usize = seen.iter().filter(|&&ok| ok).count();
+        if active == total {
+            return sb.forward(f, total, threads);
+        }
+        let mut b = vec![-1e4f32; total * h];
+        if active > 0 {
+            let mut packed_f = Vec::with_capacity(active * f_dim);
+            for (idx, &ok) in seen.iter().enumerate() {
+                if ok {
+                    packed_f.extend_from_slice(&f[idx * f_dim..(idx + 1) * f_dim]);
+                }
+            }
+            let active_b = sb.forward(&packed_f, active, threads);
+            let mut src_idx = 0usize;
+            for (idx, &ok) in seen.iter().enumerate() {
+                if ok {
+                    b[idx * h..(idx + 1) * h]
+                        .copy_from_slice(&active_b[src_idx * h..(src_idx + 1) * h]);
+                    src_idx += 1;
+                }
             }
         }
         b
@@ -1336,9 +1674,7 @@ fn run_block_layer(
 #[inline(always)]
 fn relu(v: &mut [f32]) {
     for x in v {
-        if *x < 0.0 {
-            *x = 0.0;
-        }
+        *x = x.max(0.0);
     }
 }
 

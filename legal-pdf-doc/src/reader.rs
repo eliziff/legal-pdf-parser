@@ -244,6 +244,108 @@ fn margin_links(
 /// region before it of its role in its column's language (a paragraph past the page's foot, or read past the other
 /// column's lines): the region read last of that role and language, on its page or the page before (as Order pairs
 /// regions), its unit the one open in that stream. A region the margin numbers opens.
+/// Whether a region is eligible to trigger `side_by_side_pages` column reordering checks.
+#[cfg(feature = "encoder")]
+fn is_side_by_side_candidate(regions: &Regions, region_boxes: &[f32], r: usize) -> bool {
+    let role = regions.role(r);
+    if matches!(role, FURNITURE | PAGE_LABEL | LINE_LABEL | TABLE) {
+        return false;
+    }
+    if regions.lines[regions.read[r]].len() < 2 {
+        return false;
+    }
+    let width = region_boxes[r * 4 + 2] - region_boxes[r * 4];
+    width >= 0.18
+}
+
+/// Demotes unlabeled mid-page `NOTE` lines positioned above a page's labeled footnote band (or strictly trapped
+/// between body lines in the same horizontal column) back to `QUOTE`, and demotes narrow bare 1-3 digit `TABLE`
+/// superscripts to `TEXT` before region grouping.
+#[cfg(feature = "encoder")]
+fn clamp_mid_page_notes(
+    lines: &mut Lines,
+    type_probs: &mut [f32],
+    pages: &[usize],
+    boxes: &[f32],
+    views: &[LineView],
+    texts: &[&str],
+) {
+    let n = lines.roles.len();
+    let mut min_labeled_note_y0: HashMap<usize, f32> = HashMap::new();
+    let mut max_body_y0: HashMap<usize, f32> = HashMap::new();
+    let mut body_spans_by_page: HashMap<usize, Vec<(f32, f32, f32)>> = HashMap::new();
+    for k in 0..n {
+        let role = (lines.roles[k] / 2) as u8;
+        let (x0, y0, x1) = (boxes[k * 4], boxes[k * 4 + 1], boxes[k * 4 + 2]);
+        let pg = pages[k];
+        if role == NOTE && note_number(&views[k], texts[k]).is_some() {
+            min_labeled_note_y0
+                .entry(pg)
+                .and_modify(|m| *m = m.min(y0))
+                .or_insert(y0);
+        } else if (BODY.contains(&role) && role != TABLE) || role == HEADING {
+            max_body_y0
+                .entry(pg)
+                .and_modify(|m| *m = m.max(y0))
+                .or_insert(y0);
+            body_spans_by_page.entry(pg).or_default().push((y0, x0, x1));
+        }
+    }
+    let note_idx = usize::from(NOTE);
+    let note_quote_idx = usize::from(NOTE_QUOTE);
+    let quote_idx = usize::from(QUOTE);
+    let table_idx = usize::from(TABLE);
+    let text_idx = usize::from(TEXT);
+    for k in 0..n {
+        let role = (lines.roles[k] / 2) as u8;
+        if role == TABLE {
+            let trimmed = texts[k].trim();
+            let width = boxes[k * 4 + 2] - boxes[k * 4];
+            if !trimmed.is_empty()
+                && trimmed.len() <= 3
+                && trimmed.bytes().all(|b| b.is_ascii_digit())
+                && width < 0.08
+            {
+                lines.roles[k] = text_idx * 2 + (lines.roles[k] % 2);
+                if type_probs.len() >= (k + 1) * 17 {
+                    let base = k * 17;
+                    type_probs[base + text_idx] += type_probs[base + table_idx];
+                    type_probs[base + table_idx] = 0.0;
+                }
+            }
+            continue;
+        }
+        if role != NOTE || note_number(&views[k], texts[k]).is_some() {
+            continue;
+        }
+        let pg = pages[k];
+        let (x0, y0, x1) = (boxes[k * 4], boxes[k * 4 + 1], boxes[k * 4 + 2]);
+        let above_labeled_note = min_labeled_note_y0.get(&pg).is_some_and(|&ny| y0 < ny - 1e-3)
+            && max_body_y0.get(&pg).is_some_and(|&by| y0 < by - 1e-3);
+        let trapped_between_body = min_labeled_note_y0.get(&pg).is_none()
+            && body_spans_by_page.get(&pg).is_some_and(|spans| {
+                let above = spans
+                    .iter()
+                    .any(|&(by, bx0, bx1)| by < y0 - 1e-3 && bx0 < x1 + 0.15 && x0 < bx1 + 0.15);
+                let below = spans
+                    .iter()
+                    .any(|&(by, bx0, bx1)| by > y0 + 1e-3 && bx0 < x1 + 0.15 && x0 < bx1 + 0.15);
+                above && below
+            });
+        if above_labeled_note || trapped_between_body {
+            lines.roles[k] = quote_idx * 2 + (lines.roles[k] % 2);
+            if type_probs.len() >= (k + 1) * 17 {
+                let base = k * 17;
+                type_probs[base + quote_idx] +=
+                    type_probs[base + note_idx] + type_probs[base + note_quote_idx];
+                type_probs[base + note_idx] = 0.0;
+                type_probs[base + note_quote_idx] = 0.0;
+            }
+        }
+    }
+}
+
+/// The blocks a page's lines form under `links`, as `Moves` from those lines.
 #[cfg(feature = "encoder")]
 fn goes_on_in_column(
     before: &mut [Option<usize>],
@@ -253,6 +355,8 @@ fn goes_on_in_column(
     t0: &[u8],
     views: &[LineView],
     pages: &[usize],
+    boxes: &[f32],
+    texts: &[&str],
 ) {
     let mut last: HashMap<(u8, bool), usize> = HashMap::new();
     for (i, &first) in regions.firsts.iter().enumerate() {
@@ -268,10 +372,31 @@ fn goes_on_in_column(
             && views[first].margin().is_none()
             && views[first].count().is_none()
         {
-            before[i] = last
-                .get(&key)
-                .copied()
-                .filter(|&earlier| pages[regions.firsts[earlier]] + 1 >= pages[first]);
+            before[i] = last.get(&key).copied().filter(|&earlier| {
+                let prev_page = pages[regions.firsts[earlier]];
+                if prev_page + 1 < pages[first] {
+                    return false;
+                }
+                if prev_page < pages[first] {
+                    let r_lines = &regions.lines[regions.read[earlier]];
+                    if r_lines.len() >= 2 {
+                        let max_w = r_lines
+                            .iter()
+                            .map(|&k| boxes[k * 4 + 2] - boxes[k * 4])
+                            .fold(0.0f32, f32::max);
+                        if let Some(&last_k) = r_lines.last() {
+                            let last_w = boxes[last_k * 4 + 2] - boxes[last_k * 4];
+                            let t_clean = texts[last_k]
+                                .trim()
+                                .trim_end_matches(['"', '\u{201D}', '\u{2019}', '\'', ')', ']']);
+                            if last_w < 0.72 * max_w && t_clean.ends_with(['.', '!', '?']) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            });
         }
         last.insert(key, i);
     }
@@ -1807,6 +1932,19 @@ mod model {
             let decode = decode_options();
             let mut type_probs = vec![0f32; if decode.vote || decode.joint { n * 17 } else { 0 }];
             let mut p_opens = vec![0f32; if decode.joint { n } else { 0 }];
+            let softmax_into = |src: &[f32], dst: &mut [f32]| {
+                let top = src.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut total = 0.0f32;
+                for (d, &s) in dst.iter_mut().zip(src) {
+                    let e = (s - top).exp();
+                    *d = e;
+                    total += e;
+                }
+                let inv = total.recip();
+                for d in dst.iter_mut() {
+                    *d *= inv;
+                }
+            };
             let mut at_pair = 0usize;
             for &(start, end) in runs {
                 let l = end - start;
@@ -1838,46 +1976,49 @@ mod model {
                         det.flags[(start + i) * 2 + 1] > decode.start,
                     );
                 }
-                let mut succ_terms = vec![self.meta.line_far[0]; l * l];
-                let mut pred_terms = vec![self.meta.line_far[1]; l * l];
-                for i in 0..l {
-                    for j in i..=(i + det.window).min(l - 1) {
-                        succ_terms[i * l + j] = det.near_succ[at_pair];
-                        pred_terms[j * l + i] = det.near_pred[at_pair];
-                        at_pair += 1;
-                    }
-                }
-                let mut succ_probs = vec![0f32; l * l];
-                let mut row_buf = Vec::with_capacity(det.window + 1);
+                let w_stride = det.window + 1;
+                let mut pred_terms = vec![self.meta.line_far[1]; l * w_stride];
+                let mut succ_probs = vec![0f32; l * w_stride];
+                let mut row_buf = Vec::with_capacity(w_stride);
                 for i in 0..l {
                     row_buf.clear();
                     let j_end = (i + det.window).min(l - 1);
                     let qi = &det.succ_q[(start + i) * link_dim..(start + i + 1) * link_dim];
                     for j in i..=j_end {
                         let kj = &det.succ_k[(start + j) * link_dim..(start + j + 1) * link_dim];
-                        row_buf.push(dot_slice(qi, kj) + succ_terms[i * l + j]);
+                        row_buf.push(dot_slice(qi, kj) + det.near_succ[at_pair]);
+                        let j_start = j.saturating_sub(det.window);
+                        pred_terms[j * w_stride + (i - j_start)] = det.near_pred[at_pair];
+                        at_pair += 1;
                     }
-                    let sm = softmax_rows(&row_buf, j_end - i + 1);
-                    succ_probs[i * l + i..=i * l + j_end].copy_from_slice(&sm);
+                    let span = j_end - i + 1;
+                    softmax_into(
+                        &row_buf,
+                        &mut succ_probs[i * w_stride..i * w_stride + span],
+                    );
                 }
-                let mut pred_probs = vec![0f32; l * l];
+                let mut pred_probs = vec![0f32; l * w_stride];
                 for j in 0..l {
                     row_buf.clear();
                     let i_start = j.saturating_sub(det.window);
                     let qj = &det.pred_q[(start + j) * link_dim..(start + j + 1) * link_dim];
-                    for i in i_start..=j {
+                    for (k, i) in (i_start..=j).enumerate() {
                         let ki = &det.pred_k[(start + i) * link_dim..(start + i + 1) * link_dim];
-                        row_buf.push(dot_slice(qj, ki) + pred_terms[j * l + i]);
+                        row_buf.push(dot_slice(qj, ki) + pred_terms[j * w_stride + k]);
                     }
-                    let sm = softmax_rows(&row_buf, j - i_start + 1);
-                    pred_probs[j * l + i_start..=j * l + j].copy_from_slice(&sm);
+                    let span = j - i_start + 1;
+                    softmax_into(
+                        &row_buf,
+                        &mut pred_probs[j * w_stride..j * w_stride + span],
+                    );
                 }
                 if decode.joint {
                     let mut candidates: Vec<(usize, usize)> = Vec::new();
                     for i in 0..l {
                         let j_end = (i + det.window).min(l - 1);
                         if let Some(best_j) = (i + 1..=j_end).max_by(|&a, &b| {
-                            succ_probs[i * l + a].total_cmp(&succ_probs[i * l + b])
+                            succ_probs[i * w_stride + (a - i)]
+                                .total_cmp(&succ_probs[i * w_stride + (b - i)])
                         }) {
                             candidates.push((i, best_j));
                         }
@@ -1885,7 +2026,8 @@ mod model {
                     for j in 1..l {
                         let i_start = j.saturating_sub(det.window);
                         if let Some(best_i) = (i_start..j).max_by(|&a, &b| {
-                            pred_probs[j * l + a].total_cmp(&pred_probs[j * l + b])
+                            pred_probs[j * w_stride + (a - i_start)]
+                                .total_cmp(&pred_probs[j * w_stride + (b - i_start)])
                         }) {
                             candidates.push((best_i, j));
                         }
@@ -1908,11 +2050,12 @@ mod model {
                             if rb == TABLE && j > i + 1 && p_opens[b] > 0.30 {
                                 return None;
                             }
-                            let link_lo = (clamp_p(succ_probs[i * l + j])
-                                / clamp_p(succ_probs[i * l + i]))
+                            let j_start = j.saturating_sub(det.window);
+                            let link_lo = (clamp_p(succ_probs[i * w_stride + (j - i)])
+                                / clamp_p(succ_probs[i * w_stride]))
                             .ln()
-                                + (clamp_p(pred_probs[j * l + i])
-                                    / clamp_p(pred_probs[j * l + j]))
+                                + (clamp_p(pred_probs[j * w_stride + (i - j_start)])
+                                    / clamp_p(pred_probs[j * w_stride + (j - j_start)]))
                                 .ln();
                             if link_lo < -0.5 {
                                 return None;
@@ -1944,10 +2087,16 @@ mod model {
                 } else {
                     // Legacy mode (`no_joint`): link both heads choose, or successor's sure one; none into opening role.
                     for i in 0..l {
-                        let next = i + argmax(&succ_probs[i * l + i..i * l + l]);
-                        let back = argmax(&pred_probs[next * l..next * l + next + 1]);
+                        let j_end = (i + det.window).min(l - 1);
+                        let next =
+                            i + argmax(&succ_probs[i * w_stride..i * w_stride + (j_end - i + 1)]);
+                        let next_start = next.saturating_sub(det.window);
+                        let back = next_start
+                            + argmax(
+                                &pred_probs[next * w_stride..next * w_stride + (next - next_start + 1)],
+                            );
                         if next != i
-                            && (back == i || succ_probs[i * l + next] > decode.sure)
+                            && (back == i || succ_probs[i * w_stride + (next - i)] > decode.sure)
                             && lines.roles[start + next] % 2 == 0
                         {
                             lines.links[start + i] = start + next;
@@ -1967,6 +2116,9 @@ mod model {
                 partial_oracle(&mut lines, gold, pages);
             }
             let oracle_region = gold.is_some() && oracle_parts().contains("region");
+            if !oracle_region {
+                clamp_mid_page_notes(&mut lines, &mut type_probs, pages, boxes, views, texts);
+            }
             let mut regions = Regions::of(&lines);
             if decode.vote && !oracle_region {
                 regions.vote(&type_probs);
@@ -2033,7 +2185,7 @@ mod model {
                     }
                     let mut side_by_side = false;
                     for (idx, &a) in page_regs.iter().enumerate() {
-                        if matches!(regions.role(a), FURNITURE | PAGE_LABEL | LINE_LABEL) {
+                        if !is_side_by_side_candidate(&regions, &region_boxes, a) {
                             continue;
                         }
                         let (ax0, ay0, ax1, ay1) = (
@@ -2044,7 +2196,7 @@ mod model {
                         );
                         let ah = (ay1 - ay0).max(1e-3);
                         for &b in &page_regs[idx + 1..] {
-                            if matches!(regions.role(b), FURNITURE | PAGE_LABEL | LINE_LABEL) {
+                            if !is_side_by_side_candidate(&regions, &region_boxes, b) {
                                 continue;
                             }
                             let (bx0, by0, bx1, by1) = (
@@ -2391,7 +2543,22 @@ mod model {
                     && (role(i) == MARGINAL_NOTE) == (role(j) == MARGINAL_NOTE)
                     && !(role(i) == MARGINAL_NOTE && pages[firsts[j]] > pages[firsts[i]])
                     && !(firsts[i] + 1..=firsts[j]).any(|k| lines.starts[k]);
-                if before[j].is_none() && !after[i] && !opens && same_stream {
+                let has_intervening_opener = (i + 1..j).any(|m| {
+                    let rm = role(m);
+                    rm == HEADING
+                        || (matches!(rm, TEXT | QUOTE)
+                            && stream_of(rm) == stream_of(role(i))
+                            && views[firsts[m]].translation() == views[firsts[i]].translation()
+                            && (lines.roles[firsts[m]] % 2 == 1
+                                || views[firsts[m]].margin().is_some()
+                                || views[firsts[m]].count().is_some()))
+                });
+                if before[j].is_none()
+                    && !after[i]
+                    && !opens
+                    && same_stream
+                    && !has_intervening_opener
+                {
                     (before[j], after[i]) = (Some(i), true);
                 }
             }
@@ -2403,6 +2570,8 @@ mod model {
                 &inputs.t0,
                 views,
                 pages,
+                boxes,
+                texts,
             );
             lap(2, &mut since);
             // The trees over the regions that open a unit, headings and the body's apart.
