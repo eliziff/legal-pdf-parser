@@ -35,6 +35,84 @@ pub struct IndraScratch {
     logits_block: Vec<f32>,
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct PackedQ8 {
+    /// Per-4-ic per-8-oc interleaved symmetric `i8` weights:
+    /// `[tiles16, inp / 4, 2, 8, 4]` followed by optional `[inp / 4, 8, 4]` tail8.
+    w_q: Vec<i8>,
+    /// Per-output-channel weight scale (`max_abs / 127.0`), padded to `out_pad`.
+    scale_w: Vec<f32>,
+    /// Pre-scaled column sum (`scale_w[oc] * sum_k(w_q[oc, k])`), for zero-point correction.
+    w_sum_scaled: Vec<f32>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl PackedQ8 {
+    fn pack(raw_w: &[f32], out_dim: usize, out_pad: usize, inp: usize) -> Option<Self> {
+        if inp < 64 || !inp.is_multiple_of(4) || out_pad < 64 {
+            return None;
+        }
+        let k4_count = inp / 4;
+        let tiles16 = out_pad / 16;
+        let has_tail8 = (out_pad & 8) != 0;
+        let mut w_q = vec![0_i8; out_pad * inp];
+        let mut scale_w = vec![0.0_f32; out_pad];
+        let mut w_sum_scaled = vec![0.0_f32; out_pad];
+
+        let mut encode_channel = |oc: usize, dst_oc_fn: &mut dyn FnMut(usize, i8)| {
+            if oc >= out_dim {
+                return;
+            }
+            let src_row = &raw_w[oc * inp..(oc + 1) * inp];
+            let max_abs = src_row.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
+            if max_abs == 0.0 {
+                return;
+            }
+            let sw = max_abs / 127.0;
+            let inv_sw = 127.0 / max_abs;
+            scale_w[oc] = sw;
+            let mut sum_q = 0_i32;
+            for (k, &v) in src_row.iter().enumerate() {
+                let q = (v * inv_sw).round().clamp(-127.0, 127.0) as i8;
+                sum_q += i32::from(q);
+                dst_oc_fn(k, q);
+            }
+            w_sum_scaled[oc] = sw * (sum_q as f32);
+        };
+
+        for tile in 0..tiles16 {
+            let base = tile * k4_count * 64;
+            for half in 0..2 {
+                for lane in 0..8 {
+                    let oc = tile * 16 + half * 8 + lane;
+                    encode_channel(oc, &mut |k, q| {
+                        let k4 = k >> 2;
+                        let r4 = k & 3;
+                        w_q[base + k4 * 64 + half * 32 + lane * 4 + r4] = q;
+                    });
+                }
+            }
+        }
+        if has_tail8 {
+            let base = tiles16 * k4_count * 64;
+            for lane in 0..8 {
+                let oc = tiles16 * 16 + lane;
+                encode_channel(oc, &mut |k, q| {
+                    let k4 = k >> 2;
+                    let r4 = k & 3;
+                    w_q[base + k4 * 32 + lane * 4 + r4] = q;
+                });
+            }
+        }
+
+        Some(Self {
+            w_q,
+            scale_w,
+            w_sum_scaled,
+        })
+    }
+}
+
 pub(crate) struct PackedLinear {
     /// `[tiles16, inp, 16]` followed by an optional `[inp, 8]` tail tile when `out_pad % 16 == 8`,
     /// so AVX2 (`2 x f32x8` / `1 x f32x8`) and Wasm SIMD128 (`4 x f32x4` / `2 x f32x4`) load
@@ -43,10 +121,22 @@ pub(crate) struct PackedLinear {
     pub(crate) b: Vec<f32>,
     pub(crate) out_pad: usize,
     pub(crate) inp: usize,
+    #[cfg(target_arch = "x86_64")]
+    q8: Option<PackedQ8>,
 }
 
 impl PackedLinear {
-    pub(crate) fn pack(raw_w: &[f32], raw_b: &[f32], out_dim: usize, inp: usize) -> Self {
+    pub(crate) fn pack_fp32(raw_w: &[f32], raw_b: &[f32], out_dim: usize, inp: usize) -> Self {
+        Self::pack_with_q8(raw_w, raw_b, out_dim, inp, false)
+    }
+
+    pub(crate) fn pack_with_q8(
+        raw_w: &[f32],
+        raw_b: &[f32],
+        out_dim: usize,
+        inp: usize,
+        allow_q8: bool,
+    ) -> Self {
         let out_pad = out_dim.div_ceil(8) * 8;
         let tiles16 = out_pad / 16;
         let has_tail8 = (out_pad & 8) != 0;
@@ -76,7 +166,18 @@ impl PackedLinear {
         }
         let mut b = vec![0.0_f32; out_pad];
         b[..out_dim].copy_from_slice(&raw_b[..out_dim]);
-        Self { w, b, out_pad, inp }
+        #[cfg(target_arch = "x86_64")]
+        let q8 = allow_q8.then(|| PackedQ8::pack(raw_w, out_dim, out_pad, inp)).flatten();
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = allow_q8;
+        Self {
+            w,
+            b,
+            out_pad,
+            inp,
+            #[cfg(target_arch = "x86_64")]
+            q8,
+        }
     }
 }
 
@@ -119,8 +220,23 @@ impl IndraNative {
         Self::from_onnx_bytes(&bytes)
     }
 
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn from_onnx_path_fp32(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|err| format!("failed to read Indra ONNX model {}: {err}", path.display()))?;
+        Self::from_onnx_bytes_with_q8(&bytes, false)
+    }
+
     /// Parse initializers directly from an Indra ONNX protobuf byte slice, fuse `stem_bn`, and pack weights.
     pub fn from_onnx_bytes(bytes: &[u8]) -> Result<Self, String> {
+        #[cfg(target_arch = "x86_64")]
+        let allow_q8 = use_int8_gemm();
+        #[cfg(not(target_arch = "x86_64"))]
+        let allow_q8 = false;
+        Self::from_onnx_bytes_with_q8(bytes, allow_q8)
+    }
+
+    fn from_onnx_bytes_with_q8(bytes: &[u8], allow_q8: bool) -> Result<Self, String> {
         let mut tensors = parse_onnx_initializers(bytes)?;
 
         let take = |map: &mut std::collections::HashMap<String, OnnxTensor>, name: &str| -> Result<OnnxTensor, String> {
@@ -163,7 +279,7 @@ impl IndraNative {
                 stem_b[c] = (stem_b[c] - mean.data[c]) * scale + b;
             }
         }
-        let stem = PackedLinear::pack(&stem_w, &stem_b, channels, 128);
+        let stem = PackedLinear::pack_with_q8(&stem_w, &stem_b, channels, 128, allow_q8);
 
         let mut blocks = Vec::new();
         for idx in 0..64 {
@@ -237,10 +353,10 @@ impl IndraNative {
             blocks.push(BlockWeights {
                 dw_w,
                 dw_b,
-                expand: PackedLinear::pack(&expand_w_t.data, &expand_b, expand_channels, channels),
-                fc1: PackedLinear::pack(&fc1_w_t.data, &fc1_b, se_channels, expand_channels),
-                fc2: PackedLinear::pack(&fc2_w_t.data, &fc2_b, expand_channels, se_channels),
-                project: PackedLinear::pack(&project_w_t.data, &project_b, channels, expand_channels),
+                expand: PackedLinear::pack_with_q8(&expand_w_t.data, &expand_b, expand_channels, channels, allow_q8),
+                fc1: PackedLinear::pack_fp32(&fc1_w_t.data, &fc1_b, se_channels, expand_channels),
+                fc2: PackedLinear::pack_fp32(&fc2_w_t.data, &fc2_b, expand_channels, se_channels),
+                project: PackedLinear::pack_with_q8(&project_w_t.data, &project_b, channels, expand_channels, allow_q8),
                 expand_channels,
                 se_channels,
             });
@@ -258,7 +374,7 @@ impl IndraNative {
         if head_b.len() != vocab_size {
             return Err(format!("unexpected model.head.bias len {}", head_b.len()));
         }
-        let head = PackedLinear::pack(&head_w_t.data, &head_b, vocab_size, channels);
+        let head = PackedLinear::pack_with_q8(&head_w_t.data, &head_b, vocab_size, channels, allow_q8);
         const PUNCT_EXT: [usize; 8] = [834, 835, 838, 839, 842, 843, 848, 892];
         let shortlist = if vocab_size > 256 {
             let mut in_fast = vec![false; vocab_size];
@@ -281,7 +397,7 @@ impl IndraNative {
                     w_sub.extend_from_slice(&head_w_t.data[oc * channels..(oc + 1) * channels]);
                     b_sub.push(head_b[oc]);
                 }
-                PackedLinear::pack(&w_sub, &b_sub, ids.len(), channels)
+                PackedLinear::pack_with_q8(&w_sub, &b_sub, ids.len(), channels, allow_q8)
             };
             Some(ShortlistHead {
                 fast: pack_subset(&fast_ids),
@@ -983,6 +1099,18 @@ fn depthwise_conv1d_k9_wasm(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn use_int8_gemm() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LEGALPDF_OCR_INT8")
+            .ok()
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true)
+    })
+}
+
 /// Outer-product GEMM over weights pre-packed as `[tiles16, inp, 16]` (+ optional `[inp, 8]`)
 /// with stride `lin.out_pad`, optionally fusing residual addition and/or HardSwish before storing.
 pub(crate) fn linear_packed<const ADD_TO_DST: bool, const HARDSWISH: bool>(
@@ -996,6 +1124,10 @@ pub(crate) fn linear_packed<const ADD_TO_DST: bool, const HARDSWISH: bool>(
     }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if let Some(ref q8) = lin.q8 {
+            unsafe { linear_packed_avx2_q8::<ADD_TO_DST, HARDSWISH>(x, rows, lin, q8, dst) };
+            return;
+        }
         unsafe { linear_packed_avx2::<ADD_TO_DST, HARDSWISH>(x, rows, lin, dst) };
         return;
     }
@@ -1306,6 +1438,355 @@ unsafe fn linear_packed_avx2<const ADD_TO_DST: bool, const HARDSWISH: bool>(
             r += 1;
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+struct QuantRowScratch {
+    x_q: Vec<u8>,
+    x_scale: Vec<f32>,
+    x_min: Vec<f32>,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn hmin_max_256(vmin: std::arch::x86_64::__m256, vmax: std::arch::x86_64::__m256) -> (f32, f32) {
+    use std::arch::x86_64::*;
+    let lo_min = _mm256_castps256_ps128(vmin);
+    let hi_min = _mm256_extractf128_ps::<1>(vmin);
+    let m128_min = _mm_min_ps(lo_min, hi_min);
+    let m64_min = _mm_min_ps(m128_min, _mm_movehl_ps(m128_min, m128_min));
+    let m32_min = _mm_min_ss(m64_min, _mm_shuffle_ps::<1>(m64_min, m64_min));
+
+    let lo_max = _mm256_castps256_ps128(vmax);
+    let hi_max = _mm256_extractf128_ps::<1>(vmax);
+    let m128_max = _mm_max_ps(lo_max, hi_max);
+    let m64_max = _mm_max_ps(m128_max, _mm_movehl_ps(m128_max, m128_max));
+    let m32_max = _mm_max_ss(m64_max, _mm_shuffle_ps::<1>(m64_max, m64_max));
+    (_mm_cvtss_f32(m32_min), _mm_cvtss_f32(m32_max))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn quantize_rows_u7_avx2(
+    x: &[f32],
+    rows: usize,
+    inp: usize,
+    scratch: &mut QuantRowScratch,
+) {
+    use std::arch::x86_64::*;
+    scratch.x_q.resize(rows * inp, 0);
+    scratch.x_scale.resize(rows, 0.0);
+    scratch.x_min.resize(rows, 0.0);
+    let zero_ps = _mm256_setzero_ps();
+    let max127_ps = _mm256_set1_ps(127.0);
+
+    for r in 0..rows {
+        let xr = x.as_ptr().add(r * inp);
+        let qr = scratch.x_q.as_mut_ptr().add(r * inp);
+        let mut vmin = _mm256_set1_ps(f32::INFINITY);
+        let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
+        let mut k = 0usize;
+        while k + 8 <= inp {
+            let v = _mm256_loadu_ps(xr.add(k));
+            vmin = _mm256_min_ps(vmin, v);
+            vmax = _mm256_max_ps(vmax, v);
+            k += 8;
+        }
+        let (mut min_v, mut max_v) = hmin_max_256(vmin, vmax);
+        while k < inp {
+            let v = *xr.add(k);
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            k += 1;
+        }
+        let range = max_v - min_v;
+        scratch.x_min[r] = min_v;
+        if range < 1e-12 {
+            scratch.x_scale[r] = 0.0;
+            std::ptr::write_bytes(qr, 0, inp);
+            continue;
+        }
+        scratch.x_scale[r] = range / 127.0;
+        let inv_scale = 127.0 / range;
+        let vmin_ps = _mm256_set1_ps(min_v);
+        let vinv_ps = _mm256_set1_ps(inv_scale);
+        let mut k = 0usize;
+        while k + 8 <= inp {
+            let v = _mm256_loadu_ps(xr.add(k));
+            let scaled = _mm256_min_ps(
+                _mm256_max_ps(_mm256_mul_ps(_mm256_sub_ps(v, vmin_ps), vinv_ps), zero_ps),
+                max127_ps,
+            );
+            let i32v = _mm256_cvtps_epi32(scaled);
+            let p16 = _mm_packus_epi32(
+                _mm256_castsi256_si128(i32v),
+                _mm256_extracti128_si256::<1>(i32v),
+            );
+            let p8 = _mm_packus_epi16(p16, p16);
+            (qr.add(k) as *mut i64).write_unaligned(_mm_cvtsi128_si64(p8));
+            k += 8;
+        }
+        while k < inp {
+            let q = ((*xr.add(k) - min_v) * inv_scale).round().clamp(0.0, 127.0) as u8;
+            *qr.add(k) = q;
+            k += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn dequant_store_avx2<const ADD_TO_DST: bool, const HARDSWISH: bool>(
+    dp: *mut f32,
+    acc: std::arch::x86_64::__m256i,
+    tot_scale: std::arch::x86_64::__m256,
+    bias_adj: std::arch::x86_64::__m256,
+    zero: std::arch::x86_64::__m256,
+    three: std::arch::x86_64::__m256,
+    six: std::arch::x86_64::__m256,
+    sixth: std::arch::x86_64::__m256,
+) {
+    use std::arch::x86_64::*;
+    let res = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), tot_scale, bias_adj);
+    let val = if ADD_TO_DST {
+        _mm256_add_ps(res, _mm256_loadu_ps(dp))
+    } else {
+        res
+    };
+    store_avx2::<HARDSWISH>(dp, val, zero, three, six, sixth);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn linear_packed_avx2_q8<const ADD_TO_DST: bool, const HARDSWISH: bool>(
+    x: &[f32],
+    rows: usize,
+    lin: &PackedLinear,
+    q8: &PackedQ8,
+    dst: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<QuantRowScratch> = const {
+            RefCell::new(QuantRowScratch {
+                x_q: Vec::new(),
+                x_scale: Vec::new(),
+                x_min: Vec::new(),
+            })
+        };
+    }
+
+    let inp = lin.inp;
+    let out_pad = lin.out_pad;
+    let k4_count = inp / 4;
+    let tiles16 = out_pad / 16;
+    let has_tail8 = (out_pad & 8) != 0;
+    assert!(x.len() >= rows * inp && dst.len() >= rows * out_pad);
+
+    SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        quantize_rows_u7_avx2(x, rows, inp, &mut scratch);
+
+        let xq_base = scratch.x_q.as_ptr();
+        let x_scale = scratch.x_scale.as_ptr();
+        let x_min = scratch.x_min.as_ptr();
+        let w_base = q8.w_q.as_ptr();
+        let sw_base = q8.scale_w.as_ptr();
+        let ws_base = q8.w_sum_scaled.as_ptr();
+        let b_base = lin.b.as_ptr();
+        let d_base = dst.as_mut_ptr();
+
+        let ones16 = _mm256_set1_epi16(1);
+        let zero = _mm256_setzero_ps();
+        let three = _mm256_set1_ps(3.0);
+        let six = _mm256_set1_ps(6.0);
+        let sixth = _mm256_set1_ps(HARD_SWISH_SIXTH);
+
+        for tile in 0..tiles16 {
+            let c = tile * 16;
+            let w_tile = w_base.add(tile * k4_count * 64);
+            let sw0 = _mm256_loadu_ps(sw_base.add(c));
+            let sw1 = _mm256_loadu_ps(sw_base.add(c + 8));
+            let ws0 = _mm256_loadu_ps(ws_base.add(c));
+            let ws1 = _mm256_loadu_ps(ws_base.add(c + 8));
+            let bv0 = _mm256_loadu_ps(b_base.add(c));
+            let bv1 = _mm256_loadu_ps(b_base.add(c + 8));
+
+            let mut r = 0usize;
+            while r + 4 <= rows {
+                let xp0 = xq_base.add(r * inp);
+                let xp1 = xq_base.add((r + 1) * inp);
+                let xp2 = xq_base.add((r + 2) * inp);
+                let xp3 = xq_base.add((r + 3) * inp);
+                let mut a00 = _mm256_setzero_si256();
+                let mut a01 = _mm256_setzero_si256();
+                let mut a10 = _mm256_setzero_si256();
+                let mut a11 = _mm256_setzero_si256();
+                let mut a20 = _mm256_setzero_si256();
+                let mut a21 = _mm256_setzero_si256();
+                let mut a30 = _mm256_setzero_si256();
+                let mut a31 = _mm256_setzero_si256();
+
+                for k4 in 0..k4_count {
+                    let wp = w_tile.add(k4 * 64);
+                    let w0 = _mm256_loadu_si256(wp as *const __m256i);
+                    let w1 = _mm256_loadu_si256(wp.add(32) as *const __m256i);
+                    let xv0 = _mm256_set1_epi32((xp0.add(k4 * 4) as *const i32).read_unaligned());
+                    a00 = _mm256_add_epi32(a00, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, w0), ones16));
+                    a01 = _mm256_add_epi32(a01, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, w1), ones16));
+                    let xv1 = _mm256_set1_epi32((xp1.add(k4 * 4) as *const i32).read_unaligned());
+                    a10 = _mm256_add_epi32(a10, _mm256_madd_epi16(_mm256_maddubs_epi16(xv1, w0), ones16));
+                    a11 = _mm256_add_epi32(a11, _mm256_madd_epi16(_mm256_maddubs_epi16(xv1, w1), ones16));
+                    let xv2 = _mm256_set1_epi32((xp2.add(k4 * 4) as *const i32).read_unaligned());
+                    a20 = _mm256_add_epi32(a20, _mm256_madd_epi16(_mm256_maddubs_epi16(xv2, w0), ones16));
+                    a21 = _mm256_add_epi32(a21, _mm256_madd_epi16(_mm256_maddubs_epi16(xv2, w1), ones16));
+                    let xv3 = _mm256_set1_epi32((xp3.add(k4 * 4) as *const i32).read_unaligned());
+                    a30 = _mm256_add_epi32(a30, _mm256_madd_epi16(_mm256_maddubs_epi16(xv3, w0), ones16));
+                    a31 = _mm256_add_epi32(a31, _mm256_madd_epi16(_mm256_maddubs_epi16(xv3, w1), ones16));
+                }
+
+                for (ri, (acc0, acc1)) in [(0, (a00, a01)), (1, (a10, a11)), (2, (a20, a21)), (3, (a30, a31))] {
+                    let row = r + ri;
+                    let dp = d_base.add(row * out_pad + c);
+                    let sx = _mm256_set1_ps(*x_scale.add(row));
+                    let mx = _mm256_set1_ps(*x_min.add(row));
+                    dequant_store_avx2::<ADD_TO_DST, HARDSWISH>(
+                        dp,
+                        acc0,
+                        _mm256_mul_ps(sx, sw0),
+                        _mm256_fmadd_ps(mx, ws0, bv0),
+                        zero,
+                        three,
+                        six,
+                        sixth,
+                    );
+                    dequant_store_avx2::<ADD_TO_DST, HARDSWISH>(
+                        dp.add(8),
+                        acc1,
+                        _mm256_mul_ps(sx, sw1),
+                        _mm256_fmadd_ps(mx, ws1, bv1),
+                        zero,
+                        three,
+                        six,
+                        sixth,
+                    );
+                }
+                r += 4;
+            }
+
+            while r < rows {
+                let xp0 = xq_base.add(r * inp);
+                let dp = d_base.add(r * out_pad + c);
+                let mut a0 = _mm256_setzero_si256();
+                let mut a1 = _mm256_setzero_si256();
+                for k4 in 0..k4_count {
+                    let wp = w_tile.add(k4 * 64);
+                    let w0 = _mm256_loadu_si256(wp as *const __m256i);
+                    let w1 = _mm256_loadu_si256(wp.add(32) as *const __m256i);
+                    let xv0 = _mm256_set1_epi32((xp0.add(k4 * 4) as *const i32).read_unaligned());
+                    a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, w0), ones16));
+                    a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, w1), ones16));
+                }
+                let sx = _mm256_set1_ps(*x_scale.add(r));
+                let mx = _mm256_set1_ps(*x_min.add(r));
+                dequant_store_avx2::<ADD_TO_DST, HARDSWISH>(
+                    dp,
+                    a0,
+                    _mm256_mul_ps(sx, sw0),
+                    _mm256_fmadd_ps(mx, ws0, bv0),
+                    zero,
+                    three,
+                    six,
+                    sixth,
+                );
+                dequant_store_avx2::<ADD_TO_DST, HARDSWISH>(
+                    dp.add(8),
+                    a1,
+                    _mm256_mul_ps(sx, sw1),
+                    _mm256_fmadd_ps(mx, ws1, bv1),
+                    zero,
+                    three,
+                    six,
+                    sixth,
+                );
+                r += 1;
+            }
+        }
+
+        if has_tail8 {
+            let c = tiles16 * 16;
+            let w_tail = w_base.add(tiles16 * k4_count * 64);
+            let sw = _mm256_loadu_ps(sw_base.add(c));
+            let ws = _mm256_loadu_ps(ws_base.add(c));
+            let bv = _mm256_loadu_ps(b_base.add(c));
+
+            let mut r = 0usize;
+            while r + 4 <= rows {
+                let xp0 = xq_base.add(r * inp);
+                let xp1 = xq_base.add((r + 1) * inp);
+                let xp2 = xq_base.add((r + 2) * inp);
+                let xp3 = xq_base.add((r + 3) * inp);
+                let mut a0 = _mm256_setzero_si256();
+                let mut a1 = _mm256_setzero_si256();
+                let mut a2 = _mm256_setzero_si256();
+                let mut a3 = _mm256_setzero_si256();
+                for k4 in 0..k4_count {
+                    let w0 = _mm256_loadu_si256(w_tail.add(k4 * 32) as *const __m256i);
+                    let xv0 = _mm256_set1_epi32((xp0.add(k4 * 4) as *const i32).read_unaligned());
+                    let xv1 = _mm256_set1_epi32((xp1.add(k4 * 4) as *const i32).read_unaligned());
+                    let xv2 = _mm256_set1_epi32((xp2.add(k4 * 4) as *const i32).read_unaligned());
+                    let xv3 = _mm256_set1_epi32((xp3.add(k4 * 4) as *const i32).read_unaligned());
+                    a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, w0), ones16));
+                    a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_maddubs_epi16(xv1, w0), ones16));
+                    a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(_mm256_maddubs_epi16(xv2, w0), ones16));
+                    a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(_mm256_maddubs_epi16(xv3, w0), ones16));
+                }
+                for (ri, acc) in [(0, a0), (1, a1), (2, a2), (3, a3)] {
+                    let row = r + ri;
+                    let dp = d_base.add(row * out_pad + c);
+                    let sx = _mm256_set1_ps(*x_scale.add(row));
+                    let mx = _mm256_set1_ps(*x_min.add(row));
+                    dequant_store_avx2::<ADD_TO_DST, HARDSWISH>(
+                        dp,
+                        acc,
+                        _mm256_mul_ps(sx, sw),
+                        _mm256_fmadd_ps(mx, ws, bv),
+                        zero,
+                        three,
+                        six,
+                        sixth,
+                    );
+                }
+                r += 4;
+            }
+            while r < rows {
+                let xp0 = xq_base.add(r * inp);
+                let dp = d_base.add(r * out_pad + c);
+                let mut a0 = _mm256_setzero_si256();
+                for k4 in 0..k4_count {
+                    let w0 = _mm256_loadu_si256(w_tail.add(k4 * 32) as *const __m256i);
+                    let xv0 = _mm256_set1_epi32((xp0.add(k4 * 4) as *const i32).read_unaligned());
+                    a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, w0), ones16));
+                }
+                let sx = _mm256_set1_ps(*x_scale.add(r));
+                let mx = _mm256_set1_ps(*x_min.add(r));
+                dequant_store_avx2::<ADD_TO_DST, HARDSWISH>(
+                    dp,
+                    a0,
+                    _mm256_mul_ps(sx, sw),
+                    _mm256_fmadd_ps(mx, ws, bv),
+                    zero,
+                    three,
+                    six,
+                    sixth,
+                );
+                r += 1;
+            }
+        }
+    });
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -1911,5 +2392,71 @@ pub mod wasm_abi {
             }
         }
         steps
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod q8_tests {
+    use super::*;
+
+    #[test]
+    fn q8_gemm_tracks_fp32_across_tiles_and_modes() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let rows = 7usize;
+        let inp = 64usize;
+        let out_dim = 69usize;
+        let raw_w: Vec<f32> = (0..out_dim * inp)
+            .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03)
+            .collect();
+        let raw_b: Vec<f32> = (0..out_dim).map(|i| (i as f32 - 10.0) * 0.05).collect();
+        let lin = PackedLinear::pack_with_q8(&raw_w, &raw_b, out_dim, inp, true);
+        let q8 = lin.q8.as_ref().expect("PackedQ8 should be populated");
+        let mut x: Vec<f32> = (0..rows * inp)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) * 0.08)
+            .collect();
+        // Exercise constant-row fast path too.
+        x[6 * inp..7 * inp].fill(-0.37);
+
+        let initial: Vec<f32> = (0..rows * lin.out_pad)
+            .map(|i| ((i * 7 % 19) as f32 - 9.0) * 0.1)
+            .collect();
+        for (add, hswish) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut ref_dst = initial.clone();
+            let mut q8_dst = initial.clone();
+            unsafe {
+                match (add, hswish) {
+                    (false, false) => {
+                        linear_packed_avx2::<false, false>(&x, rows, &lin, &mut ref_dst);
+                        linear_packed_avx2_q8::<false, false>(&x, rows, &lin, q8, &mut q8_dst);
+                    }
+                    (true, false) => {
+                        linear_packed_avx2::<true, false>(&x, rows, &lin, &mut ref_dst);
+                        linear_packed_avx2_q8::<true, false>(&x, rows, &lin, q8, &mut q8_dst);
+                    }
+                    (false, true) => {
+                        linear_packed_avx2::<false, true>(&x, rows, &lin, &mut ref_dst);
+                        linear_packed_avx2_q8::<false, true>(&x, rows, &lin, q8, &mut q8_dst);
+                    }
+                    (true, true) => {
+                        linear_packed_avx2::<true, true>(&x, rows, &lin, &mut ref_dst);
+                        linear_packed_avx2_q8::<true, true>(&x, rows, &lin, q8, &mut q8_dst);
+                    }
+                }
+            }
+            for r in 0..rows {
+                for c in 0..out_dim {
+                    let idx = r * lin.out_pad + c;
+                    let diff = (ref_dst[idx] - q8_dst[idx]).abs();
+                    assert!(
+                        diff < 0.05,
+                        "add={add} hswish={hswish} r={r} c={c}: ref={} q8={} diff={diff}",
+                        ref_dst[idx],
+                        q8_dst[idx]
+                    );
+                }
+            }
+        }
     }
 }

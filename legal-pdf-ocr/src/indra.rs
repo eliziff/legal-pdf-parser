@@ -1590,7 +1590,7 @@ mod tests {
                 continue;
             }
             let codec = Codec::load(codec_path).expect("load codec");
-            let native = IndraNative::from_onnx_path(model_path).expect("load IndraNative");
+            let native = IndraNative::from_onnx_path_fp32(model_path).expect("load IndraNative");
             let mut session = open_session(model_path, 1, OrtBackend::Cpu, "cpu", true, &weights, false)
                 .expect("open ORT session");
             let mut scratch = IndraScratch::default();

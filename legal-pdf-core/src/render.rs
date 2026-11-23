@@ -4,14 +4,18 @@ use crate::{Error, FailureKind, Result};
 use hayro::hayro_interpret::font::Glyph;
 use hayro::hayro_interpret::{
     interpret_page, BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, ImageData,
-    InterpreterCache, InterpreterSettings, Paint, PathDrawMode, SoftMask, TransformExt,
+    InterpreterCache, InterpreterSettings, Paint, PathDrawMode, RasterImage, SoftMask,
+    TransformExt,
 };
+use hayro::hayro_syntax::object::dict::keys::*;
+use hayro::hayro_syntax::object::{Name, Object};
 use hayro::hayro_syntax::LoadPdfError;
 pub use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::vello_cpu::kurbo::{Affine, BezPath, Rect, Shape};
 pub use hayro::vello_cpu::Pixmap;
 use hayro::{RenderCache, RenderSettings};
+use std::io::Read;
 
 /// A single-image page decoded and scaled directly to 8-bit luma (`gray`) plus optional color
 /// mean (`ink`) without full RGBA compositing.
@@ -171,21 +175,28 @@ impl<'a> Device<'a> for ScanDevice {
         }
         let dst_w = usize::from(self.pix_w);
         let dst_h = usize::from(self.pix_h);
-        let mut decoded = None;
-        raster.with_rgba(
-            |image_data, alpha| {
-                if alpha.is_some() {
-                    return;
-                }
-                decoded = convert_and_resize_scan(image_data, dst_w, dst_h).map(|(gray, ink)| RenderedGray {
-                    width: self.pix_w,
-                    height: self.pix_h,
-                    gray,
-                    ink,
-                });
-            },
-            Some((u32::from(self.pix_w), u32::from(self.pix_h))),
-        );
+        let mut decoded = try_decode_flate_scan(&raster, dst_w, dst_h).map(|(gray, ink)| RenderedGray {
+            width: self.pix_w,
+            height: self.pix_h,
+            gray,
+            ink,
+        });
+        if decoded.is_none() {
+            raster.with_rgba(
+                |image_data, alpha| {
+                    if alpha.is_some() {
+                        return;
+                    }
+                    decoded = convert_and_resize_scan(image_data, dst_w, dst_h).map(|(gray, ink)| RenderedGray {
+                        width: self.pix_w,
+                        height: self.pix_h,
+                        gray,
+                        ink,
+                    });
+                },
+                Some((u32::from(self.pix_w), u32::from(self.pix_h))),
+            );
+        }
         if decoded.is_some() {
             self.result = decoded;
         } else {
@@ -197,6 +208,111 @@ impl<'a> Device<'a> for ScanDevice {
     fn pop_transparency_group(&mut self) {}
 }
 
+fn single_name<'a>(obj: Object<'a>) -> Option<Name<'a>> {
+    match obj {
+        Object::Name(name) => Some(name),
+        Object::Array(arr) => {
+            let mut raw = arr.raw_iter();
+            if raw.next().is_some() && raw.next().is_none() {
+                arr.iter::<Name<'_>>().next()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn try_decode_flate_scan(
+    raster: &RasterImage<'_>,
+    dst_w: usize,
+    dst_h: usize,
+) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let src_w = usize::try_from(raster.width()).ok()?;
+    let src_h = usize::try_from(raster.height()).ok()?;
+    if src_w == 0 || src_h == 0 {
+        return None;
+    }
+    let stream = raster.stream();
+    let dict = stream.dict();
+    let filter_obj = dict.get::<Object<'_>>(F).or_else(|| dict.get::<Object<'_>>(FILTER))?;
+    let filter_name = single_name(filter_obj)?;
+    if !matches!(filter_name.as_ref(), FLATE_DECODE | FLATE_DECODE_ABBREVIATION) {
+        return None;
+    }
+    if dict.contains_key(DP)
+        || dict.contains_key(DECODE_PARMS)
+        || dict.contains_key(F_DECODE_PARMS)
+        || dict.contains_key(SMASK)
+        || dict.contains_key(SMASK_IN_DATA)
+        || dict.contains_key(MASK)
+        || dict.contains_key(DECODE)
+        || dict.contains_key(D)
+    {
+        return None;
+    }
+    if dict.get::<bool>(IM).or_else(|| dict.get::<bool>(IMAGE_MASK)).unwrap_or(false) {
+        return None;
+    }
+    let bpc = dict.get::<u8>(BPC).or_else(|| dict.get::<u8>(BITS_PER_COMPONENT))?;
+    if bpc != 8 {
+        return None;
+    }
+    let cs_obj = dict.get::<Object<'_>>(CS).or_else(|| dict.get::<Object<'_>>(COLORSPACE))?;
+    let cs_name = single_name(cs_obj)?;
+    let channels = match cs_name.as_ref() {
+        DEVICE_RGB | RGB => 3usize,
+        DEVICE_GRAY | G => 1usize,
+        _ => return None,
+    };
+    let pixels = src_w.checked_mul(src_h)?;
+    let expected_len = pixels.checked_mul(channels)?;
+    let raw = stream.raw_data();
+    let mut data = Vec::with_capacity(expected_len);
+    let mut decoder = flate2::read::ZlibDecoder::new(raw.as_ref()).take(expected_len as u64 + 1);
+    if decoder.read_to_end(&mut data).is_err() || data.len() != expected_len {
+        return None;
+    }
+    if channels == 1 {
+        Some(finish_luma_scan(data, src_w, src_h, dst_w, dst_h))
+    } else {
+        Some(finish_rgb_scan(&data, src_w, src_h, dst_w, dst_h))
+    }
+}
+
+fn finish_luma_scan(
+    data: Vec<u8>,
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> (Vec<u8>, Option<Vec<u8>>) {
+    let gray = if src_w == dst_w && src_h == dst_h {
+        data
+    } else {
+        resize_u8_triangle(&data, src_w, src_h, dst_w, dst_h)
+    };
+    (gray, None)
+}
+
+fn finish_rgb_scan(
+    data: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> (Vec<u8>, Option<Vec<u8>>) {
+    let pixels = src_w * src_h;
+    let (src_gray, src_ink) = rgb_to_gray_and_ink(data, pixels);
+    if src_w == dst_w && src_h == dst_h {
+        (src_gray, src_ink)
+    } else {
+        let gray = resize_u8_triangle(&src_gray, src_w, src_h, dst_w, dst_h);
+        let ink = src_ink.map(|buf| resize_u8_triangle(&buf, src_w, src_h, dst_w, dst_h));
+        (gray, ink)
+    }
+}
+
 fn convert_and_resize_scan(image_data: ImageData, dst_w: usize, dst_h: usize) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     match image_data {
         ImageData::Luma(luma) => {
@@ -204,12 +320,7 @@ fn convert_and_resize_scan(image_data: ImageData, dst_w: usize, dst_h: usize) ->
             if src_w == 0 || src_h == 0 || luma.data.len() != src_w.saturating_mul(src_h) {
                 return None;
             }
-            let gray = if src_w == dst_w && src_h == dst_h {
-                luma.data
-            } else {
-                resize_u8_triangle(&luma.data, src_w, src_h, dst_w, dst_h)
-            };
-            Some((gray, None))
+            Some(finish_luma_scan(luma.data, src_w, src_h, dst_w, dst_h))
         }
         ImageData::Rgb(rgb) => {
             let (src_w, src_h) = (rgb.width as usize, rgb.height as usize);
@@ -217,19 +328,13 @@ fn convert_and_resize_scan(image_data: ImageData, dst_w: usize, dst_h: usize) ->
             if src_w == 0 || src_h == 0 || rgb.data.len() != pixels.saturating_mul(3) {
                 return None;
             }
-            let (src_gray, src_ink) = rgb_to_gray_and_ink(&rgb.data, pixels);
-            if src_w == dst_w && src_h == dst_h {
-                Some((src_gray, src_ink))
-            } else {
-                let gray = resize_u8_triangle(&src_gray, src_w, src_h, dst_w, dst_h);
-                let ink = src_ink.map(|buf| resize_u8_triangle(&buf, src_w, src_h, dst_w, dst_h));
-                Some((gray, ink))
-            }
+            Some(finish_rgb_scan(&rgb.data, src_w, src_h, dst_w, dst_h))
         }
     }
 }
 
 fn rgb_to_gray_and_ink(data: &[u8], pixels: usize) -> (Vec<u8>, Option<Vec<u8>>) {
+    assert!(data.len() >= pixels.saturating_mul(3));
     let mut gray = vec![0u8; pixels];
     let mut idx = 0usize;
     #[cfg(target_arch = "x86_64")]
@@ -242,6 +347,10 @@ fn rgb_to_gray_and_ink(data: &[u8], pixels: usize) -> (Vec<u8>, Option<Vec<u8>>)
         if r != g || g != b {
             let mut ink = vec![0u8; pixels];
             ink[..idx].copy_from_slice(&gray[..idx]);
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") {
+                idx = unsafe { rgb_to_gray_and_ink_color_avx2(data, idx, &mut gray, &mut ink) };
+            }
             for k in idx..pixels {
                 let p = k * 3;
                 let (rr, gg, bb) = (u32::from(data[p]), u32::from(data[p + 1]), u32::from(data[p + 2]));
@@ -258,7 +367,10 @@ fn rgb_to_gray_and_ink(data: &[u8], pixels: usize) -> (Vec<u8>, Option<Vec<u8>>)
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn rgb_to_gray_mono_prefix_avx2(data: &[u8], gray: &mut [u8]) -> usize {
+#[inline]
+unsafe fn deinterleave_rgb16_avx2(
+    src_ptr: *const u8,
+) -> (std::arch::x86_64::__m128i, std::arch::x86_64::__m128i, std::arch::x86_64::__m128i) {
     use std::arch::x86_64::*;
     let mr0 = _mm_setr_epi8(0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
     let mr1 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14, -1, -1, -1, -1, -1);
@@ -269,23 +381,67 @@ unsafe fn rgb_to_gray_mono_prefix_avx2(data: &[u8], gray: &mut [u8]) -> usize {
     let mb0 = _mm_setr_epi8(2, 5, 8, 11, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
     let mb1 = _mm_setr_epi8(-1, -1, -1, -1, -1, 1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1);
     let mb2 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15);
+    let p0 = _mm_loadu_si128(src_ptr as *const __m128i);
+    let p1 = _mm_loadu_si128(src_ptr.add(16) as *const __m128i);
+    let p2 = _mm_loadu_si128(src_ptr.add(32) as *const __m128i);
+    let r = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(p0, mr0), _mm_shuffle_epi8(p1, mr1)), _mm_shuffle_epi8(p2, mr2));
+    let g = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(p0, mg0), _mm_shuffle_epi8(p1, mg1)), _mm_shuffle_epi8(p2, mg2));
+    let b = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(p0, mb0), _mm_shuffle_epi8(p1, mb1)), _mm_shuffle_epi8(p2, mb2));
+    (r, g, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rgb_to_gray_mono_prefix_avx2(data: &[u8], gray: &mut [u8]) -> usize {
+    use std::arch::x86_64::*;
     let mut i = 0usize;
     let n = gray.len();
     let ptr = data.as_ptr();
     let gptr = gray.as_mut_ptr();
     while i + 16 <= n {
-        let s = i * 3;
-        let p0 = _mm_loadu_si128(ptr.add(s) as *const __m128i);
-        let p1 = _mm_loadu_si128(ptr.add(s + 16) as *const __m128i);
-        let p2 = _mm_loadu_si128(ptr.add(s + 32) as *const __m128i);
-        let r = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(p0, mr0), _mm_shuffle_epi8(p1, mr1)), _mm_shuffle_epi8(p2, mr2));
-        let g = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(p0, mg0), _mm_shuffle_epi8(p1, mg1)), _mm_shuffle_epi8(p2, mg2));
-        let b = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(p0, mb0), _mm_shuffle_epi8(p1, mb1)), _mm_shuffle_epi8(p2, mb2));
+        let (r, g, b) = deinterleave_rgb16_avx2(ptr.add(i * 3));
         let eq = _mm_and_si128(_mm_cmpeq_epi8(r, g), _mm_cmpeq_epi8(g, b));
         if _mm_movemask_epi8(eq) != 0xFFFF {
             break;
         }
         _mm_storeu_si128(gptr.add(i) as *mut __m128i, r);
+        i += 16;
+    }
+    i
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rgb_to_gray_and_ink_color_avx2(data: &[u8], start: usize, gray: &mut [u8], ink: &mut [u8]) -> usize {
+    use std::arch::x86_64::*;
+    let w_r = _mm256_set1_epi16(77);
+    let w_g = _mm256_set1_epi16(150);
+    let w_b = _mm256_set1_epi16(29);
+    let ones = _mm256_set1_epi16(1);
+    let div3_mul = _mm256_set1_epi16(21846);
+    let n = gray.len();
+    let mut i = start;
+    let ptr = data.as_ptr();
+    let gptr = gray.as_mut_ptr();
+    let iptr = ink.as_mut_ptr();
+    while i + 16 <= n {
+        let (r, g, b) = deinterleave_rgb16_avx2(ptr.add(i * 3));
+        let r16 = _mm256_cvtepu8_epi16(r);
+        let g16 = _mm256_cvtepu8_epi16(g);
+        let b16 = _mm256_cvtepu8_epi16(b);
+
+        let gray16 = _mm256_srli_epi16::<8>(_mm256_add_epi16(
+            _mm256_add_epi16(_mm256_mullo_epi16(r16, w_r), _mm256_mullo_epi16(g16, w_g)),
+            _mm256_mullo_epi16(b16, w_b),
+        ));
+        let gray8 = _mm_packus_epi16(_mm256_castsi256_si128(gray16), _mm256_extracti128_si256::<1>(gray16));
+        _mm_storeu_si128(gptr.add(i) as *mut __m128i, gray8);
+
+        let sum16 = _mm256_add_epi16(_mm256_add_epi16(r16, g16), _mm256_add_epi16(b16, ones));
+        let ink16 = _mm256_mulhi_epu16(sum16, div3_mul);
+        let ink8 = _mm_packus_epi16(_mm256_castsi256_si128(ink16), _mm256_extracti128_si256::<1>(ink16));
+        _mm_storeu_si128(iptr.add(i) as *mut __m128i, ink8);
+
         i += 16;
     }
     i
@@ -506,4 +662,125 @@ pub fn page_images(bytes: &[u8], long_side: f64, dpi_cap: u32) -> Result<Vec<(u3
             Ok((dpi, png))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    #[test]
+    fn rgb_to_gray_and_ink_avx2_matches_scalar_exact() {
+        for n in 0u32..=766 {
+            assert_eq!((n * 21846) >> 16, n / 3, "div3 mismatch at n={n}");
+        }
+
+        let pixels = 73usize;
+        let mut rgb = Vec::with_capacity(pixels * 3);
+        // 19-pixel monochrome prefix (crosses 16-byte SIMD boundary + 3 scalar mono pixels) then color tail.
+        for i in 0..pixels {
+            if i < 19 {
+                let v = ((i * 13) % 256) as u8;
+                rgb.extend_from_slice(&[v, v, v]);
+            } else {
+                let r = ((i * 73 + 17) % 256) as u8;
+                let g = ((i * 151 + 29) % 256) as u8;
+                let b = ((i * 211 + 5) % 256) as u8;
+                rgb.extend_from_slice(&[r, g, b]);
+            }
+        }
+        // Overwrite a few pixels with extreme RGB corners to test u16 overflow/shift edge cases.
+        for (idx, (r, g, b)) in [
+            (20, (255u8, 255, 254)),
+            (21, (255, 0, 0)),
+            (22, (0, 255, 0)),
+            (23, (0, 0, 255)),
+            (24, (1, 0, 0)),
+            (72, (254, 255, 255)),
+        ] {
+            rgb[idx * 3] = r;
+            rgb[idx * 3 + 1] = g;
+            rgb[idx * 3 + 2] = b;
+        }
+
+        let (gray, ink) = rgb_to_gray_and_ink(&rgb, pixels);
+        let ink = ink.expect("color pixels should produce ink channel");
+        for k in 0..pixels {
+            let (rr, gg, bb) = (u32::from(rgb[k * 3]), u32::from(rgb[k * 3 + 1]), u32::from(rgb[k * 3 + 2]));
+            let exp_gray = ((rr * 77 + gg * 150 + bb * 29) >> 8) as u8;
+            let exp_ink = ((rr + gg + bb + 1) / 3) as u8;
+            assert_eq!(gray[k], exp_gray, "gray mismatch at pixel {k}");
+            assert_eq!(ink[k], exp_ink, "ink mismatch at pixel {k}");
+        }
+
+        let mono: Vec<u8> = (0..pixels).flat_map(|i| {
+            let v = (i * 7 % 256) as u8;
+            [v, v, v]
+        }).collect();
+        let (mono_gray, mono_ink) = rgb_to_gray_and_ink(&mono, pixels);
+        assert!(mono_ink.is_none(), "monochrome image should skip ink buffer");
+        for k in 0..pixels {
+            assert_eq!(mono_gray[k], mono[k * 3]);
+        }
+    }
+
+    #[test]
+    fn flate_scan_fast_path_decodes_devicergb_scan() {
+        let (w, h) = (32usize, 24usize);
+        let mut raw_rgb = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (((x + y) * 9) % 256) as u8;
+                raw_rgb.extend_from_slice(&[v, v.saturating_add(3), v]);
+            }
+        }
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&raw_rgb).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let content = b"q 32 0 0 24 0 0 cm /Im0 Do Q\n";
+        let mut pdf_bytes = Vec::new();
+        pdf_bytes.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = vec![0usize];
+        let mut push_obj = |id: usize, body: &[u8]| {
+            offsets.push(pdf_bytes.len());
+            pdf_bytes.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+            pdf_bytes.extend_from_slice(body);
+            pdf_bytes.extend_from_slice(b"\nendobj\n");
+        };
+        push_obj(1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        push_obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        push_obj(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 32 24] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        push_obj(
+            4,
+            format!("<< /Length {} >>\nstream\n{}endstream", content.len(), String::from_utf8_lossy(content)).as_bytes(),
+        );
+        let mut img_obj = format!(
+            "<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {} >>\nstream\n",
+            compressed.len()
+        ).into_bytes();
+        img_obj.extend_from_slice(&compressed);
+        img_obj.extend_from_slice(b"\nendstream");
+        push_obj(5, &img_obj);
+
+        let xref_pos = pdf_bytes.len();
+        pdf_bytes.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes());
+        for off in &offsets[1..] {
+            pdf_bytes.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf_bytes.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n", offsets.len()).as_bytes());
+
+        let pdf = open_pdf(&pdf_bytes).expect("open synthetic flate scan PDF");
+        let renderer = PageRenderer::new(&pdf, 72.0);
+        let scan = renderer.render_scan_gray(0).expect("should decode via flate scan fast path");
+        assert_eq!((usize::from(scan.width), usize::from(scan.height)), (w, h));
+        let (exp_gray, exp_ink) = rgb_to_gray_and_ink(&raw_rgb, w * h);
+        assert_eq!(scan.gray, exp_gray);
+        assert_eq!(scan.ink, exp_ink);
+    }
 }

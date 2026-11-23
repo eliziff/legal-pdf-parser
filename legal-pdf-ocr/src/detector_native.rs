@@ -187,7 +187,7 @@ impl DetectorNative {
             if out_channels == 0 || !out_channels.is_multiple_of(8) || pw_b.data.len() != out_channels {
                 return Err(format!("unexpected detector stage out_channels {out_channels}"));
             }
-            let down_pw = PackedLinear::pack(&pw_w.data, &pw_b.data, out_channels, in_c);
+            let down_pw = PackedLinear::pack_fp32(&pw_w.data, &pw_b.data, out_channels, in_c);
 
             let mut blocks = Vec::with_capacity(res_count);
             for _ in 0..res_count {
@@ -199,7 +199,7 @@ impl DetectorNative {
                 if expand_channels == 0 || !expand_channels.is_multiple_of(8) || exp_b.data.len() != expand_channels {
                     return Err(format!("unexpected detector expand_channels {expand_channels}"));
                 }
-                let expand = PackedLinear::pack(&exp_w.data, &exp_b.data, expand_channels, out_channels);
+                let expand = PackedLinear::pack_fp32(&exp_w.data, &exp_b.data, expand_channels, out_channels);
 
                 let (bdw_w, bdw_b) = take_conv(&mut tensors)?;
                 if bdw_w.dims.len() != 4
@@ -222,7 +222,7 @@ impl DetectorNative {
                 {
                     return Err(format!("unexpected detector project shape {:?}", proj_w.dims));
                 }
-                let project = PackedLinear::pack(&proj_w.data, &proj_b.data, out_channels, expand_channels);
+                let project = PackedLinear::pack_fp32(&proj_w.data, &proj_b.data, out_channels, expand_channels);
 
                 blocks.push(DetResBlock {
                     expand,
@@ -252,7 +252,7 @@ impl DetectorNative {
                 return Err(format!("unexpected detector {name} shape {:?}", w.dims));
             }
             let out_c = w.dims[0];
-            Ok((PackedLinear::pack(&w.data, &b.data, out_c, expected_in), out_c))
+            Ok((PackedLinear::pack_fp32(&w.data, &b.data, out_c, expected_in), out_c))
         }
 
         let (w, b) = take_conv(&mut tensors)?;
