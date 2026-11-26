@@ -302,6 +302,15 @@ fn finish_rgb_scan(
     dst_w: usize,
     dst_h: usize,
 ) -> (Vec<u8>, Option<Vec<u8>>) {
+    if src_w != dst_w || src_h != dst_h {
+        let source = GraySource::MonoRgb {
+            rgb: data,
+            row_buf: vec![0u8; src_w],
+        };
+        if let Some(gray) = resize_u8_triangle_source(source, src_w, src_h, dst_w, dst_h) {
+            return (gray, None);
+        }
+    }
     let pixels = src_w * src_h;
     let (src_gray, src_ink) = rgb_to_gray_and_ink(data, pixels);
     if src_w == dst_w && src_h == dst_h {
@@ -590,7 +599,103 @@ fn accum_row_q4(acc: &mut [u32], row: &[u16], w: u16) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn finish_acc_row_q16_avx2(acc: &[u32], dst_row: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let half = _mm256_set1_epi32(1 << 15);
+    let len = dst_row.len();
+    let aptr = acc.as_ptr();
+    let dptr = dst_row.as_mut_ptr();
+    let mut i = 0usize;
+    while i + 16 <= len {
+        let s0 = _mm256_srli_epi32::<16>(_mm256_add_epi32(
+            _mm256_loadu_si256(aptr.add(i) as *const __m256i),
+            half,
+        ));
+        let s1 = _mm256_srli_epi32::<16>(_mm256_add_epi32(
+            _mm256_loadu_si256(aptr.add(i + 8) as *const __m256i),
+            half,
+        ));
+        let p16 = _mm256_packus_epi32(s0, s1);
+        let p8 = _mm256_packus_epi16(p16, p16);
+        let lo = _mm256_castsi256_si128(p8);
+        let hi = _mm256_extracti128_si256::<1>(p8);
+        _mm_storeu_si128(dptr.add(i) as *mut __m128i, _mm_unpacklo_epi32(lo, hi));
+        i += 16;
+    }
+    while i + 8 <= len {
+        let s = _mm256_srli_epi32::<16>(_mm256_add_epi32(
+            _mm256_loadu_si256(aptr.add(i) as *const __m256i),
+            half,
+        ));
+        let p16 = _mm_packus_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256::<1>(s));
+        let p8 = _mm_packus_epi16(p16, p16);
+        _mm_storel_epi64(dptr.add(i) as *mut __m128i, p8);
+        i += 8;
+    }
+    while i < len {
+        *dptr.add(i) = ((*aptr.add(i) + (1 << 15)) >> 16).min(255) as u8;
+        i += 1;
+    }
+}
+
+#[inline]
+fn finish_acc_row_q16(acc: &[u32], dst_row: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe { finish_acc_row_q16_avx2(acc, dst_row) };
+        return;
+    }
+    for (d, &a) in dst_row.iter_mut().zip(acc) {
+        *d = ((a + (1 << 15)) >> 16).min(255) as u8;
+    }
+}
+
+enum GraySource<'a> {
+    Plain(&'a [u8]),
+    MonoRgb { rgb: &'a [u8], row_buf: Vec<u8> },
+}
+
+impl<'a> GraySource<'a> {
+    #[inline]
+    fn get_row(&mut self, sy: usize, src_w: usize) -> Option<&[u8]> {
+        match self {
+            GraySource::Plain(src) => Some(&src[sy * src_w..(sy + 1) * src_w]),
+            GraySource::MonoRgb { rgb, row_buf } => {
+                let rgb_row = &rgb[sy * src_w * 3..(sy + 1) * src_w * 3];
+                let mut idx = 0usize;
+                #[cfg(target_arch = "x86_64")]
+                if is_x86_feature_detected!("avx2") {
+                    idx = unsafe { rgb_to_gray_mono_prefix_avx2(rgb_row, row_buf) };
+                }
+                while idx < src_w {
+                    let off = idx * 3;
+                    let (r, g, b) = (rgb_row[off], rgb_row[off + 1], rgb_row[off + 2]);
+                    if r != g || g != b {
+                        return None;
+                    }
+                    row_buf[idx] = r;
+                    idx += 1;
+                }
+                Some(&row_buf[..src_w])
+            }
+        }
+    }
+}
+
 fn resize_u8_triangle(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
+    resize_u8_triangle_source(GraySource::Plain(src), src_w, src_h, dst_w, dst_h)
+        .expect("Plain grayscale source cannot abort")
+}
+
+fn resize_u8_triangle_source(
+    mut source: GraySource<'_>,
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Option<Vec<u8>> {
     let (x_ranges, x_weights, max_x_taps) = build_triangle_q12(src_w, dst_w);
     let (y_ranges, y_weights, max_y_taps) = build_triangle_q12(src_h, dst_h);
     let mut x8_packed_buf = Vec::new();
@@ -625,7 +730,7 @@ fn resize_u8_triangle(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_
             let sy = y0 + i;
             let slot = sy % ring_cap;
             if cached_sy[slot] != sy {
-                let src_row = &src[sy * src_w..(sy + 1) * src_w];
+                let src_row = source.get_row(sy, src_w)?;
                 let ring_row = &mut ring[slot * dst_w..(slot + 1) * dst_w];
                 horiz_filter_row_q4(src_row, &x_ranges, &x_weights, x8_packed, avx_end, ring_row);
                 cached_sy[slot] = sy;
@@ -634,11 +739,9 @@ fn resize_u8_triangle(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_
             accum_row_q4(&mut acc, row, wy);
         }
         let dst_row = &mut out[dy * dst_w..(dy + 1) * dst_w];
-        for (d, &a) in dst_row.iter_mut().zip(&acc) {
-            *d = ((a + (1 << 15)) >> 16).min(255) as u8;
-        }
+        finish_acc_row_q16(&acc, dst_row);
     }
-    out
+    Some(out)
 }
 
 /// Every page of `bytes` drawn so its long side is `long_side` pixels, at most `dpi_cap` dpi (whole
@@ -782,5 +885,20 @@ mod tests {
         let (exp_gray, exp_ink) = rgb_to_gray_and_ink(&raw_rgb, w * h);
         assert_eq!(scan.gray, exp_gray);
         assert_eq!(scan.ink, exp_ink);
+
+        // Exercise monochrome streaming resize (32x24 -> 16x12) + color resize fallback.
+        let (dst_w, dst_h) = (16usize, 12usize);
+        let mono_rgb: Vec<u8> = (0..w * h).flat_map(|i| {
+            let v = ((i * 11) % 256) as u8;
+            [v, v, v]
+        }).collect();
+        let (stream_gray, stream_ink) = finish_rgb_scan(&mono_rgb, w, h, dst_w, dst_h);
+        assert!(stream_ink.is_none());
+        let (plain_src, _) = rgb_to_gray_and_ink(&mono_rgb, w * h);
+        assert_eq!(stream_gray, resize_u8_triangle(&plain_src, w, h, dst_w, dst_h));
+
+        let (color_gray, color_ink) = finish_rgb_scan(&raw_rgb, w, h, dst_w, dst_h);
+        assert!(color_ink.is_some());
+        assert_eq!(color_gray, resize_u8_triangle(&exp_gray, w, h, dst_w, dst_h));
     }
 }

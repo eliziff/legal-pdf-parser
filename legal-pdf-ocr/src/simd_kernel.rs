@@ -139,6 +139,7 @@ unsafe fn find_ink_bbox_avx2(
 }
 
 /// Zero-allocation bilinear resize directly from page `(raw, stride)` with virtual 255-white padding `(px, py)`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resize_cropped_padded_bilinear(
     raw: &[u8],
     stride: usize,
@@ -150,43 +151,167 @@ pub(crate) fn resize_cropped_padded_bilinear(
     py: usize,
     dst_w: usize,
     dst_h: usize,
+    scratch: &mut DownsampleScratch,
 ) -> Vec<u8> {
+    let mut out = vec![255u8; dst_w * dst_h];
+    if cw == 0 || ch == 0 || dst_w == 0 || dst_h == 0 {
+        return out;
+    }
     let pw = cw + 2 * px;
     let ph = ch + 2 * py;
-    let mut out = vec![255u8; dst_w * dst_h];
     let sx_scale = pw as f32 / dst_w as f32;
     let sy_scale = ph as f32 / dst_h as f32;
 
-    let sample = |sx: isize, sy: isize| -> f32 {
-        let rx = sx - px as isize;
-        let ry = sy - py as isize;
-        if rx < 0 || ry < 0 || rx >= cw as isize || ry >= ch as isize {
-            255.0
-        } else {
-            f32::from(raw[(src_y0 + ry as usize) * stride + (src_x0 + rx as usize)])
+    scratch.bilin_rx.clear();
+    scratch.bilin_rx.reserve(dst_w);
+    scratch.x_weights.clear();
+    scratch.x_weights.reserve(dst_w);
+    let px_i = px as isize;
+    let cw_i = cw as isize;
+    let mut left_end = dst_w;
+    let mut right_start = dst_w;
+    for dx in 0..dst_w {
+        let fx = (dx as f32 + 0.5) * sx_scale - 0.5;
+        let ix = fx.floor() as isize;
+        let rx = ix - px_i;
+        let wx = fx - ix as f32;
+        scratch.bilin_rx.push(rx as i32);
+        scratch.x_weights.push(wx);
+        if rx >= 0 && rx + 1 < cw_i {
+            if left_end == dst_w {
+                left_end = dx;
+            }
+        } else if left_end < dst_w && right_start == dst_w {
+            right_start = dx;
+        }
+    }
+    if left_end > right_start {
+        right_start = left_end;
+    }
+
+    // 2-slot horizontal row cache: row indices increase monotonically so each in-bounds `ry` is filtered once.
+    scratch.horiz.resize(2 * dst_w, 255.0);
+    let mut cached_ry = [isize::MIN; 2];
+
+    let rx_slice = &scratch.bilin_rx[..dst_w];
+    let wx_slice = &scratch.x_weights[..dst_w];
+    let filter_row = |ry: isize, dst_h_row: &mut [f32]| {
+        if ry < 0 || ry >= ch as isize {
+            dst_h_row.fill(255.0);
+            return;
+        }
+        let row = &raw[(src_y0 + ry as usize) * stride + src_x0..(src_y0 + ry as usize) * stride + src_x0 + cw];
+        let sample_x = |rx: isize| -> f32 {
+            if rx < 0 || rx >= cw_i {
+                255.0
+            } else {
+                f32::from(row[rx as usize])
+            }
+        };
+        for dx in 0..left_end {
+            let rx = rx_slice[dx] as isize;
+            let wx = wx_slice[dx];
+            dst_h_row[dx] = (1.0 - wx) * sample_x(rx) + wx * sample_x(rx + 1);
+        }
+        for dx in left_end..right_start {
+            // SAFETY: by construction above, `0 <= rx && rx + 1 < cw` for every `dx` in `left_end..right_start`.
+            let (rx, wx, p0, p1) = unsafe {
+                let rx = *rx_slice.get_unchecked(dx) as usize;
+                let wx = *wx_slice.get_unchecked(dx);
+                let p0 = f32::from(*row.get_unchecked(rx));
+                let p1 = f32::from(*row.get_unchecked(rx + 1));
+                (rx, wx, p0, p1)
+            };
+            let _ = rx;
+            dst_h_row[dx] = (1.0 - wx) * p0 + wx * p1;
+        }
+        for dx in right_start..dst_w {
+            let rx = rx_slice[dx] as isize;
+            let wx = wx_slice[dx];
+            dst_h_row[dx] = (1.0 - wx) * sample_x(rx) + wx * sample_x(rx + 1);
         }
     };
 
+    #[cfg(target_arch = "x86_64")]
+    let has_avx2_fma = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_avx2_fma = false;
+
+    let py_i = py as isize;
     for dy in 0..dst_h {
         let fy = (dy as f32 + 0.5) * sy_scale - 0.5;
         let iy = fy.floor() as isize;
         let wy = fy - iy as f32;
         let wy0 = 1.0 - wy;
-        let row_out = &mut out[dy * dst_w..(dy + 1) * dst_w];
-        for dx in 0..dst_w {
-            let fx = (dx as f32 + 0.5) * sx_scale - 0.5;
-            let ix = fx.floor() as isize;
-            let wx = fx - ix as f32;
-            let wx0 = 1.0 - wx;
-            let p00 = sample(ix, iy);
-            let p10 = sample(ix + 1, iy);
-            let p01 = sample(ix, iy + 1);
-            let p11 = sample(ix + 1, iy + 1);
-            let v = wy0 * (wx0 * p00 + wx * p10) + wy * (wx0 * p01 + wx * p11);
-            row_out[dx] = v.round().clamp(0.0, 255.0) as u8;
+        let ry0 = iy - py_i;
+        let ry1 = ry0 + 1;
+        if (ry0 < 0 || ry0 >= ch as isize) && (ry1 < 0 || ry1 >= ch as isize) {
+            continue;
+        }
+        let s0 = (ry0.rem_euclid(2)) as usize;
+        let s1 = 1 - s0;
+        if cached_ry[s0] != ry0 {
+            let h0 = &mut scratch.horiz[s0 * dst_w..(s0 + 1) * dst_w];
+            filter_row(ry0, h0);
+            cached_ry[s0] = ry0;
+        }
+        if cached_ry[s1] != ry1 {
+            let h1 = &mut scratch.horiz[s1 * dst_w..(s1 + 1) * dst_w];
+            filter_row(ry1, h1);
+            cached_ry[s1] = ry1;
+        }
+        let (h0, h1) = if s0 == 0 {
+            let (a, b) = scratch.horiz.split_at(dst_w);
+            (&a[..dst_w], &b[..dst_w])
+        } else {
+            let (a, b) = scratch.horiz.split_at(dst_w);
+            (&b[..dst_w], &a[..dst_w])
+        };
+        let out_row = &mut out[dy * dst_w..(dy + 1) * dst_w];
+        if has_avx2_fma {
+            #[cfg(target_arch = "x86_64")]
+            unsafe { blend_bilin_row_avx2(h0, h1, wy0, wy, out_row) };
+        } else {
+            for dx in 0..dst_w {
+                let v = wy0 * h0[dx] + wy * h1[dx];
+                out_row[dx] = v.round().clamp(0.0, 255.0) as u8;
+            }
         }
     }
     out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn blend_bilin_row_avx2(h0: &[f32], h1: &[f32], wy0: f32, wy1: f32, out_row: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let w0 = _mm256_set1_ps(wy0);
+    let w1 = _mm256_set1_ps(wy1);
+    let zero = _mm256_setzero_ps();
+    let max255 = _mm256_set1_ps(255.0);
+    let half = _mm256_set1_ps(0.5);
+    let p0 = h0.as_ptr();
+    let p1 = h1.as_ptr();
+    let dp = out_row.as_mut_ptr();
+    let len = out_row.len();
+    let mut i = 0usize;
+    while i + 8 <= len {
+        let a = _mm256_loadu_ps(p0.add(i));
+        let b = _mm256_loadu_ps(p1.add(i));
+        let v = _mm256_fmadd_ps(w1, b, _mm256_mul_ps(w0, a));
+        let clamped = _mm256_min_ps(_mm256_max_ps(v, zero), max255);
+        // Since clamped >= 0, floor(clamped + 0.5) matches f32::round() away from zero.
+        let ints = _mm256_cvttps_epi32(_mm256_add_ps(clamped, half));
+        let p16 = _mm_packus_epi32(_mm256_castsi256_si128(ints), _mm256_extracti128_si256::<1>(ints));
+        let p8 = _mm_packus_epi16(p16, p16);
+        _mm_storel_epi64(dp.add(i) as *mut __m128i, p8);
+        i += 8;
+    }
+    while i < len {
+        let v = wy0 * *p0.add(i) + wy1 * *p1.add(i);
+        *dp.add(i) = v.round().clamp(0.0, 255.0) as u8;
+        i += 1;
+    }
 }
 
 fn line_energy_of_grid(bin: &[f32], w: usize, h: usize, angle_deg: f32) -> f32 {
@@ -431,6 +556,7 @@ pub(crate) struct DownsampleScratch {
     horiz: Vec<f32>,
     acc_row: Vec<f32>,
     src_f32: Vec<f32>,
+    bilin_rx: Vec<i32>,
     x0_packed: Vec<usize>,
     w8_packed: Vec<f32>,
     x_ranges: Vec<(usize, usize)>,
@@ -791,5 +917,54 @@ pub(crate) fn downsample_to_norm_f32(
         if dst_w < dst_stride {
             out_row[dst_w..dst_stride].fill(0.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bilinear_resizer_matches_scalar_exact() {
+        let stride = 400usize;
+        let raw: Vec<u8> = (0..120 * stride).map(|i| ((i * 29 + 13) % 256) as u8).collect();
+        let (src_x0, src_y0, cw, ch) = (17usize, 11usize, 311usize, 25usize);
+        let (px, py, dst_w, dst_h) = (9usize, 5usize, 373usize, 32usize);
+
+        let pw = cw + 2 * px;
+        let ph = ch + 2 * py;
+        let sx_scale = pw as f32 / dst_w as f32;
+        let sy_scale = ph as f32 / dst_h as f32;
+        let sample = |sx: isize, sy: isize| -> f32 {
+            let rx = sx - px as isize;
+            let ry = sy - py as isize;
+            if rx < 0 || ry < 0 || rx >= cw as isize || ry >= ch as isize {
+                255.0
+            } else {
+                f32::from(raw[(src_y0 + ry as usize) * stride + (src_x0 + rx as usize)])
+            }
+        };
+        let mut expected = vec![255u8; dst_w * dst_h];
+        for dy in 0..dst_h {
+            let fy = (dy as f32 + 0.5) * sy_scale - 0.5;
+            let iy = fy.floor() as isize;
+            let wy = fy - iy as f32;
+            let wy0 = 1.0 - wy;
+            for dx in 0..dst_w {
+                let fx = (dx as f32 + 0.5) * sx_scale - 0.5;
+                let ix = fx.floor() as isize;
+                let wx = fx - ix as f32;
+                let wx0 = 1.0 - wx;
+                let v = wy0 * (wx0 * sample(ix, iy) + wx * sample(ix + 1, iy))
+                    + wy * (wx0 * sample(ix, iy + 1) + wx * sample(ix + 1, iy + 1));
+                expected[dy * dst_w + dx] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+
+        let mut scratch = DownsampleScratch::default();
+        let actual = resize_cropped_padded_bilinear(raw.as_slice(), stride, src_x0, src_y0, cw, ch, px, py, dst_w, dst_h, &mut scratch);
+        assert_eq!(actual.len(), expected.len());
+        let max_diff = actual.iter().zip(&expected).map(|(&a, &b)| a.abs_diff(b)).max().unwrap_or(0);
+        assert!(max_diff <= 1, "max bilinear diff {max_diff} > 1");
     }
 }

@@ -1280,6 +1280,7 @@ fn prepare_line(image: &GrayImage, bbox: LineBox, scratch: &mut crate::simd_kern
             py,
             width,
             INPUT_HEIGHT,
+            scratch,
         )
     };
     Some(PreparedLine {
