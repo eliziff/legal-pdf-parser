@@ -80,6 +80,7 @@ fn run() -> Result<()> {
         } else {
             "libonnxruntime.so"
         })),
+        detect_separator: false,
         ..Default::default()
     };
     let mut output = None;

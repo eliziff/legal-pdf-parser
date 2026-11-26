@@ -81,6 +81,8 @@ pub struct OcrOptions {
     pub cpu_arena: bool,
     pub expected_identity: Option<String>,
     pub orientation: Option<PathBuf>,
+    /// Detect horizontal footnote separator rules on rendered pages (`false` skips the scan for text-only callers).
+    pub detect_separator: bool,
 }
 impl Default for OcrOptions {
     fn default() -> Self {
@@ -99,6 +101,7 @@ impl Default for OcrOptions {
             cpu_arena: true,
             expected_identity: None,
             orientation: None,
+            detect_separator: true,
         }
     }
 }
@@ -285,6 +288,7 @@ pub struct OcrProvider {
     fallback_engine: Option<(RecognizerEngine, Codec)>,
     cpu_arena: bool,
     independent_pool: bool,
+    detect_separator: bool,
 }
 
 /// A recognizer's models found, checked and planned for this machine, and its identity known,
@@ -336,7 +340,8 @@ impl OcrProvider {
         Ok(PreparedOcrProvider { pack, runtime, plan, ready: None, identity })
     }
     pub fn from_prepared(options: &OcrOptions, mut prepared: PreparedOcrProvider) -> Result<Self> {
-        if let Some(ready) = prepared.ready.take() {
+        if let Some(mut ready) = prepared.ready.take() {
+            ready.detect_separator = options.detect_separator;
             return Ok(*ready);
         }
         Self::open_prepared(options, &prepared)
@@ -365,6 +370,7 @@ impl OcrProvider {
             fallback_engine: None,
             cpu_arena: options.cpu_arena,
             independent_pool,
+            detect_separator: options.detect_separator,
         })
     }
     pub fn configuration(&self) -> &RuntimePlan {
@@ -491,10 +497,23 @@ impl OcrProvider {
         let confidence_pages =
             requests.iter().filter(|request| !request.regions.is_empty()).map(|request| request.page_index).collect::<BTreeSet<_>>();
         let pdf = open_pdf(bytes)?;
-        let Self { engine, codec, layouts, plan, orientation, fallback, fallback_engine, cpu_arena, independent_pool, .. } = self;
+        let Self {
+            engine,
+            codec,
+            layouts,
+            plan,
+            orientation,
+            fallback,
+            fallback_engine,
+            cpu_arena,
+            independent_pool,
+            detect_separator,
+            ..
+        } = self;
         let has_fallback = fallback.is_some();
         let cpu_arena = *cpu_arena;
         let independent_pool = *independent_pool;
+        let detect_separator = *detect_separator;
         let orientation = orientation.as_mut().map(Mutex::new);
         let mut results: Vec<OcrPageResult> = requests
             .iter()
@@ -512,7 +531,7 @@ impl OcrProvider {
                     for (req_idx, request) in requests[offset..end].iter().enumerate() {
                         let req_idx = offset + req_idx;
                         let items = measure("ocr.render", || {
-                            render_single_request(&pages, request, orientation.as_ref(), has_fallback)
+                            render_single_request(&pages, request, orientation.as_ref(), has_fallback, detect_separator)
                         })?;
                         if items.is_empty() {
                             continue;
@@ -560,7 +579,7 @@ impl OcrProvider {
                                 break;
                             }
                             let rendered = measure("ocr.render", || {
-                                render_single_request(&pages, &requests[req_idx], orientation, has_fallback)
+                                render_single_request(&pages, &requests[req_idx], orientation, has_fallback, detect_separator)
                             })
                             .map(|items| (req_idx, items));
                             let failed = rendered.is_err();
@@ -1165,6 +1184,7 @@ fn render_single_request(
     request: &OcrPageRequest,
     orientation: Option<&Mutex<&mut Orientation>>,
     has_fallback: bool,
+    detect_separator: bool,
 ) -> Result<Vec<(Placement, GrayImage, Option<GrayImage>)>> {
     // White margin around a part of a page, so the layout reads its first and last lines whole.
     const MARGIN: usize = 16;
@@ -1203,7 +1223,7 @@ fn render_single_request(
             None => 0,
         };
         // A turned page's rule runs across its print, not across the page as drawn.
-        let separator = (turns == 0)
+        let separator = (detect_separator && turns == 0)
             .then(|| measure("ocr.render.sep", || crate::separator::separator_y(gray.as_raw(), width, height, request.height)))
             .flatten();
         let (image, ink) = if turns == 0 { (gray, ink) } else { (turn(&gray, turns), ink.map(|img| turn(&img, turns))) };
