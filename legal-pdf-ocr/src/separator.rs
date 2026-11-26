@@ -80,11 +80,15 @@ fn horizontal_rules_gray(
         let row = &gray[y * width + a..y * width + b];
         row.iter().filter(|&&v| v >= thresh).count() * 10 >= (b - a) * 7
     };
+    let y_start = ((height as f64 * (SEPARATOR_MIN_Y_RATIO - STACK_NEIGHBOR_Y_RATIO - 0.02)).floor() as isize)
+        .max(0) as usize;
+    let y_end = ((height as f64 * (SEPARATOR_MAX_Y_RATIO + STACK_NEIGHBOR_Y_RATIO + 0.02)).ceil() as usize)
+        .min(height);
     let mut rules: Vec<(usize, usize, usize, usize)> = Vec::new();
     // The rules reaching the row above, which a run in this row may carry on.
     let mut open: Vec<usize> = Vec::new();
     let mut reaching: Vec<usize> = Vec::new();
-    for y in 0..height {
+    for y in y_start..y_end {
         reaching.clear();
         let row = &gray[y * width..(y + 1) * width];
         let mut x = 0;
@@ -174,15 +178,28 @@ struct VerticalRule {
 
 fn otsu_threshold_and_dark_count(gray: &[u8]) -> (usize, usize) {
     let (mut h0, mut h1, mut h2, mut h3) = ([0_u32; 256], [0_u32; 256], [0_u32; 256], [0_u32; 256]);
-    let mut chunks = gray.chunks_exact(4);
-    for c in &mut chunks {
-        h0[usize::from(c[0])] += 1;
-        h1[usize::from(c[1])] += 1;
-        h2[usize::from(c[2])] += 1;
-        h3[usize::from(c[3])] += 1;
-    }
-    for &v in chunks.remainder() {
-        h0[usize::from(v)] += 1;
+    let mut sampled_count = 0usize;
+    if gray.len() >= 256 * 256 {
+        let mut chunks = gray.chunks_exact(16);
+        for c in &mut chunks {
+            h0[usize::from(c[0])] += 1;
+            h1[usize::from(c[5])] += 1;
+            h2[usize::from(c[10])] += 1;
+            h3[usize::from(c[15])] += 1;
+            sampled_count += 4;
+        }
+    } else {
+        let mut chunks = gray.chunks_exact(4);
+        for c in &mut chunks {
+            h0[usize::from(c[0])] += 1;
+            h1[usize::from(c[1])] += 1;
+            h2[usize::from(c[2])] += 1;
+            h3[usize::from(c[3])] += 1;
+        }
+        for &v in chunks.remainder() {
+            h0[usize::from(v)] += 1;
+        }
+        sampled_count = gray.len();
     }
     let mut histogram = [0_u32; 256];
     let mut total_mu = 0.0_f64;
@@ -191,7 +208,7 @@ fn otsu_threshold_and_dark_count(gray: &[u8]) -> (usize, usize) {
         histogram[value] = c;
         total_mu += value as f64 * f64::from(c);
     }
-    let total = gray.len() as f64;
+    let total = sampled_count.max(1) as f64;
     let mut omega = 0.0;
     let mut mu = 0.0;
     let mut best_index = 0;
@@ -208,7 +225,8 @@ fn otsu_threshold_and_dark_count(gray: &[u8]) -> (usize, usize) {
         }
     }
     let clamped = best_index.clamp(OTSU_MIN_THRESHOLD, OTSU_MAX_THRESHOLD);
-    let dark_count = histogram[..clamped].iter().map(|&c| c as usize).sum();
+    let dark_sampled: usize = histogram[..clamped].iter().map(|&c| c as usize).sum();
+    let dark_count = dark_sampled * gray.len() / sampled_count.max(1);
     (clamped, dark_count)
 }
 

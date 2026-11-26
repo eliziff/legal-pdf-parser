@@ -511,17 +511,21 @@ pub(crate) fn upright_and_deskew(gray: &GrayImage, profile: PageProfile) -> Opti
     let (w, h) = rotated.dimensions();
     let rad = profile.skew_deg.to_radians();
     let (sin_a, cos_a) = (rad.sin(), rad.cos());
+    let new_w = ((w as f32 * cos_a.abs() + h as f32 * sin_a.abs()).ceil() as u32).max(w);
+    let new_h = ((w as f32 * sin_a.abs() + h as f32 * cos_a.abs()).ceil() as u32).max(h);
     let cx = (w as f32 - 1.0) * 0.5;
     let cy = (h as f32 - 1.0) * 0.5;
+    let ncx = (new_w as f32 - 1.0) * 0.5;
+    let ncy = (new_h as f32 - 1.0) * 0.5;
     let src = rotated.as_raw();
     let wi = w as isize;
     let hi = h as isize;
-    let mut dst = vec![255u8; (w * h) as usize];
-    for y in 0..h as usize {
-        let dy = y as f32 - cy;
-        let row = &mut dst[y * w as usize..(y + 1) * w as usize];
-        for x in 0..w as usize {
-            let dx = x as f32 - cx;
+    let mut dst = vec![255u8; (new_w * new_h) as usize];
+    for y in 0..new_h as usize {
+        let dy = y as f32 - ncy;
+        let row = &mut dst[y * new_w as usize..(y + 1) * new_w as usize];
+        for x in 0..new_w as usize {
+            let dx = x as f32 - ncx;
             let sx = cx + dx * cos_a + dy * sin_a;
             let sy = cy - dx * sin_a + dy * cos_a;
             let ix = sx.floor() as isize;
@@ -539,7 +543,7 @@ pub(crate) fn upright_and_deskew(gray: &GrayImage, profile: PageProfile) -> Opti
             }
         }
     }
-    GrayImage::from_raw(w, h, dst)
+    GrayImage::from_raw(new_w, new_h, dst)
 }
 
 const STOP_WORDS: &[&str] = &[
@@ -570,8 +574,8 @@ fn count_stop_and_alpha(lines: &[OcrLine]) -> (usize, usize, f64) {
 /// Returns true when recognized text has low confidence or lacks common English stop-words (candidate for 180 deg flip).
 pub(crate) fn needs_180_check(lines: &[OcrLine]) -> bool {
     let (toks, stops, mean_conf) = count_stop_and_alpha(lines);
-    (lines.len() >= 4 && mean_conf < 0.78)
-        || (mean_conf < 0.86 && toks >= 8 && (stops as f64 / toks as f64) < 0.08)
+    (lines.len() >= 4 && mean_conf < 0.85)
+        || (toks >= 8 && (stops as f64 / toks as f64) < 0.12)
 }
 
 /// Quality score used to pick between upright and 180-deg rotated OCR passes.

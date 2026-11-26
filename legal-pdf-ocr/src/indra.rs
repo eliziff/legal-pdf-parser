@@ -385,11 +385,15 @@ impl OcrProvider {
             return Ok(Vec::new());
         }
         let mut use_fallback = vec![false; images.len()];
+        let mut rotated_90 = vec![false; images.len()];
         let adjusted: Vec<std::borrow::Cow<'_, GrayImage>> = images
             .iter()
             .enumerate()
             .map(|(idx, img)| {
                 let prof = crate::simd_kernel::analyze_gray_page(img);
+                if prof.turns_90 != 0 {
+                    rotated_90[idx] = true;
+                }
                 if self.fallback.is_some() && !is_crisp_legal_profile(prof) {
                     use_fallback[idx] = true;
                 }
@@ -449,7 +453,7 @@ impl OcrProvider {
         }
 
         for (i, page_lines) in pages.iter_mut().enumerate() {
-            if crate::simd_kernel::needs_180_check(page_lines) {
+            if rotated_90[i] || crate::simd_kernel::needs_180_check(page_lines) {
                 let flipped = imageops::rotate180(refs[i]);
                 let flip_ref = [&flipped];
                 let (prep, _) = prepare_window_refs(&mut self.layouts, &flip_ref, &flip_ref)?;
