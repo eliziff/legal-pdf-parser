@@ -38,6 +38,8 @@ const VERTICAL_MARGIN: f64 = 0.2;
 /// How sure the recognizer must be of a line the page analysis left out: a number or a word reads
 /// at 0.95 and more; a signature, a seal's lettering or a speckle at less.
 const RECOVERED_CONFIDENCE: f64 = 0.95;
+/// Cap rendered long edge so oversized PDF MediaBoxes do not push redundant pixels through every pass.
+const MAX_OCR_RENDER_LONG_SIDE: u16 = 2200;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +149,23 @@ struct Placement {
     origin: [f64; 2],
     turns: u8,
     drawn: [f64; 2],
+    use_fallback: bool,
+}
+
+#[inline]
+fn is_crisp_legal_profile(prof: crate::simd_kernel::PageProfile) -> bool {
+    prof.white_frac >= 0.78 && prof.mid_frac <= 0.08 && prof.line_energy >= 3.50
+}
+
+/// Forms, receipts, and sparse tables mostly yield short fragmented boxes, unlike prose scans.
+fn has_sparse_short_boxes(boxes: &[LineBox], page_width: u32) -> bool {
+    if boxes.len() < 6 || page_width == 0 {
+        return false;
+    }
+    let mut widths: Vec<usize> = boxes.iter().map(|b| b.right.saturating_sub(b.left)).collect();
+    let mid = widths.len() / 2;
+    let (_, median_w, _) = widths.select_nth_unstable(mid);
+    *median_w * 4 < page_width as usize
 }
 
 struct Codec {
@@ -371,8 +390,7 @@ impl OcrProvider {
             .enumerate()
             .map(|(idx, img)| {
                 let prof = crate::simd_kernel::analyze_gray_page(img);
-                let is_crisp_legal = prof.white_frac >= 0.78 && prof.mid_frac <= 0.015 && prof.line_energy >= 3.50;
-                if self.fallback.is_some() && !is_crisp_legal {
+                if self.fallback.is_some() && !is_crisp_legal_profile(prof) {
                     use_fallback[idx] = true;
                 }
                 match crate::simd_kernel::upright_and_deskew(img, prof) {
@@ -384,10 +402,21 @@ impl OcrProvider {
         let refs: Vec<&GrayImage> = adjusted.iter().map(std::borrow::Cow::as_ref).collect();
         let mut prep_all = {
             let layouts = &mut self.layouts;
+            let has_fallback = self.fallback.is_some();
             let window_size = if refs.len() <= 4 { refs.len() } else { preparation_window_size(refs.len()) };
             let mut prepared = Vec::with_capacity(refs.len());
+            let mut offset = 0usize;
             for chunk in refs.chunks(window_size) {
-                prepared.extend(prepare_window_refs(layouts, chunk, chunk)?);
+                let (chunk_prep, chunk_sparse) = prepare_window_refs(layouts, chunk, chunk)?;
+                if has_fallback {
+                    for (local_i, sparse) in chunk_sparse.into_iter().enumerate() {
+                        if sparse {
+                            use_fallback[offset + local_i] = true;
+                        }
+                    }
+                }
+                prepared.extend(chunk_prep);
+                offset += chunk.len();
             }
             prepared
         };
@@ -423,7 +452,7 @@ impl OcrProvider {
             if crate::simd_kernel::needs_180_check(page_lines) {
                 let flipped = imageops::rotate180(refs[i]);
                 let flip_ref = [&flipped];
-                let prep = prepare_window_refs(&mut self.layouts, &flip_ref, &flip_ref)?;
+                let (prep, _) = prepare_window_refs(&mut self.layouts, &flip_ref, &flip_ref)?;
                 let re = if use_fallback[i] {
                     if let Some((ref mut fb_engine, ref fb_codec)) = self.fallback_engine {
                         recognize_pages(fb_engine, fb_codec, &self.plan, prep)?
@@ -458,13 +487,57 @@ impl OcrProvider {
         let confidence_pages =
             requests.iter().filter(|request| !request.regions.is_empty()).map(|request| request.page_index).collect::<BTreeSet<_>>();
         let pdf = open_pdf(bytes)?;
-        let Self { engine, codec, layouts, plan, orientation, .. } = self;
+        let Self { engine, codec, layouts, plan, orientation, fallback, fallback_engine, cpu_arena, independent_pool, .. } = self;
+        let has_fallback = fallback.is_some();
+        let cpu_arena = *cpu_arena;
+        let independent_pool = *independent_pool;
         let orientation = orientation.as_mut().map(Mutex::new);
         let mut results: Vec<OcrPageResult> = requests
             .iter()
             .map(|request| OcrPageResult { page_index: request.page_index, lines: Vec::new(), separator_y: None })
             .collect();
-        measure("ocr.total", || {
+        measure("ocr.total", || -> Result<()> {
+            if available <= 1 {
+                let pages = PageRenderer::with_max_long_side(&pdf, dpi, MAX_OCR_RENDER_LONG_SIDE);
+                let layout = &mut layouts[0];
+                let mut offset = 0usize;
+                while offset < requests.len() {
+                    let end = (offset + 4).min(requests.len());
+                    let mut batch_meta = Vec::new();
+                    let mut batch_prep = Vec::new();
+                    for (req_idx, request) in requests[offset..end].iter().enumerate() {
+                        let req_idx = offset + req_idx;
+                        let items = measure("ocr.render", || {
+                            render_single_request(&pages, request, orientation.as_ref(), has_fallback)
+                        })?;
+                        if items.is_empty() {
+                            continue;
+                        }
+                        let need_conf = confidence_pages.contains(&request.page_index);
+                        for (placement, lines) in prepare_rendered_items(layout, items, need_conf, has_fallback)? {
+                            batch_meta.push((req_idx, placement));
+                            batch_prep.push(lines);
+                        }
+                    }
+                    if !batch_prep.is_empty() {
+                        place_recognized_batch(
+                            &mut results,
+                            batch_meta,
+                            batch_prep,
+                            engine,
+                            codec,
+                            fallback,
+                            fallback_engine,
+                            plan,
+                            cpu_arena,
+                            independent_pool,
+                        )?;
+                    }
+                    offset = end;
+                }
+                return Ok(());
+            }
+
             let (render_tx, raw_render_rx) = sync_channel::<Result<(usize, Vec<(Placement, GrayImage, Option<GrayImage>)>)>>(queue_cap);
             let render_rx = Mutex::new(raw_render_rx);
             let (prep_tx, prep_rx) = sync_channel::<Result<(usize, Vec<(Placement, Vec<PreparedLine>)>)>>(queue_cap);
@@ -476,14 +549,14 @@ impl OcrProvider {
                 for _ in 0..render_workers {
                     let render_tx = render_tx.clone();
                     scope.spawn(move || {
-                        let pages = PageRenderer::new(pdf, dpi);
+                        let pages = PageRenderer::with_max_long_side(pdf, dpi, MAX_OCR_RENDER_LONG_SIDE);
                         while !aborted_ref.load(Ordering::Relaxed) {
                             let req_idx = next_render_ref.fetch_add(1, Ordering::Relaxed);
                             if req_idx >= requests.len() {
                                 break;
                             }
                             let rendered = measure("ocr.render", || {
-                                render_single_request(&pages, &requests[req_idx], orientation)
+                                render_single_request(&pages, &requests[req_idx], orientation, has_fallback)
                             })
                             .map(|items| (req_idx, items));
                             let failed = rendered.is_err();
@@ -514,27 +587,7 @@ impl OcrProvider {
                                     return Ok((req_idx, Vec::new()));
                                 }
                                 let need_conf = confidence_pages.contains(&requests[req_idx].page_index);
-                                let mut placements = Vec::with_capacity(items.len());
-                                let mut seen = Vec::with_capacity(items.len());
-                                let mut ink = Vec::with_capacity(items.len());
-                                for (p, s, i) in items {
-                                    placements.push(p);
-                                    seen.push(s);
-                                    ink.push(i);
-                                }
-                                let seen_refs: Vec<&GrayImage> = seen.iter().collect();
-                                let boxes = measure("ocr.layout", || {
-                                    seen_refs.iter().map(|img| layout.lines(img)).collect::<Result<Vec<_>>>()
-                                })?;
-                                let ink_refs: Vec<&GrayImage> =
-                                    seen.iter().zip(&ink).map(|(gray, sep)| sep.as_ref().unwrap_or(gray)).collect();
-                                let mut prepared = measure("ocr.prepare_lines", || prepare_pages_refs(&ink_refs, &boxes))?;
-                                if need_conf {
-                                    for item_lines in &mut prepared {
-                                        item_lines.iter_mut().for_each(|line| line.confidence_required = true);
-                                    }
-                                }
-                                Ok((req_idx, placements.into_iter().zip(prepared).collect()))
+                                Ok((req_idx, prepare_rendered_items(layout, items, need_conf, has_fallback)?))
                             });
                             let failed = out.is_err();
                             if failed {
@@ -552,7 +605,17 @@ impl OcrProvider {
                 }
                 drop(prep_tx);
 
-                let res = place_pages(&mut results, prep_rx, engine, codec, plan);
+                let res = place_pages(
+                    &mut results,
+                    prep_rx,
+                    engine,
+                    codec,
+                    fallback,
+                    fallback_engine,
+                    plan,
+                    cpu_arena,
+                    independent_pool,
+                );
                 if res.is_err() {
                     aborted_ref.store(true, Ordering::Relaxed);
                 }
@@ -563,14 +626,82 @@ impl OcrProvider {
     }
 }
 
+fn place_recognized_item(result: &mut OcrPageResult, placement: Placement, mut lines: Vec<OcrLine>) {
+    place_back(&mut lines, placement.turns, placement.drawn[0], placement.drawn[1]);
+    scale_lines(&mut lines, placement.scale);
+    translate_lines(&mut lines, placement.origin);
+    result.lines.extend(lines);
+    result.separator_y = result.separator_y.or(placement.separator);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn place_recognized_batch(
+    results: &mut [OcrPageResult],
+    batch_meta: Vec<(usize, Placement)>,
+    mut batch_prep: Vec<Vec<PreparedLine>>,
+    engine: &mut RecognizerEngine,
+    codec: &Codec,
+    fallback: &Option<(PathBuf, PathBuf)>,
+    fallback_engine: &mut Option<(RecognizerEngine, Codec)>,
+    plan: &RuntimePlan,
+    cpu_arena: bool,
+    independent_pool: bool,
+) -> Result<()> {
+    if !batch_meta.iter().any(|(_, p)| p.use_fallback) || fallback.is_none() {
+        for ((req_idx, placement), lines) in batch_meta.into_iter().zip(recognize_pages(engine, codec, plan, batch_prep)?) {
+            place_recognized_item(&mut results[req_idx], placement, lines);
+        }
+        return Ok(());
+    }
+    let mut primary_meta = Vec::new();
+    let mut primary_prep = Vec::new();
+    let mut fb_meta = Vec::new();
+    let mut fb_prep = Vec::new();
+    for (idx, (req_idx, placement)) in batch_meta.into_iter().enumerate() {
+        let lines = std::mem::take(&mut batch_prep[idx]);
+        if placement.use_fallback {
+            fb_meta.push((req_idx, placement));
+            fb_prep.push(lines);
+        } else {
+            primary_meta.push((req_idx, placement));
+            primary_prep.push(lines);
+        }
+    }
+    if !primary_prep.is_empty() {
+        for ((req_idx, placement), lines) in primary_meta.into_iter().zip(recognize_pages(engine, codec, plan, primary_prep)?) {
+            place_recognized_item(&mut results[req_idx], placement, lines);
+        }
+    }
+    if !fb_prep.is_empty() {
+        if fallback_engine.is_none() {
+            if let Some((ref model_path, ref codec_path)) = *fallback {
+                let fb_eng = open_recognizer(model_path, plan, cpu_arena, independent_pool)?;
+                let fb_cod = Codec::load(codec_path)?;
+                *fallback_engine = Some((fb_eng, fb_cod));
+            }
+        }
+        if let Some((ref mut fb_eng, ref fb_cod)) = *fallback_engine {
+            for ((req_idx, placement), lines) in fb_meta.into_iter().zip(recognize_pages(fb_eng, fb_cod, plan, fb_prep)?) {
+                place_recognized_item(&mut results[req_idx], placement, lines);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Prepared items placed into `results[req_idx]`, micro-batched from whatever pages are already ready
 /// so recognition starts immediately on the first page while amortizing larger bursts.
+#[allow(clippy::too_many_arguments)]
 fn place_pages(
     results: &mut [OcrPageResult],
     prepared_rx: Receiver<Result<(usize, Vec<(Placement, Vec<PreparedLine>)>)>>,
     engine: &mut RecognizerEngine,
     codec: &Codec,
+    fallback: &Option<(PathBuf, PathBuf)>,
+    fallback_engine: &mut Option<(RecognizerEngine, Codec)>,
     plan: &RuntimePlan,
+    cpu_arena: bool,
+    independent_pool: bool,
 ) -> Result<()> {
     const MAX_MICROBATCH_ITEMS: usize = 4;
     while let Ok(first) = prepared_rx.recv() {
@@ -597,20 +728,60 @@ fn place_pages(
         if batch_prep.is_empty() {
             continue;
         }
-        for ((req_idx, placement), mut lines) in batch_meta.into_iter().zip(recognize_pages(engine, codec, plan, batch_prep)?) {
-            place_back(&mut lines, placement.turns, placement.drawn[0], placement.drawn[1]);
-            scale_lines(&mut lines, placement.scale);
-            translate_lines(&mut lines, placement.origin);
-            results[req_idx].lines.extend(lines);
-            results[req_idx].separator_y = results[req_idx].separator_y.or(placement.separator);
-        }
+        place_recognized_batch(
+            results,
+            batch_meta,
+            batch_prep,
+            engine,
+            codec,
+            fallback,
+            fallback_engine,
+            plan,
+            cpu_arena,
+            independent_pool,
+        )?;
     }
     Ok(())
 }
 
-fn prepare_window_refs(layouts: &mut [LineDetector], seen: &[&GrayImage], ink: &[&GrayImage]) -> Result<Vec<Vec<PreparedLine>>> {
+fn prepare_rendered_items(
+    layout: &mut LineDetector,
+    items: Vec<(Placement, GrayImage, Option<GrayImage>)>,
+    need_conf: bool,
+    has_fallback: bool,
+) -> Result<Vec<(Placement, Vec<PreparedLine>)>> {
+    let mut placements = Vec::with_capacity(items.len());
+    let mut seen = Vec::with_capacity(items.len());
+    let mut ink = Vec::with_capacity(items.len());
+    for (p, s, i) in items {
+        placements.push(p);
+        seen.push(s);
+        ink.push(i);
+    }
+    let seen_refs: Vec<&GrayImage> = seen.iter().collect();
+    let boxes = measure("ocr.layout", || seen_refs.iter().map(|img| layout.lines(img)).collect::<Result<Vec<_>>>())?;
+    if has_fallback {
+        for ((placement, img), item_boxes) in placements.iter_mut().zip(&seen).zip(&boxes) {
+            if has_sparse_short_boxes(item_boxes, img.width()) {
+                placement.use_fallback = true;
+            }
+        }
+    }
+    let ink_refs: Vec<&GrayImage> = seen.iter().zip(&ink).map(|(gray, sep)| sep.as_ref().unwrap_or(gray)).collect();
+    let mut prepared = measure("ocr.prepare_lines", || prepare_pages_refs(&ink_refs, &boxes))?;
+    if need_conf {
+        for item_lines in &mut prepared {
+            item_lines.iter_mut().for_each(|line| line.confidence_required = true);
+        }
+    }
+    Ok(placements.into_iter().zip(prepared).collect())
+}
+
+fn prepare_window_refs(layouts: &mut [LineDetector], seen: &[&GrayImage], ink: &[&GrayImage]) -> Result<(Vec<Vec<PreparedLine>>, Vec<bool>)> {
     let boxes = measure("ocr.layout", || layout_boxes_refs(layouts, seen))?;
-    measure("ocr.prepare_lines", || prepare_pages_refs(ink, &boxes))
+    let sparse = seen.iter().zip(&boxes).map(|(img, b)| has_sparse_short_boxes(b, img.width())).collect();
+    let prepared = measure("ocr.prepare_lines", || prepare_pages_refs(ink, &boxes))?;
+    Ok((prepared, sparse))
 }
 
 /// Pages' prepared lines read, each kept where it reads as text: a line the page analysis left
@@ -989,6 +1160,7 @@ fn render_single_request(
     pages: &PageRenderer,
     request: &OcrPageRequest,
     orientation: Option<&Mutex<&mut Orientation>>,
+    has_fallback: bool,
 ) -> Result<Vec<(Placement, GrayImage, Option<GrayImage>)>> {
     // White margin around a part of a page, so the layout reads its first and last lines whole.
     const MARGIN: usize = 16;
@@ -1031,8 +1203,9 @@ fn render_single_request(
             .then(|| measure("ocr.render.sep", || crate::separator::separator_y(gray.as_raw(), width, height, request.height)))
             .flatten();
         let (image, ink) = if turns == 0 { (gray, ink) } else { (turn(&gray, turns), ink.map(|img| turn(&img, turns))) };
+        let use_fallback = has_fallback && !crate::simd_kernel::is_crisp_white_page(&image);
         let drawn = [width as f64, height as f64];
-        rendered.push((Placement { separator, scale, origin: [0.0, 0.0], turns, drawn }, image, ink));
+        rendered.push((Placement { separator, scale, origin: [0.0, 0.0], turns, drawn, use_fallback }, image, ink));
         return Ok(rendered);
     }
     // Each part of the page is recognized on its own, at the page's resolution.
@@ -1051,9 +1224,11 @@ fn render_single_request(
             crop
         };
         let origin = [(x0 as f64 - MARGIN as f64) * scale[0], (y0 as f64 - MARGIN as f64) * scale[1]];
+        let region_img = framed(&gray);
+        let use_fallback = has_fallback && !crate::simd_kernel::is_crisp_white_page(&region_img);
         rendered.push((
-            Placement { separator: None, scale, origin, turns: 0, drawn: [0.0, 0.0] },
-            framed(&gray),
+            Placement { separator: None, scale, origin, turns: 0, drawn: [0.0, 0.0], use_fallback },
+            region_img,
             ink.as_ref().map(|img| framed(img)),
         ));
     }

@@ -361,6 +361,36 @@ fn line_energy_of_grid(bin: &[f32], w: usize, h: usize, angle_deg: f32) -> f32 {
     (sum_sq / (h.saturating_sub(1)).max(1) as f32) / (mean_r * mean_r)
 }
 
+/// Zero-allocation grid sample checking whether a PDF page matches crisp black-on-white print.
+pub(crate) fn is_crisp_white_page(gray: &GrayImage) -> bool {
+    let (w, h) = gray.dimensions();
+    if w == 0 || h == 0 {
+        return true;
+    }
+    let sc = 224.0 / w.max(h).max(1) as f32;
+    let sw = (w as f32 * sc).round().max(32.0) as usize;
+    let sh = (h as f32 * sc).round().max(32.0) as usize;
+    let raw = gray.as_raw();
+    let stride = w as usize;
+    let mut wf_cnt = 0usize;
+    let mut mf_cnt = 0usize;
+    for y in 0..sh {
+        let sy = (((y as f32 + 0.5) * h as f32 / sh as f32).floor() as usize).min(h as usize - 1);
+        let row = &raw[sy * stride..];
+        for x in 0..sw {
+            let sx = (((x as f32 + 0.5) * w as f32 / sw as f32).floor() as usize).min(w as usize - 1);
+            let v = row[sx];
+            if v >= 215 {
+                wf_cnt += 1;
+            } else if v > 120 {
+                mf_cnt += 1;
+            }
+        }
+    }
+    let total = (sw * sh).max(1) as f32;
+    (wf_cnt as f32 / total) >= 0.78 && (mf_cnt as f32 / total) <= 0.08
+}
+
 /// One-pass 224px analysis: upright/90/270 orientation + +/-12 deg deskew + router features.
 pub(crate) fn analyze_gray_page(gray: &GrayImage) -> PageProfile {
     let (w, h) = gray.dimensions();

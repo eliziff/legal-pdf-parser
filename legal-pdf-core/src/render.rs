@@ -45,6 +45,7 @@ pub struct PageRenderer<'a> {
     scan_cache: InterpreterCache<'a>,
     interpreter: InterpreterSettings,
     settings: RenderSettings,
+    max_long_side: Option<u16>,
 }
 
 impl<'a> PageRenderer<'a> {
@@ -56,13 +57,37 @@ impl<'a> PageRenderer<'a> {
             scan_cache: InterpreterCache::new(),
             interpreter: InterpreterSettings::default(),
             settings: RenderSettings { x_scale: scale, y_scale: scale, bg_color: WHITE, ..Default::default() },
+            max_long_side: None,
         }
+    }
+
+    /// Draw pages at `dpi`, clamping any page whose rendered long side exceeds `max_long_side`.
+    pub fn with_max_long_side(pdf: &'a Pdf, dpi: f64, max_long_side: u16) -> Self {
+        let mut renderer = Self::new(pdf, dpi);
+        renderer.max_long_side = Some(max_long_side.max(1));
+        renderer
+    }
+
+    fn scaled_axes(&self, page_w: f32, page_h: f32) -> (f32, f32) {
+        let (mut xs, mut ys) = (self.settings.x_scale, self.settings.y_scale);
+        if let Some(cap) = self.max_long_side {
+            let long_side = (page_w * xs).max(page_h * ys);
+            if long_side > f32::from(cap) && long_side > 0.0 {
+                let factor = f32::from(cap) / long_side;
+                xs *= factor;
+                ys *= factor;
+            }
+        }
+        (xs, ys)
     }
 
     /// Page `index` drawn; none where the document has no such page or it draws to nothing.
     pub fn render(&self, index: usize) -> Option<Pixmap> {
         let page = self.pdf.pages().get(index)?;
-        let pixmap = hayro::render(page, &self.cache, &self.interpreter, &self.settings);
+        let (width, height) = page.render_dimensions();
+        let (x_scale, y_scale) = self.scaled_axes(width, height);
+        let settings = RenderSettings { x_scale, y_scale, bg_color: WHITE, ..Default::default() };
+        let pixmap = hayro::render(page, &self.cache, &self.interpreter, &settings);
         (pixmap.width() > 0 && pixmap.height() > 0).then_some(pixmap)
     }
 
@@ -71,8 +96,8 @@ impl<'a> PageRenderer<'a> {
     /// the caller can fall back to `render(index)`.
     pub fn render_scan_gray(&self, index: usize) -> Option<RenderedGray> {
         let page = self.pdf.pages().get(index)?;
-        let (x_scale, y_scale) = (self.settings.x_scale, self.settings.y_scale);
         let (width, height) = page.render_dimensions();
+        let (x_scale, y_scale) = self.scaled_axes(width, height);
         let pix_w = self.settings.width.unwrap_or(((width * x_scale) as f64).floor() as u16);
         let pix_h = self.settings.height.unwrap_or(((height * y_scale) as f64).floor() as u16);
         if pix_w == 0 || pix_h == 0 {
@@ -885,6 +910,13 @@ mod tests {
         let (exp_gray, exp_ink) = rgb_to_gray_and_ink(&raw_rgb, w * h);
         assert_eq!(scan.gray, exp_gray);
         assert_eq!(scan.ink, exp_ink);
+
+        // Verify with_max_long_side caps oversized MediaBox proportionally without touching smaller pages.
+        let capped = PageRenderer::with_max_long_side(&pdf, 72.0, 16);
+        let capped_scan = capped.render_scan_gray(0).expect("capped fast-path scan should succeed");
+        assert_eq!((usize::from(capped_scan.width), usize::from(capped_scan.height)), (16, 12));
+        let capped_fallback = capped.render(0).expect("capped hayro render should succeed");
+        assert_eq!((usize::from(capped_fallback.width()), usize::from(capped_fallback.height())), (16, 12));
 
         // Exercise monochrome streaming resize (32x24 -> 16x12) + color resize fallback.
         let (dst_w, dst_h) = (16usize, 12usize);

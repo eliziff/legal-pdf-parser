@@ -1124,6 +1124,17 @@ pub(crate) fn linear_packed<const ADD_TO_DST: bool, const HARDSWISH: bool>(
     }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if is_x86_feature_detected!("avx512f") {
+            if let Some(ref q8) = lin.q8 {
+                if is_x86_feature_detected!("avx512vnni") {
+                    unsafe { linear_packed_avx512_vnni::<ADD_TO_DST, HARDSWISH>(x, rows, lin, q8, dst) };
+                    return;
+                }
+            } else {
+                unsafe { linear_packed_avx512::<ADD_TO_DST, HARDSWISH>(x, rows, lin, dst) };
+                return;
+            }
+        }
         if let Some(ref q8) = lin.q8 {
             unsafe { linear_packed_avx2_q8::<ADD_TO_DST, HARDSWISH>(x, rows, lin, q8, dst) };
             return;
@@ -1381,62 +1392,231 @@ unsafe fn linear_packed_avx2<const ADD_TO_DST: bool, const HARDSWISH: bool>(
     }
 
     if has_tail8 {
-        let c = tiles * 16;
-        let w_tail = w_base.add(tiles * inp * 16);
-        let bv = _mm256_loadu_ps(b_base.add(c));
+        linear_packed_avx2_tail8::<ADD_TO_DST, HARDSWISH>(x, rows, lin, dst);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn linear_packed_avx2_tail8<const ADD_TO_DST: bool, const HARDSWISH: bool>(
+    x: &[f32],
+    rows: usize,
+    lin: &PackedLinear,
+    dst: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let inp = lin.inp;
+    let out_pad = lin.out_pad;
+    let tiles = out_pad / 16;
+    let c = tiles * 16;
+    let x_base = x.as_ptr();
+    let w_tail = lin.w.as_ptr().add(tiles * inp * 16);
+    let bv = _mm256_loadu_ps(lin.b.as_ptr().add(c));
+    let d_base = dst.as_mut_ptr();
+    let zero = _mm256_setzero_ps();
+    let three = _mm256_set1_ps(3.0);
+    let six = _mm256_set1_ps(6.0);
+    let sixth = _mm256_set1_ps(HARD_SWISH_SIXTH);
+    let mut r = 0usize;
+    while r + 6 <= rows {
+        let xp0 = x_base.add(r * inp);
+        let xp1 = x_base.add((r + 1) * inp);
+        let xp2 = x_base.add((r + 2) * inp);
+        let xp3 = x_base.add((r + 3) * inp);
+        let xp4 = x_base.add((r + 4) * inp);
+        let xp5 = x_base.add((r + 5) * inp);
+        let dp0 = d_base.add(r * out_pad + c);
+        let dp1 = d_base.add((r + 1) * out_pad + c);
+        let dp2 = d_base.add((r + 2) * out_pad + c);
+        let dp3 = d_base.add((r + 3) * out_pad + c);
+        let dp4 = d_base.add((r + 4) * out_pad + c);
+        let dp5 = d_base.add((r + 5) * out_pad + c);
+        let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) = if ADD_TO_DST {
+            (
+                _mm256_add_ps(bv, _mm256_loadu_ps(dp0)),
+                _mm256_add_ps(bv, _mm256_loadu_ps(dp1)),
+                _mm256_add_ps(bv, _mm256_loadu_ps(dp2)),
+                _mm256_add_ps(bv, _mm256_loadu_ps(dp3)),
+                _mm256_add_ps(bv, _mm256_loadu_ps(dp4)),
+                _mm256_add_ps(bv, _mm256_loadu_ps(dp5)),
+            )
+        } else {
+            (bv, bv, bv, bv, bv, bv)
+        };
+        for k in 0..inp {
+            let wv = _mm256_loadu_ps(w_tail.add(k * 8));
+            a0 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp0.add(k)), wv, a0);
+            a1 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp1.add(k)), wv, a1);
+            a2 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp2.add(k)), wv, a2);
+            a3 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp3.add(k)), wv, a3);
+            a4 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp4.add(k)), wv, a4);
+            a5 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp5.add(k)), wv, a5);
+        }
+        store_avx2::<HARDSWISH>(dp0, a0, zero, three, six, sixth);
+        store_avx2::<HARDSWISH>(dp1, a1, zero, three, six, sixth);
+        store_avx2::<HARDSWISH>(dp2, a2, zero, three, six, sixth);
+        store_avx2::<HARDSWISH>(dp3, a3, zero, three, six, sixth);
+        store_avx2::<HARDSWISH>(dp4, a4, zero, three, six, sixth);
+        store_avx2::<HARDSWISH>(dp5, a5, zero, three, six, sixth);
+        r += 6;
+    }
+    while r < rows {
+        let xp0 = x_base.add(r * inp);
+        let dp0 = d_base.add(r * out_pad + c);
+        let mut a0 = if ADD_TO_DST { _mm256_add_ps(bv, _mm256_loadu_ps(dp0)) } else { bv };
+        for k in 0..inp {
+            a0 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp0.add(k)), _mm256_loadu_ps(w_tail.add(k * 8)), a0);
+        }
+        store_avx2::<HARDSWISH>(dp0, a0, zero, three, six, sixth);
+        r += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn store_avx512<const HARDSWISH: bool>(
+    dp: *mut f32,
+    v: std::arch::x86_64::__m512,
+    zero: std::arch::x86_64::__m512,
+    three: std::arch::x86_64::__m512,
+    six: std::arch::x86_64::__m512,
+    sixth: std::arch::x86_64::__m512,
+) {
+    use std::arch::x86_64::*;
+    let out = if HARDSWISH {
+        let gate = _mm512_min_ps(_mm512_max_ps(_mm512_add_ps(v, three), zero), six);
+        _mm512_mul_ps(v, _mm512_mul_ps(gate, sixth))
+    } else {
+        v
+    };
+    _mm512_storeu_ps(dp, out);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avx512f")]
+unsafe fn linear_packed_avx512<const ADD_TO_DST: bool, const HARDSWISH: bool>(
+    x: &[f32],
+    rows: usize,
+    lin: &PackedLinear,
+    dst: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let inp = lin.inp;
+    let out_pad = lin.out_pad;
+    let tiles = out_pad / 16;
+    let has_tail8 = (out_pad & 8) != 0;
+    assert!(x.len() >= rows * inp && dst.len() >= rows * out_pad);
+    let x_base = x.as_ptr();
+    let w_base = lin.w.as_ptr();
+    let b_base = lin.b.as_ptr();
+    let d_base = dst.as_mut_ptr();
+    let zero = _mm512_setzero_ps();
+    let three = _mm512_set1_ps(3.0);
+    let six = _mm512_set1_ps(6.0);
+    let sixth = _mm512_set1_ps(HARD_SWISH_SIXTH);
+
+    for tile in 0..tiles {
+        let c = tile * 16;
+        let w_tile = w_base.add(tile * inp * 16);
+        let bv = _mm512_loadu_ps(b_base.add(c));
         let mut r = 0usize;
-        while r + 6 <= rows {
-            let xp0 = x_base.add(r * inp);
-            let xp1 = x_base.add((r + 1) * inp);
-            let xp2 = x_base.add((r + 2) * inp);
-            let xp3 = x_base.add((r + 3) * inp);
-            let xp4 = x_base.add((r + 4) * inp);
-            let xp5 = x_base.add((r + 5) * inp);
-            let dp0 = d_base.add(r * out_pad + c);
-            let dp1 = d_base.add((r + 1) * out_pad + c);
-            let dp2 = d_base.add((r + 2) * out_pad + c);
-            let dp3 = d_base.add((r + 3) * out_pad + c);
-            let dp4 = d_base.add((r + 4) * out_pad + c);
-            let dp5 = d_base.add((r + 5) * out_pad + c);
-            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) = if ADD_TO_DST {
+        while r + 8 <= rows {
+            let xp = [
+                x_base.add(r * inp),
+                x_base.add((r + 1) * inp),
+                x_base.add((r + 2) * inp),
+                x_base.add((r + 3) * inp),
+                x_base.add((r + 4) * inp),
+                x_base.add((r + 5) * inp),
+                x_base.add((r + 6) * inp),
+                x_base.add((r + 7) * inp),
+            ];
+            let dp = [
+                d_base.add(r * out_pad + c),
+                d_base.add((r + 1) * out_pad + c),
+                d_base.add((r + 2) * out_pad + c),
+                d_base.add((r + 3) * out_pad + c),
+                d_base.add((r + 4) * out_pad + c),
+                d_base.add((r + 5) * out_pad + c),
+                d_base.add((r + 6) * out_pad + c),
+                d_base.add((r + 7) * out_pad + c),
+            ];
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7) = if ADD_TO_DST {
                 (
-                    _mm256_add_ps(bv, _mm256_loadu_ps(dp0)),
-                    _mm256_add_ps(bv, _mm256_loadu_ps(dp1)),
-                    _mm256_add_ps(bv, _mm256_loadu_ps(dp2)),
-                    _mm256_add_ps(bv, _mm256_loadu_ps(dp3)),
-                    _mm256_add_ps(bv, _mm256_loadu_ps(dp4)),
-                    _mm256_add_ps(bv, _mm256_loadu_ps(dp5)),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[0])),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[1])),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[2])),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[3])),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[4])),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[5])),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[6])),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[7])),
                 )
             } else {
-                (bv, bv, bv, bv, bv, bv)
+                (bv, bv, bv, bv, bv, bv, bv, bv)
             };
             for k in 0..inp {
-                let wv = _mm256_loadu_ps(w_tail.add(k * 8));
-                a0 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp0.add(k)), wv, a0);
-                a1 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp1.add(k)), wv, a1);
-                a2 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp2.add(k)), wv, a2);
-                a3 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp3.add(k)), wv, a3);
-                a4 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp4.add(k)), wv, a4);
-                a5 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp5.add(k)), wv, a5);
+                let wv = _mm512_loadu_ps(w_tile.add(k * 16));
+                a0 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[0].add(k)), wv, a0);
+                a1 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[1].add(k)), wv, a1);
+                a2 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[2].add(k)), wv, a2);
+                a3 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[3].add(k)), wv, a3);
+                a4 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[4].add(k)), wv, a4);
+                a5 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[5].add(k)), wv, a5);
+                a6 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[6].add(k)), wv, a6);
+                a7 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[7].add(k)), wv, a7);
             }
-            store_avx2::<HARDSWISH>(dp0, a0, zero, three, six, sixth);
-            store_avx2::<HARDSWISH>(dp1, a1, zero, three, six, sixth);
-            store_avx2::<HARDSWISH>(dp2, a2, zero, three, six, sixth);
-            store_avx2::<HARDSWISH>(dp3, a3, zero, three, six, sixth);
-            store_avx2::<HARDSWISH>(dp4, a4, zero, three, six, sixth);
-            store_avx2::<HARDSWISH>(dp5, a5, zero, three, six, sixth);
-            r += 6;
+            store_avx512::<HARDSWISH>(dp[0], a0, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp[1], a1, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp[2], a2, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp[3], a3, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp[4], a4, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp[5], a5, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp[6], a6, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp[7], a7, zero, three, six, sixth);
+            r += 8;
+        }
+        while r + 4 <= rows {
+            let xp = [x_base.add(r * inp), x_base.add((r + 1) * inp), x_base.add((r + 2) * inp), x_base.add((r + 3) * inp)];
+            let dp = [d_base.add(r * out_pad + c), d_base.add((r + 1) * out_pad + c), d_base.add((r + 2) * out_pad + c), d_base.add((r + 3) * out_pad + c)];
+            let (mut a0, mut a1, mut a2, mut a3) = if ADD_TO_DST {
+                (
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[0])),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[1])),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[2])),
+                    _mm512_add_ps(bv, _mm512_loadu_ps(dp[3])),
+                )
+            } else {
+                (bv, bv, bv, bv)
+            };
+            for k in 0..inp {
+                let wv = _mm512_loadu_ps(w_tile.add(k * 16));
+                a0 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[0].add(k)), wv, a0);
+                a1 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[1].add(k)), wv, a1);
+                a2 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[2].add(k)), wv, a2);
+                a3 = _mm512_fmadd_ps(_mm512_set1_ps(*xp[3].add(k)), wv, a3);
+            }
+            store_avx512::<HARDSWISH>(dp[0], a0, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp[1], a1, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp[2], a2, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp[3], a3, zero, three, six, sixth);
+            r += 4;
         }
         while r < rows {
             let xp0 = x_base.add(r * inp);
             let dp0 = d_base.add(r * out_pad + c);
-            let mut a0 = if ADD_TO_DST { _mm256_add_ps(bv, _mm256_loadu_ps(dp0)) } else { bv };
+            let mut a0 = if ADD_TO_DST { _mm512_add_ps(bv, _mm512_loadu_ps(dp0)) } else { bv };
             for k in 0..inp {
-                a0 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*xp0.add(k)), _mm256_loadu_ps(w_tail.add(k * 8)), a0);
+                a0 = _mm512_fmadd_ps(_mm512_set1_ps(*xp0.add(k)), _mm512_loadu_ps(w_tile.add(k * 16)), a0);
             }
-            store_avx2::<HARDSWISH>(dp0, a0, zero, three, six, sixth);
+            store_avx512::<HARDSWISH>(dp0, a0, zero, three, six, sixth);
             r += 1;
         }
+    }
+
+    if has_tail8 {
+        linear_packed_avx2_tail8::<ADD_TO_DST, HARDSWISH>(x, rows, lin, dst);
     }
 }
 
@@ -1717,43 +1897,260 @@ unsafe fn linear_packed_avx2_q8<const ADD_TO_DST: bool, const HARDSWISH: bool>(
         }
 
         if has_tail8 {
-            let c = tiles16 * 16;
-            let w_tail = w_base.add(tiles16 * k4_count * 64);
-            let sw = _mm256_loadu_ps(sw_base.add(c));
-            let ws = _mm256_loadu_ps(ws_base.add(c));
-            let bv = _mm256_loadu_ps(b_base.add(c));
+            linear_packed_avx2_q8_tail8::<ADD_TO_DST, HARDSWISH>(rows, lin, q8, &scratch, dst);
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn linear_packed_avx2_q8_tail8<const ADD_TO_DST: bool, const HARDSWISH: bool>(
+    rows: usize,
+    lin: &PackedLinear,
+    q8: &PackedQ8,
+    scratch: &QuantRowScratch,
+    dst: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let inp = lin.inp;
+    let out_pad = lin.out_pad;
+    let k4_count = inp / 4;
+    let tiles16 = out_pad / 16;
+    let c = tiles16 * 16;
+    let xq_base = scratch.x_q.as_ptr();
+    let x_scale = scratch.x_scale.as_ptr();
+    let x_min = scratch.x_min.as_ptr();
+    let w_tail = q8.w_q.as_ptr().add(tiles16 * k4_count * 64);
+    let sw = _mm256_loadu_ps(q8.scale_w.as_ptr().add(c));
+    let ws = _mm256_loadu_ps(q8.w_sum_scaled.as_ptr().add(c));
+    let bv = _mm256_loadu_ps(lin.b.as_ptr().add(c));
+    let d_base = dst.as_mut_ptr();
+    let ones16 = _mm256_set1_epi16(1);
+    let zero = _mm256_setzero_ps();
+    let three = _mm256_set1_ps(3.0);
+    let six = _mm256_set1_ps(6.0);
+    let sixth = _mm256_set1_ps(HARD_SWISH_SIXTH);
+
+    let mut r = 0usize;
+    while r + 4 <= rows {
+        let xp0 = xq_base.add(r * inp);
+        let xp1 = xq_base.add((r + 1) * inp);
+        let xp2 = xq_base.add((r + 2) * inp);
+        let xp3 = xq_base.add((r + 3) * inp);
+        let mut a0 = _mm256_setzero_si256();
+        let mut a1 = _mm256_setzero_si256();
+        let mut a2 = _mm256_setzero_si256();
+        let mut a3 = _mm256_setzero_si256();
+        for k4 in 0..k4_count {
+            let w0 = _mm256_loadu_si256(w_tail.add(k4 * 32) as *const __m256i);
+            let xv0 = _mm256_set1_epi32((xp0.add(k4 * 4) as *const i32).read_unaligned());
+            let xv1 = _mm256_set1_epi32((xp1.add(k4 * 4) as *const i32).read_unaligned());
+            let xv2 = _mm256_set1_epi32((xp2.add(k4 * 4) as *const i32).read_unaligned());
+            let xv3 = _mm256_set1_epi32((xp3.add(k4 * 4) as *const i32).read_unaligned());
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, w0), ones16));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_maddubs_epi16(xv1, w0), ones16));
+            a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(_mm256_maddubs_epi16(xv2, w0), ones16));
+            a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(_mm256_maddubs_epi16(xv3, w0), ones16));
+        }
+        for (ri, acc) in [(0, a0), (1, a1), (2, a2), (3, a3)] {
+            let row = r + ri;
+            let dp = d_base.add(row * out_pad + c);
+            let sx = _mm256_set1_ps(*x_scale.add(row));
+            let mx = _mm256_set1_ps(*x_min.add(row));
+            dequant_store_avx2::<ADD_TO_DST, HARDSWISH>(
+                dp,
+                acc,
+                _mm256_mul_ps(sx, sw),
+                _mm256_fmadd_ps(mx, ws, bv),
+                zero,
+                three,
+                six,
+                sixth,
+            );
+        }
+        r += 4;
+    }
+    while r < rows {
+        let xp0 = xq_base.add(r * inp);
+        let dp = d_base.add(r * out_pad + c);
+        let mut a0 = _mm256_setzero_si256();
+        for k4 in 0..k4_count {
+            let w0 = _mm256_loadu_si256(w_tail.add(k4 * 32) as *const __m256i);
+            let xv0 = _mm256_set1_epi32((xp0.add(k4 * 4) as *const i32).read_unaligned());
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, w0), ones16));
+        }
+        let sx = _mm256_set1_ps(*x_scale.add(r));
+        let mx = _mm256_set1_ps(*x_min.add(r));
+        dequant_store_avx2::<ADD_TO_DST, HARDSWISH>(
+            dp,
+            a0,
+            _mm256_mul_ps(sx, sw),
+            _mm256_fmadd_ps(mx, ws, bv),
+            zero,
+            three,
+            six,
+            sixth,
+        );
+        r += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn dequant_store_avx512<const ADD_TO_DST: bool, const HARDSWISH: bool>(
+    dp: *mut f32,
+    acc: std::arch::x86_64::__m512i,
+    tot_scale: std::arch::x86_64::__m512,
+    bias_adj: std::arch::x86_64::__m512,
+    zero: std::arch::x86_64::__m512,
+    three: std::arch::x86_64::__m512,
+    six: std::arch::x86_64::__m512,
+    sixth: std::arch::x86_64::__m512,
+) {
+    use std::arch::x86_64::*;
+    let res = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), tot_scale, bias_adj);
+    let val = if ADD_TO_DST {
+        _mm512_add_ps(res, _mm512_loadu_ps(dp))
+    } else {
+        res
+    };
+    store_avx512::<HARDSWISH>(dp, val, zero, three, six, sixth);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avx512f,avx512vnni")]
+unsafe fn linear_packed_avx512_vnni<const ADD_TO_DST: bool, const HARDSWISH: bool>(
+    x: &[f32],
+    rows: usize,
+    lin: &PackedLinear,
+    q8: &PackedQ8,
+    dst: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH_VNNI: RefCell<QuantRowScratch> = const {
+            RefCell::new(QuantRowScratch {
+                x_q: Vec::new(),
+                x_scale: Vec::new(),
+                x_min: Vec::new(),
+            })
+        };
+    }
+
+    let inp = lin.inp;
+    let out_pad = lin.out_pad;
+    let k4_count = inp / 4;
+    let tiles16 = out_pad / 16;
+    let has_tail8 = (out_pad & 8) != 0;
+    assert!(x.len() >= rows * inp && dst.len() >= rows * out_pad);
+
+    SCRATCH_VNNI.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        quantize_rows_u7_avx2(x, rows, inp, &mut scratch);
+
+        let xq_base = scratch.x_q.as_ptr();
+        let x_scale = scratch.x_scale.as_ptr();
+        let x_min = scratch.x_min.as_ptr();
+        let w_base = q8.w_q.as_ptr();
+        let sw_base = q8.scale_w.as_ptr();
+        let ws_base = q8.w_sum_scaled.as_ptr();
+        let b_base = lin.b.as_ptr();
+        let d_base = dst.as_mut_ptr();
+
+        let zero = _mm512_setzero_ps();
+        let three = _mm512_set1_ps(3.0);
+        let six = _mm512_set1_ps(6.0);
+        let sixth = _mm512_set1_ps(HARD_SWISH_SIXTH);
+
+        for tile in 0..tiles16 {
+            let c = tile * 16;
+            let w_tile = w_base.add(tile * k4_count * 64);
+            let sw = _mm512_loadu_ps(sw_base.add(c));
+            let ws = _mm512_loadu_ps(ws_base.add(c));
+            let bv = _mm512_loadu_ps(b_base.add(c));
 
             let mut r = 0usize;
-            while r + 4 <= rows {
-                let xp0 = xq_base.add(r * inp);
-                let xp1 = xq_base.add((r + 1) * inp);
-                let xp2 = xq_base.add((r + 2) * inp);
-                let xp3 = xq_base.add((r + 3) * inp);
-                let mut a0 = _mm256_setzero_si256();
-                let mut a1 = _mm256_setzero_si256();
-                let mut a2 = _mm256_setzero_si256();
-                let mut a3 = _mm256_setzero_si256();
+            while r + 8 <= rows {
+                let xp = [
+                    xq_base.add(r * inp),
+                    xq_base.add((r + 1) * inp),
+                    xq_base.add((r + 2) * inp),
+                    xq_base.add((r + 3) * inp),
+                    xq_base.add((r + 4) * inp),
+                    xq_base.add((r + 5) * inp),
+                    xq_base.add((r + 6) * inp),
+                    xq_base.add((r + 7) * inp),
+                ];
+                let mut a0 = _mm512_setzero_si512();
+                let mut a1 = _mm512_setzero_si512();
+                let mut a2 = _mm512_setzero_si512();
+                let mut a3 = _mm512_setzero_si512();
+                let mut a4 = _mm512_setzero_si512();
+                let mut a5 = _mm512_setzero_si512();
+                let mut a6 = _mm512_setzero_si512();
+                let mut a7 = _mm512_setzero_si512();
                 for k4 in 0..k4_count {
-                    let w0 = _mm256_loadu_si256(w_tail.add(k4 * 32) as *const __m256i);
-                    let xv0 = _mm256_set1_epi32((xp0.add(k4 * 4) as *const i32).read_unaligned());
-                    let xv1 = _mm256_set1_epi32((xp1.add(k4 * 4) as *const i32).read_unaligned());
-                    let xv2 = _mm256_set1_epi32((xp2.add(k4 * 4) as *const i32).read_unaligned());
-                    let xv3 = _mm256_set1_epi32((xp3.add(k4 * 4) as *const i32).read_unaligned());
-                    a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, w0), ones16));
-                    a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_maddubs_epi16(xv1, w0), ones16));
-                    a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(_mm256_maddubs_epi16(xv2, w0), ones16));
-                    a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(_mm256_maddubs_epi16(xv3, w0), ones16));
+                    let w = _mm512_loadu_si512(w_tile.add(k4 * 64) as *const _);
+                    let xv0 = _mm512_set1_epi32((xp[0].add(k4 * 4) as *const i32).read_unaligned());
+                    let xv1 = _mm512_set1_epi32((xp[1].add(k4 * 4) as *const i32).read_unaligned());
+                    let xv2 = _mm512_set1_epi32((xp[2].add(k4 * 4) as *const i32).read_unaligned());
+                    let xv3 = _mm512_set1_epi32((xp[3].add(k4 * 4) as *const i32).read_unaligned());
+                    let xv4 = _mm512_set1_epi32((xp[4].add(k4 * 4) as *const i32).read_unaligned());
+                    let xv5 = _mm512_set1_epi32((xp[5].add(k4 * 4) as *const i32).read_unaligned());
+                    let xv6 = _mm512_set1_epi32((xp[6].add(k4 * 4) as *const i32).read_unaligned());
+                    let xv7 = _mm512_set1_epi32((xp[7].add(k4 * 4) as *const i32).read_unaligned());
+                    a0 = _mm512_dpbusd_epi32(a0, xv0, w);
+                    a1 = _mm512_dpbusd_epi32(a1, xv1, w);
+                    a2 = _mm512_dpbusd_epi32(a2, xv2, w);
+                    a3 = _mm512_dpbusd_epi32(a3, xv3, w);
+                    a4 = _mm512_dpbusd_epi32(a4, xv4, w);
+                    a5 = _mm512_dpbusd_epi32(a5, xv5, w);
+                    a6 = _mm512_dpbusd_epi32(a6, xv6, w);
+                    a7 = _mm512_dpbusd_epi32(a7, xv7, w);
+                }
+                for (ri, acc) in [(0, a0), (1, a1), (2, a2), (3, a3), (4, a4), (5, a5), (6, a6), (7, a7)] {
+                    let row = r + ri;
+                    let dp = d_base.add(row * out_pad + c);
+                    let sx = _mm512_set1_ps(*x_scale.add(row));
+                    let mx = _mm512_set1_ps(*x_min.add(row));
+                    dequant_store_avx512::<ADD_TO_DST, HARDSWISH>(
+                        dp,
+                        acc,
+                        _mm512_mul_ps(sx, sw),
+                        _mm512_fmadd_ps(mx, ws, bv),
+                        zero,
+                        three,
+                        six,
+                        sixth,
+                    );
+                }
+                r += 8;
+            }
+            while r + 4 <= rows {
+                let xp = [xq_base.add(r * inp), xq_base.add((r + 1) * inp), xq_base.add((r + 2) * inp), xq_base.add((r + 3) * inp)];
+                let mut a0 = _mm512_setzero_si512();
+                let mut a1 = _mm512_setzero_si512();
+                let mut a2 = _mm512_setzero_si512();
+                let mut a3 = _mm512_setzero_si512();
+                for k4 in 0..k4_count {
+                    let w = _mm512_loadu_si512(w_tile.add(k4 * 64) as *const _);
+                    a0 = _mm512_dpbusd_epi32(a0, _mm512_set1_epi32((xp[0].add(k4 * 4) as *const i32).read_unaligned()), w);
+                    a1 = _mm512_dpbusd_epi32(a1, _mm512_set1_epi32((xp[1].add(k4 * 4) as *const i32).read_unaligned()), w);
+                    a2 = _mm512_dpbusd_epi32(a2, _mm512_set1_epi32((xp[2].add(k4 * 4) as *const i32).read_unaligned()), w);
+                    a3 = _mm512_dpbusd_epi32(a3, _mm512_set1_epi32((xp[3].add(k4 * 4) as *const i32).read_unaligned()), w);
                 }
                 for (ri, acc) in [(0, a0), (1, a1), (2, a2), (3, a3)] {
                     let row = r + ri;
                     let dp = d_base.add(row * out_pad + c);
-                    let sx = _mm256_set1_ps(*x_scale.add(row));
-                    let mx = _mm256_set1_ps(*x_min.add(row));
-                    dequant_store_avx2::<ADD_TO_DST, HARDSWISH>(
+                    let sx = _mm512_set1_ps(*x_scale.add(row));
+                    let mx = _mm512_set1_ps(*x_min.add(row));
+                    dequant_store_avx512::<ADD_TO_DST, HARDSWISH>(
                         dp,
                         acc,
-                        _mm256_mul_ps(sx, sw),
-                        _mm256_fmadd_ps(mx, ws, bv),
+                        _mm512_mul_ps(sx, sw),
+                        _mm512_fmadd_ps(mx, ws, bv),
                         zero,
                         three,
                         six,
@@ -1765,19 +2162,19 @@ unsafe fn linear_packed_avx2_q8<const ADD_TO_DST: bool, const HARDSWISH: bool>(
             while r < rows {
                 let xp0 = xq_base.add(r * inp);
                 let dp = d_base.add(r * out_pad + c);
-                let mut a0 = _mm256_setzero_si256();
+                let mut a0 = _mm512_setzero_si512();
                 for k4 in 0..k4_count {
-                    let w0 = _mm256_loadu_si256(w_tail.add(k4 * 32) as *const __m256i);
-                    let xv0 = _mm256_set1_epi32((xp0.add(k4 * 4) as *const i32).read_unaligned());
-                    a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, w0), ones16));
+                    let w = _mm512_loadu_si512(w_tile.add(k4 * 64) as *const _);
+                    let xv0 = _mm512_set1_epi32((xp0.add(k4 * 4) as *const i32).read_unaligned());
+                    a0 = _mm512_dpbusd_epi32(a0, xv0, w);
                 }
-                let sx = _mm256_set1_ps(*x_scale.add(r));
-                let mx = _mm256_set1_ps(*x_min.add(r));
-                dequant_store_avx2::<ADD_TO_DST, HARDSWISH>(
+                let sx = _mm512_set1_ps(*x_scale.add(r));
+                let mx = _mm512_set1_ps(*x_min.add(r));
+                dequant_store_avx512::<ADD_TO_DST, HARDSWISH>(
                     dp,
                     a0,
-                    _mm256_mul_ps(sx, sw),
-                    _mm256_fmadd_ps(mx, ws, bv),
+                    _mm512_mul_ps(sx, sw),
+                    _mm512_fmadd_ps(mx, ws, bv),
                     zero,
                     three,
                     six,
@@ -1785,6 +2182,10 @@ unsafe fn linear_packed_avx2_q8<const ADD_TO_DST: bool, const HARDSWISH: bool>(
                 );
                 r += 1;
             }
+        }
+
+        if has_tail8 {
+            linear_packed_avx2_q8_tail8::<ADD_TO_DST, HARDSWISH>(rows, lin, q8, &scratch, dst);
         }
     });
 }
@@ -2455,6 +2856,40 @@ mod q8_tests {
                         ref_dst[idx],
                         q8_dst[idx]
                     );
+                }
+            }
+            if is_x86_feature_detected!("avx512f") {
+                let mut avx512_dst = initial.clone();
+                unsafe {
+                    match (add, hswish) {
+                        (false, false) => linear_packed_avx512::<false, false>(&x, rows, &lin, &mut avx512_dst),
+                        (true, false) => linear_packed_avx512::<true, false>(&x, rows, &lin, &mut avx512_dst),
+                        (false, true) => linear_packed_avx512::<false, true>(&x, rows, &lin, &mut avx512_dst),
+                        (true, true) => linear_packed_avx512::<true, true>(&x, rows, &lin, &mut avx512_dst),
+                    }
+                }
+                for r in 0..rows {
+                    for c in 0..out_dim {
+                        let idx = r * lin.out_pad + c;
+                        assert!((ref_dst[idx] - avx512_dst[idx]).abs() < 1e-5, "avx512 mismatch at ({r},{c})");
+                    }
+                }
+            }
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vnni") {
+                let mut vnni_dst = initial.clone();
+                unsafe {
+                    match (add, hswish) {
+                        (false, false) => linear_packed_avx512_vnni::<false, false>(&x, rows, &lin, q8, &mut vnni_dst),
+                        (true, false) => linear_packed_avx512_vnni::<true, false>(&x, rows, &lin, q8, &mut vnni_dst),
+                        (false, true) => linear_packed_avx512_vnni::<false, true>(&x, rows, &lin, q8, &mut vnni_dst),
+                        (true, true) => linear_packed_avx512_vnni::<true, true>(&x, rows, &lin, q8, &mut vnni_dst),
+                    }
+                }
+                for r in 0..rows {
+                    for c in 0..out_dim {
+                        let idx = r * lin.out_pad + c;
+                        assert!((q8_dst[idx] - vnni_dst[idx]).abs() < 1e-4, "vnni vs avx2_q8 mismatch at ({r},{c})");
+                    }
                 }
             }
         }

@@ -84,9 +84,11 @@ impl ModelPack {
             backend,
             OrtBackend::Cuda | OrtBackend::TensorRt | OrtBackend::DirectMl
         );
-        let fallback = manifest
+        let fallback_model = manifest
             .fallback
             .as_ref()
+            .or_else(|| (selected.model != "standard").then(|| manifest.models.get("standard")).flatten());
+        let fallback = fallback_model
             .map(|fb| {
                 Ok::<_, Error>((
                     checked_asset(&root, if accelerated { &fb.gpu } else { &fb.cpu })?,
